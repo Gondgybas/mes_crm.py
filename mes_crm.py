@@ -228,7 +228,10 @@ class PartTemplate(Base):
     description = Column(Text, default="")
     created_at = Column(DateTime, default=now_msk)
     operation_times = Column(Text, default="{}")
+    is_assembly = Column(Boolean, default=False)
     customer = relationship("Customer", lazy="joined")
+    components = relationship("AssemblyComponent", foreign_keys="[AssemblyComponent.assembly_id]",
+                              cascade="all, delete-orphan", lazy="joined")
     materials = relationship("PartTemplateMaterial", back_populates="part_template",
                              cascade="all, delete-orphan", lazy="joined")
     files = relationship("PartTemplateFile", back_populates="part_template",
@@ -279,6 +282,16 @@ class PartTemplateFile(Base):
     description = Column(Text, default="")
     part_template = relationship("PartTemplate", back_populates="files")
     uploader = relationship("User")
+
+class AssemblyComponent(Base):
+    __tablename__ = "assembly_components"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    assembly_id = Column(Integer, ForeignKey("part_templates.id"), nullable=False)
+    component_id = Column(Integer, ForeignKey("part_templates.id"), nullable=False)
+    quantity = Column(Integer, nullable=False, default=1)
+    sort_order = Column(Integer, default=0)
+    component = relationship("PartTemplate", foreign_keys=[component_id], lazy="joined")
+
 
 
 class Resource(Base):
@@ -561,6 +574,19 @@ def init_database():
             conn.execute(text("ALTER TABLE operation_type_cfgs ADD COLUMN writeoff_mode VARCHAR(50) DEFAULT 'Детали'"))
             conn.commit()
         log.info("Migration: added writeoff_mode to operation_type_cfgs")
+
+    # Миграция: is_assembly в part_templates
+    pt_cols = [c["name"] for c in insp.get_columns("part_templates")]
+    if "is_assembly" not in pt_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE part_templates ADD COLUMN is_assembly BOOLEAN DEFAULT 0"))
+            conn.commit()
+        log.info("Migration: added is_assembly to part_templates")
+    # Миграция: таблица assembly_components
+    if not insp.has_table("assembly_components"):
+        Base.metadata.tables["assembly_components"].create(engine)
+        log.info("Migration: created assembly_components table")
+
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
             for i, n in enumerate(DEFAULT_OP_TYPES):
@@ -743,21 +769,34 @@ def create_app():
     def auto_create_reservations(db, order_item, user_id=None):
         pt = order_item.part_template
         if not pt: return
-        for ptm in (pt.materials or []):
-            sheets = ptm.calc_sheets_for_qty(order_item.quantity)
-            mat = db.query(Material).get(ptm.material_id)
-            if not mat: continue
-            kg = round(sheets * (mat.sheet_weight_kg or 0), 2)
-            db.add(Reservation(order_id=order_item.order_id, order_item_id=order_item.id,
-                               material_id=mat.id, part_template_id=pt.id,
-                               quantity_sheets=sheets, quantity_kg=kg,
-                               reserved_by=user_id, is_active=True))
-            mat.reserved_sheets += sheets
-            mat.reserved_kg += kg
-            db.add(MaterialMovement(material_id=mat.id, movement_type="Резерв",
-                                    quantity_sheets=sheets, quantity_kg=kg,
-                                    order_id=order_item.order_id, user_id=user_id,
-                                    note=f"Авто-резерв: {pt.name} x{order_item.quantity}"))
+
+        def _reserve_materials(template, qty_multiplier, label_pt_id):
+            for ptm in (template.materials or []):
+                sheets = ptm.calc_sheets_for_qty(order_item.quantity * qty_multiplier)
+                mat = db.query(Material).get(ptm.material_id)
+                if not mat: continue
+                kg = round(sheets * (mat.sheet_weight_kg or 0), 2)
+                db.add(Reservation(order_id=order_item.order_id, order_item_id=order_item.id,
+                                   material_id=mat.id, part_template_id=label_pt_id,
+                                   quantity_sheets=sheets, quantity_kg=kg,
+                                   reserved_by=user_id, is_active=True))
+                mat.reserved_sheets += sheets
+                mat.reserved_kg += kg
+                db.add(MaterialMovement(material_id=mat.id, movement_type="Резерв",
+                                        quantity_sheets=sheets, quantity_kg=kg,
+                                        order_id=order_item.order_id, user_id=user_id,
+                                        note=f"Авто-резерв: {template.name} x{order_item.quantity * qty_multiplier}"))
+
+        # Собственные материалы детали/сборки
+        _reserve_materials(pt, 1, pt.id)
+
+        # Материалы компонентов сборки
+        if pt.is_assembly:
+            for comp in (pt.components or []):
+                comp_pt = db.query(PartTemplate).get(comp.component_id)
+                if comp_pt:
+                    _reserve_materials(comp_pt, comp.quantity, comp_pt.id)
+
         db.flush()
 
     def auto_create_operations(db, order_item):
@@ -1209,7 +1248,12 @@ def create_app():
                                for pm in (p.materials or [])],
                  "files": [{"id": f.id, "name": f.original_name, "type": f.file_type,
                             "size": f.file_size, "date": f.uploaded_at.isoformat()}
-                           for f in (p.files or [])]}
+                           for f in (p.files or [])],
+                 "is_assembly": p.is_assembly or False,
+                 "components": [{"id": ac.id, "component_id": ac.component_id,
+                                 "component_name": pt_display(ac.component) if ac.component else "?",
+                                 "quantity": ac.quantity, "sort_order": ac.sort_order}
+                                for ac in (p.components or [])]}
                 for p in q.order_by(PartTemplate.name).all()]
 
     @app.post("/api/part-templates/save")
@@ -1223,6 +1267,7 @@ def create_app():
         p.customer_id = data.get("customer_id") or None
         p.description = data.get("description", p.description or "")
         if "operation_times" in data: p.set_op_times(data["operation_times"])
+        p.is_assembly = data.get("is_assembly", p.is_assembly or False)
         if "materials" in data:
             db.query(PartTemplateMaterial).filter(PartTemplateMaterial.part_template_id == p.id).delete()
             db.flush()
@@ -1232,6 +1277,12 @@ def create_app():
                     part_template_id=p.id, material_id=int(md["material_id"]),
                     sheets_input=shi, parts_per_sheets=pps,
                     sheets_per_one=round(shi / pps, 6) if pps > 0 else 0))
+        if "components" in data:
+            db.query(AssemblyComponent).filter(AssemblyComponent.assembly_id == p.id).delete()
+            db.flush()
+            for i, cd in enumerate(data["components"]):
+                db.add(AssemblyComponent(assembly_id=p.id, component_id=int(cd["component_id"]),
+                                         quantity=int(cd.get("quantity", 1)), sort_order=i))
         db.flush()
         if pid: recalc_linked_items(db, p.id, data.get("user_id"))
         db.commit()
@@ -1547,10 +1598,15 @@ def create_app():
     def api_res_by_item(item_id: int, db: Session = Depends(db_dep)):
         rs = db.query(Reservation).options(joinedload(Reservation.material)).filter(
             Reservation.order_item_id == item_id, Reservation.is_active == True).all()
+        rs = db.query(Reservation).options(
+            joinedload(Reservation.material), joinedload(Reservation.part_template)
+        ).filter(Reservation.order_item_id == item_id, Reservation.is_active == True).all()
         return [{"id": r.id, "material_id": r.material_id,
                  "material": r.material.name if r.material else "",
                  "material_code": r.material.code if r.material else "",
-                 "sheets": r.quantity_sheets, "kg": r.quantity_kg} for r in rs]
+                 "sheets": r.quantity_sheets, "kg": r.quantity_kg,
+                 "part_template_id": r.part_template_id,
+                 "part_name": pt_display(r.part_template) if r.part_template else "—"} for r in rs]
 
     # ─── Resources ──────────────────────────────────
     @app.get("/api/resources")
@@ -1736,6 +1792,9 @@ def create_app():
                 "order_display": it.order.display_name if it.order else "",
                 "order_status": it.order.status if it.order else "",
                 "part_name": pt_display(it.part_template),
+                "is_assembly": it.part_template.is_assembly if it.part_template else False,
+                "components": [{"name": pt_display(ac.component), "qty": ac.quantity}
+                               for ac in (it.part_template.components or [])] if it.part_template and it.part_template.is_assembly else [],
                 "quantity": it.quantity, "completed": it.completed_qty,
                 "rejected": it.rejected_qty, "surplus": surplus,
                 "by_resource": by_res})
@@ -2509,20 +2568,23 @@ function modalPTFiles(ptid,name){
     '<span style="color:var(--text3);font-size:.8em">'+fmtDT(f.date)+'</span></div>'}).join('')+'</div>'}
   h+='<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)})}
 
-var ptMaterials=[];
+var ptMaterials=[],ptComponents=[];
 function modalPartTpl(pid){
-  Promise.all([api('/api/customers'),api('/api/materials'),api('/api/op-types')]).then(function(arr){
-  var custs=arr[0],mats=arr[1],opTypes=arr[2];
-  var p1=pid?api('/api/part-templates'):Promise.resolve(null);
-  p1.then(function(pts){var p=pts?pts.find(function(x){return x.id===pid}):null;
+  Promise.all([api('/api/customers'),api('/api/materials'),api('/api/op-types'),api('/api/part-templates')]).then(function(arr){
+  var custs=arr[0],mats=arr[1],opTypes=arr[2],allPts=arr[3];
+  var p=pid?allPts.find(function(x){return x.id===pid}):null;
   ptMaterials=p?(p.materials||[]).map(function(m){return{material_id:m.material_id_val||m.material_id,sheets_input:m.sheets_input,parts_per_sheets:m.parts_per_sheets}}):[];
+  ptComponents=p?(p.components||[]).map(function(c){return{component_id:c.component_id,component_name:c.component_name,quantity:c.quantity}}):[];
+  window._allPTs=allPts;window._allMats=mats;
   var opT=p?p.operation_times:{};var activeOps=opTypes.filter(function(o){return o.is_active});
   var custOpts=[{v:'',t:'— не привязан —'}].concat(custs.map(function(c){return{v:String(c.id),t:c.name}}));
-  window._allMats=mats;
   var h='<h2>'+(p?'✏':'+')+' Деталь</h2>'+
   '<div class="form-row"><div><label>Наименование</label><input id="fp_name" value="'+(p?p.name:'')+'"></div>'+
     '<div><label>Чертёжный номер</label><input id="fp_num" value="'+(p?p.part_number:'')+'"></div></div>'+
   '<div class="form-row"><div><label>Заказчик</label>'+SS('fp_cust',custOpts,p?String(p.customer_id||''):'','Заказчик')+'</div><div></div></div>'+
+'<div style="margin-bottom:12px;padding:8px;background:var(--bg);border:1px solid var(--s2);border-radius:var(--r)"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.9em"><input type="checkbox" id="fp_is_asm" '+(p&&p.is_assembly?'checked':'')+' onchange="toggleAsmUI()" style="width:18px;height:18px;accent-color:var(--accent)"> Это сборка (состоит из нескольких деталей)</label></div>'+
+  '<div id="fp_asm_section" style="display:'+(p&&p.is_assembly?'block':'none')+'">'+
+    '<div class="section-hdr">Компоненты сборки <button class="btn sm" onclick="addPTComp()">+</button></div><div id="fp_comps_list"></div></div>'+
   '<div class="section-hdr">Материалы <button class="btn sm" onclick="addPTMat()">+</button></div><div id="fp_mats_list"></div>'+
   '<div class="section-hdr">Калькулятор операций</div><div class="info-box">Партия + общее время → авто мин/шт</div>';
   activeOps.forEach(function(ot){var entry=opT[ot.name];var qty=entry&&typeof entry==='object'?entry.qty||1:1;
@@ -2536,10 +2598,10 @@ function modalPartTpl(pid){
   h+='<div class="section-hdr">Файлы '+(p?'<button class="btn sm" onclick="modalPTUpload('+p.id+')">📎 Загрузить</button>':'')+'</div>'+
   '<div id="fp_files">'+(p?(p.files||[]).map(function(f){return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--s2);font-size:.85em">'+
     '<a href="/api/part-template-files/'+f.id+'/download" target="_blank" style="color:var(--info)">📄 '+f.name+'</a>'+
-    '<button class="btn sm" onclick="delPTFile('+f.id+','+p.id+')">🗑</button></div>'}).join('')||'<div style="color:var(--text3)">Нет файлов</div>':'<div class="info-box">Сохраните, затем добавьте файлы</div>')+'</div>'+
+    '<button class="btn sm" onclick="delPTFile('+f.id+','+p.id+')">🗑</button></div>'}).join('')||'<div style="color:var(--text3)">Нет файлов</div>':'<div class="info-box">Сохраните деталь, чтобы загрузить файлы</div>')+'</div>'+
   '<div class="form-row full"><div><label>Описание</label><textarea id="fp_desc" rows="2">'+(p?p.description:'')+'</textarea></div></div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="savePT('+(pid||0)+')">Сохранить</button></div>';
-  openModal(h);renderPTMats(mats);activeOps.forEach(function(ot){calcOneOp(ot.name)})})})}
+  openModal(h);renderPTMats(mats);renderPTComps();activeOps.forEach(function(ot){calcOneOp(ot.name)})})}
 
 function calcOneOp(n){var q=document.querySelector('.fp_op_qty[data-op="'+n+'"]');var t=document.querySelector('.fp_op_total[data-op="'+n+'"]');var o=document.querySelector('.fp_op_one[data-op="'+n+'"]');
   if(!q||!t||!o)return;var qty=+q.value||1;var tot=+t.value||0;o.value=qty>0?(tot/qty).toFixed(2):''}
@@ -2557,6 +2619,23 @@ function renderPTMats(allMats){var el=document.getElementById('fp_mats_list');if
 function addPTMat(){if(!window._allMats||!window._allMats.length){toast('Нет материалов','err');return}
   ptMaterials.push({material_id:window._allMats[0].id,sheets_input:1,parts_per_sheets:1});renderPTMats(window._allMats)}
 
+function toggleAsmUI(){var ch=document.getElementById('fp_is_asm');
+  document.getElementById('fp_asm_section').style.display=ch.checked?'block':'none'}
+
+function renderPTComps(){var el=document.getElementById('fp_comps_list');if(!el)return;
+  var allPts=(window._allPTs||[]).filter(function(p){return!p.is_assembly});
+  var ptOpts=allPts.map(function(p){return{v:String(p.id),t:p.display_name+' ['+p.customer_name+']'}});
+  el.innerHTML=ptComponents.map(function(c,i){
+    return '<div class="mat-row">'+
+    '<div style="flex:1"><label>Деталь</label>'+SS('ptc_'+i,ptOpts,String(c.component_id),'Деталь...')+'</div>'+
+    '<div><label>Кол-во/сб</label><input type="number" value="'+c.quantity+'" min="1" style="width:60px" onchange="ptComponents['+i+'].quantity=+this.value"></div>'+
+    '<button class="btn sm" onclick="ptComponents.splice('+i+',1);renderPTComps()">🗑</button></div>'
+  }).join('')}
+
+function addPTComp(){var allPts=(window._allPTs||[]).filter(function(p){return!p.is_assembly});
+  if(!allPts.length){toast('Нет деталей для компонентов','err');return}
+  ptComponents.push({component_id:allPts[0].id,component_name:allPts[0].display_name,quantity:1});renderPTComps()}
+
 function savePT(pid){var opTimes={};
   document.querySelectorAll('.fp_op_total').forEach(function(el){var t=+el.value;if(!t)return;var n=el.dataset.op;
     var q=+document.querySelector('.fp_op_qty[data-op="'+n+'"]').value||1;
@@ -2564,9 +2643,13 @@ function savePT(pid){var opTimes={};
   ptMaterials.forEach(function(m,i){var v=ssVal('ptm_'+i);if(v)m.material_id=+v});
   var b={name:document.getElementById('fp_name').value,part_number:document.getElementById('fp_num').value,
     customer_id:+ssVal('fp_cust')||null,description:document.getElementById('fp_desc').value,
-    operation_times:opTimes,materials:ptMaterials,user_id:U.id};if(pid)b.id=pid;
+    operation_times:opTimes,materials:ptMaterials,user_id:U.id,
+    is_assembly:document.getElementById('fp_is_asm').checked,
+    components:ptComponents.map(function(c,i){var v=ssVal('ptc_'+i);return{component_id:+(v||c.component_id),quantity:c.quantity}})};
+  if(pid)b.id=pid;
   api('/api/part-templates/save','POST',b).then(function(){closeModal();toast('Сохранено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function delPT(pid){if(!confirm('Удалить?'))return;api('/api/part-templates/delete','POST',{id:pid}).then(function(){refreshPage()})}
+
 function modalPTUpload(ptid){openModal('<h2>📎 Файл детали</h2>'+
   '<div class="form-row full"><div><label>Файл</label><input type="file" id="fpu_file" style="padding:8px"></div></div>'+
   '<div class="form-row"><div><label>Тип</label><select id="fpu_type"><option>Чертёж</option><option>3D Модель</option><option>Развёртка</option><option>Фото</option><option>Прочее</option></select></div>'+
@@ -2802,21 +2885,29 @@ function modalOpWriteoff(opid){
   if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
   var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
   p.then(function(reservations){
+    window._opWoReservations=reservations;
+    // Группируем по компоненту
+    var byComp={};reservations.forEach(function(r){
+      var key=r.part_template_id||0;var name=r.part_name||'Общие';
+      if(!byComp[key])byComp[key]={name:name,items:[]};byComp[key].items.push(r)});
+    var compKeys=Object.keys(byComp);var hasComponents=compKeys.length>1;
+
     var h='<h2>📤 Списание: '+op.type+'</h2>'+
       '<div class="info-box"><strong>Заказ:</strong> '+(op.order_display||op.order_number)+
       ' | <strong>Деталь:</strong> '+(op.item||'—')+
       ' | <strong>Участок:</strong> '+(op.resource||'—')+'</div>';
-    if(showMat){
+
+    if(showMat&&reservations.length){
       h+='<div class="section-hdr">📦 Материал</div>';
-      if(reservations.length){
-        h+='<div class="form-row full"><div><label>Материал (из резерва)</label><select id="fopwo_mat">'+
-          reservations.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
-            r.material_code+' — '+r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
-          '</select></div></div>'+
-          '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>'
-      } else {
-        h+='<div class="info-box" style="color:var(--text3)">Нет активных резервов</div>'
+      if(hasComponents){
+        h+='<div class="form-row full"><div><label>Компонент сборки</label><select id="fopwo_comp" onchange="opWoCompChg()">'+
+          compKeys.map(function(k){return '<option value="'+k+'">'+byComp[k].name+' ('+byComp[k].items.length+' мат.)</option>'}).join('')+
+          '</select></div></div>'
       }
+      h+='<div id="fopwo_mat_area"></div>'+
+        '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>'
+    } else if(showMat){
+      h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов</div>'
     }
     if(showParts){
       h+='<div class="section-hdr">🔩 Детали</div>'+
@@ -2826,8 +2917,23 @@ function modalOpWriteoff(opid){
     h+='<div class="form-row full"><div><label>Примечание</label><input id="fopwo_note"></div></div>'+
       '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
       '<button class="btn primary" onclick="submitOpWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
-    openModal(h)
+    openModal(h);
+    // Инициализируем материалы
+    if(showMat&&reservations.length){
+      window._opWoByComp=byComp;window._opWoCompKeys=compKeys;
+      opWoCompChg()
+    }
   }).catch(function(e){toast(e.message,'err')})}
+
+function opWoCompChg(){
+  var sel=document.getElementById('fopwo_comp');
+  var key=sel?sel.value:window._opWoCompKeys[0];
+  var items=window._opWoByComp[key].items;
+  document.getElementById('fopwo_mat_area').innerHTML=
+    '<div class="form-row full"><div><label>Материал</label><select id="fopwo_mat">'+
+    items.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
+      r.material_code+' — '+r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
+    '</select></div></div>'}
 
 function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
@@ -2931,7 +3037,8 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
   '<tbody>'+filtered.map(function(d){var resBadges=Object.entries(d.by_resource||{}).map(function(e){var rn=e[0],rd=e[1];
     var ac=rd.logs.some(function(l){return l.anomaly})?'anomaly':'';
     return '<span class="badge b-info '+ac+'" title="'+rn+': '+rd.good+' / '+rd.rejected+' брак">'+rn+': '+rd.good+(rd.rejected?' ⚠'+rd.rejected:'')+'</span>'}).join(' ')||'—';
-    return '<tr><td>'+d.order_display+'</td><td>'+statusBadge(d.order_status)+'</td><td><strong>'+d.part_name+'</strong></td>'+
+     d.components_html=(d.components||[]).length?'<div style="font-size:.8em;color:var(--text3);margin-top:2px">'+d.components.map(function(c){return '├ '+c.name+' ×'+c.qty}).join('<br>')+'</div>':'';
+    return '<tr><td>'+d.order_display+'</td><td>'+statusBadge(d.order_status)+'</td><td><strong>'+(d.is_assembly?'🔧 ':'')+d.part_name+'</strong>'+(d.components_html||'')+'</td>'+
     '<td>'+d.quantity+'</td><td>'+d.completed+'</td><td class="'+(d.rejected?'low':'')+'">'+d.rejected+'</td>'+
     '<td class="'+(d.surplus>0?'low':'')+'">'+(d.surplus>0?'+'+d.surplus:'—')+'</td><td>'+resBadges+'</td></tr>'}).join('')+'</tbody></table></div>';
   var inp=document.getElementById('plNameInput');
@@ -2940,7 +3047,7 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
   })}
 function modalSurplus(){api('/api/part-station-logs/surplus').then(function(data){if(!data.length){toast('Нет излишков');return}
   openModal('<h2>📊 Излишки (по 1-му участку)</h2><div class="tbl-wrap"><table><thead><tr><th>Деталь</th><th>Изл.</th><th>Заказы</th></tr></thead>'+
-  '<tbody>'+data.map(function(d){return '<tr><td><strong>'+d.part_name+'</strong></td><td class="low">+'+d.total_surplus+'</td>'+
+  '<tbody>'+data.map(function(d){return '<tr><td><strong>'+(d.is_assembly?'🔧 ':'')+d.part_name+'</strong>'+((d.components||[]).length?'<div style="font-size:.8em;color:var(--text3);margin-top:2px">'+(d.components||[]).map(function(c){return '├ '+c.name+' ×'+c.qty}).join('<br>')+'</div>':'')+'</td> class="low">+'+d.total_surplus+'</td>'+
     '<td style="font-size:.8em">'+(d.orders||[]).map(function(o){return o.order+': '+o.planned+'→'+o.completed_first+' (+'+o.surplus+')'}).join('<br>')+'</td></tr>'}).join('')+'</tbody></table></div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')}).catch(function(e){toast(e.message,'err')})}
 
