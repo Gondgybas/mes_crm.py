@@ -518,7 +518,7 @@ DEFAULT_PERMS = [
     ("mat.consume", "Списание материалов", "Склад"), ("mat.create", "Создание материалов", "Склад"),
     ("mat.edit", "Редактирование материалов", "Склад"),
     ("order.view", "Просмотр заказов", "Заказы"), ("order.create", "Создание заказов", "Заказы"),
-    ("order.edit", "Редактирование заказов", "Заказы"), ("order.status", "Смена статуса", "Заказы"),
+    ("order.edit", "Редактирование заказов", "Заказы"), ("order.delete", "Удаление заказов", "Заказы"), ("order.status", "Смена статуса", "Заказы"),
     ("order.files", "Файлы заказов", "Заказы"), ("order.reports", "Отчёты", "Заказы"),
     ("reserve.view", "Просмотр резервов", "Резервы"), ("reserve.create", "Создание резервов", "Резервы"),
     ("reserve.edit", "Редактирование резервов", "Резервы"), ("reserve.cancel", "Отмена резервов", "Резервы"),
@@ -1346,6 +1346,36 @@ def create_app():
         if o.status == "Завершён": o.completed_at = now_msk()
         audit(db, data.get("user_id", 1), "Смена статуса", "order", oid, f"{old} → {o.status}")
         db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.post("/api/orders/delete")
+    async def api_delete_order(request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        oid = data.get("id")
+        o = db.query(Order).get(oid)
+        if not o:
+            raise HTTPException(404, "Заказ не найден")
+        # Снимаем все активные резервы — возвращаем материал
+        for r in db.query(Reservation).filter(Reservation.order_id == oid, Reservation.is_active == True).all():
+            mat = db.query(Material).get(r.material_id)
+            if mat:
+                mat.reserved_sheets = max(0, mat.reserved_sheets - r.quantity_sheets)
+                mat.reserved_kg = max(0, mat.reserved_kg - r.quantity_kg)
+                db.add(MaterialMovement(material_id=mat.id, movement_type="Снятие резерва",
+                                        quantity_sheets=r.quantity_sheets, quantity_kg=r.quantity_kg,
+                                        order_id=oid, user_id=uid,
+                                        note=f"Удаление заказа {o.order_number}"))
+            r.is_active = False
+        # Удаляем файлы с диска
+        for f in db.query(OrderFile).filter(OrderFile.order_id == oid).all():
+            fp = UPLOAD_DIR / f.filename
+            if fp.exists():
+                fp.unlink()
+        audit(db, uid, "Удаление заказа", "order", oid, o.order_number)
+        db.delete(o)
+        db.flush()
+        db.commit()
         return {"status": "ok"}
 
     # ─── Order Items ────────────────────────────────
@@ -2301,6 +2331,7 @@ function pgOrders(c){api('/api/orders').then(function(orders){
       '<button class="btn sm" onclick="modalOrderDetail('+o.id+')">📋</button>'+
       '<button class="btn sm" onclick="modalOrderStats('+o.id+')" title="Статистика">📈</button>'+
       (hasPerm('order.edit')?'<button class="btn sm" onclick="modalOrder('+o.id+')">✏</button>':'')+
+      (hasPerm('order.delete')?'<button class="btn sm" onclick="delOrder('+o.id+',\''+esc(o.number)+'\')" style="color:var(--err)" title="Удалить заказ">🗑</button>':'')+
       (hasPerm('order.status')?'<select class="ctl" style="padding:3px;font-size:.8em" onchange="chgStatus('+o.id+',this.value)">'+STATUSES.map(function(s){return '<option '+(s===o.status?'selected':'')+'>'+s+'</option>'}).join('')+'</select>':'')+
     '</td></tr>'}).join('')+'</tbody></table></div>'})}
 function chgStatus(oid,s){
@@ -2308,6 +2339,9 @@ function chgStatus(oid,s){
     if(r.status==='warning'){if(confirm(r.message)){api('/api/orders/'+oid+'/status','POST',{status:s,user_id:U.id,force:true}).then(function(){toast('Обновлён','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}else{refreshPage()}}
     else{toast('Обновлён','ok');refreshPage()}
   }).catch(function(e){toast(e.message,'err')})}
+  
+  function delOrder(oid,num){if(!confirm('Удалить заказ '+num+'?\n\nВсе позиции, операции, резервы и файлы будут удалены.\nМатериалы из резервов вернутся на склад.'))return;
+  api('/api/orders/delete','POST',{id:oid,user_id:U.id}).then(function(){toast('Заказ '+num+' удалён','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 function modalOrder(oid){
   api('/api/customers').then(function(custs){
