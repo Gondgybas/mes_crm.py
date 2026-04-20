@@ -52,6 +52,7 @@ class OperationTypeCfg(Base):
     name = Column(String(200), unique=True, nullable=False)
     sort_order = Column(Integer, default=0)
     is_active = Column(Boolean, default=True)
+    writeoff_mode = Column(String(50), default="Детали")
 
 
 class Permission(Base):
@@ -551,6 +552,15 @@ ROLE_LABELS = {"admin": "Администратор", "master": "Мастер", 
 
 def init_database():
     Base.metadata.create_all(engine)
+    # Миграция: добавляем writeoff_mode в operation_type_cfgs
+    from sqlalchemy import inspect as sa_inspect, text
+    insp = sa_inspect(engine)
+    cols = [c["name"] for c in insp.get_columns("operation_type_cfgs")]
+    if "writeoff_mode" not in cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE operation_type_cfgs ADD COLUMN writeoff_mode VARCHAR(50) DEFAULT 'Детали'"))
+            conn.commit()
+        log.info("Migration: added writeoff_mode to operation_type_cfgs")
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
             for i, n in enumerate(DEFAULT_OP_TYPES):
@@ -849,7 +859,8 @@ def create_app():
     # ─── Op Types ───────────────────────────────────
     @app.get("/api/op-types")
     def api_op_types(db: Session = Depends(db_dep)):
-        return [{"id": o.id, "name": o.name, "sort_order": o.sort_order, "is_active": o.is_active}
+        return [{"id": o.id, "name": o.name, "sort_order": o.sort_order, "is_active": o.is_active,
+                 "writeoff_mode": o.writeoff_mode or "Детали"}
                 for o in db.query(OperationTypeCfg).order_by(OperationTypeCfg.sort_order).all()]
 
     @app.post("/api/op-types/save")
@@ -861,6 +872,7 @@ def create_app():
         o.name = data.get("name", o.name or "")
         o.sort_order = int(data.get("sort_order", o.sort_order or 0))
         o.is_active = data.get("is_active", True)
+        o.writeoff_mode = data.get("writeoff_mode", o.writeoff_mode or "Детали")
         db.flush(); db.commit()
         return {"id": o.id}
 
@@ -2740,8 +2752,10 @@ var opsResFilter=0,opsTypeFilter='';
 function pgOperations(c){
   Promise.all([api('/api/resources'),api('/api/op-types')]).then(function(arr2){
   var resources=arr2[0],opTypes=arr2[1];
+  window._opTypesData={};opTypes.forEach(function(ot){window._opTypesData[ot.name]=ot});
   var url='/api/operations?active_only=1';if(opsResFilter)url+='&resource_id='+opsResFilter;
   api(url).then(function(ops){
+  window._opsData={};ops.forEach(function(o){window._opsData[o.id]=o});
   if(opsTypeFilter)ops=ops.filter(function(o){return o.type===opsTypeFilter});
   var byRes={};
   ops.forEach(function(o){var rn=o.resource||'Не назначен';if(!byRes[rn])byRes[rn]={ops:[],rid:o.resource_id,shift_h:0};byRes[rn].ops.push(o)});
@@ -2761,6 +2775,7 @@ function pgOperations(c){
       '<td style="white-space:nowrap">'+
         (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
         (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
+        ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
         (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)">↩</button>':'')+
       '</td></tr>'}).join('')+'</tbody></table></div>'});
   if(!Object.keys(byRes).length)html+='<div class="info-box">Нет операций</div>';c.innerHTML=html})})}
@@ -2776,6 +2791,79 @@ function startOp(id){api('/api/operations/'+id+'/start','POST',{user_id:U.id}).t
 function pauseOp(id){api('/api/operations/'+id+'/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function completeOp(id){api('/api/operations/'+id+'/complete','POST',{user_id:U.id}).then(function(){toast('Завершена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function rollbackOp(id){if(!confirm('Откатить?'))return;api('/api/operations/'+id+'/rollback','POST',{user_id:U.id}).then(function(){toast('Откат','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+
+function modalOpWriteoff(opid){
+  var op=window._opsData[opid];if(!op){toast('Операция не найдена','err');return}
+  var otCfg=window._opTypesData[op.type]||{};
+  var mode=otCfg.writeoff_mode||'Детали';
+  if(mode==='Нет'){toast('Списание не настроено для «'+op.type+'»','err');return}
+  var showMat=mode.indexOf('Материал')>=0&&U.writeoff_types.indexOf('Материал')>=0;
+  var showParts=mode.indexOf('Детали')>=0&&U.writeoff_types.indexOf('Детали')>=0;
+  if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
+  var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
+  p.then(function(reservations){
+    var h='<h2>📤 Списание: '+op.type+'</h2>'+
+      '<div class="info-box"><strong>Заказ:</strong> '+(op.order_display||op.order_number)+
+      ' | <strong>Деталь:</strong> '+(op.item||'—')+
+      ' | <strong>Участок:</strong> '+(op.resource||'—')+'</div>';
+    if(showMat){
+      h+='<div class="section-hdr">📦 Материал</div>';
+      if(reservations.length){
+        h+='<div class="form-row full"><div><label>Материал (из резерва)</label><select id="fopwo_mat">'+
+          reservations.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
+            r.material_code+' — '+r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
+          '</select></div></div>'+
+          '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>'
+      } else {
+        h+='<div class="info-box" style="color:var(--text3)">Нет активных резервов</div>'
+      }
+    }
+    if(showParts){
+      h+='<div class="section-hdr">🔩 Детали</div>'+
+        '<div class="form-row"><div><label>Годных</label><input type="number" id="fopwo_good" value="0" min="0"></div>'+
+        '<div><label>Брак</label><input type="number" id="fopwo_rej" value="0" min="0"></div></div>'
+    }
+    h+='<div class="form-row full"><div><label>Примечание</label><input id="fopwo_note"></div></div>'+
+      '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+      '<button class="btn primary" onclick="submitOpWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
+    openModal(h)
+  }).catch(function(e){toast(e.message,'err')})}
+
+function submitOpWriteoff(opid,showMat,showParts){
+  var op=window._opsData[opid];if(!op)return;
+  var note=(document.getElementById('fopwo_note')||{}).value||'';
+  var promises=[];
+  if(showMat){
+    var matSel=document.getElementById('fopwo_mat');
+    var shVal=+(document.getElementById('fopwo_sheets')||{}).value||0;
+    if(matSel&&shVal>0){
+      var matOpt=matSel.options[matSel.selectedIndex];
+      promises.push(api('/api/writeoffs/create','POST',{
+        writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
+        order_item_id:op.item_id,resource_id:op.resource_id,
+        material_id:+matSel.value,reservation_id:+(matOpt.dataset.rid)||null,
+        sheets:shVal,note:'['+op.type+'] '+note}))
+    }
+  }
+  if(showParts){
+    var good=+(document.getElementById('fopwo_good')||{}).value||0;
+    var rej=+(document.getElementById('fopwo_rej')||{}).value||0;
+    if(good>0||rej>0){
+      promises.push(api('/api/writeoffs/create','POST',{
+        writeoff_type:'Детали',user_id:U.id,order_id:op.order_id,
+        order_item_id:op.item_id,resource_id:op.resource_id,
+        operation_type:op.type,parts_good:good,parts_rejected:rej,
+        note:'['+op.type+'] '+note}))
+    }
+  }
+  if(!promises.length){toast('Укажите количество','err');return}
+  Promise.all(promises).then(function(results){
+    closeModal();
+    var anom=results.find(function(r){return r.is_anomaly});
+    if(anom)toast('⚠ '+anom.anomaly_note,'err');
+    else toast('Списано с «'+op.type+'»','ok');
+    refreshPage()
+  }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ РЕЗЕРВЫ ═══
 var resFilter={type:'',order:'',status:'',part:''};
@@ -3154,12 +3242,13 @@ function setOpTypes(sc){api('/api/op-types').then(function(opTypes){
   '<tbody>'+opTypes.map(function(ot){return '<tr><td><strong>'+ot.name+'</strong></td><td>'+ot.sort_order+'</td><td>'+(ot.is_active?'✅':'❌')+'</td>'+
     '<td><button class="btn sm" onclick="modalOpType('+ot.id+')">✏</button><button class="btn sm" onclick="delOpType('+ot.id+')">🗑</button></td></tr>'}).join('')+'</tbody></table></div>'})}
 function modalOpType(otid){var p1=otid?api('/api/op-types'):Promise.resolve(null);p1.then(function(ots){var ot=ots?ots.find(function(x){return x.id===otid}):null;
-  openModal('<h2>'+(ot?'✏':'+')+' Тип операции</h2>'+
-  '<div class="form-row"><div><label>Название</label><input id="fot_name" value="'+(ot?ot.name:'')+'"></div><div><label>Порядок</label><input type="number" id="fot_sort" value="'+(ot?ot.sort_order:0)+'"></div></div>'+
-  '<div class="form-row"><div><label>Активен</label><select id="fot_active"><option value="true" '+(!ot||ot.is_active?'selected':'')+'>Да</option><option value="false" '+(ot&&!ot.is_active?'selected':'')+'>Нет</option></select></div><div></div></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveOpType('+(otid||0)+')">Сохранить</button></div>')})}
+   openModal('<h2>'+(ot?'✏':'+')+' Тип операции</h2>'+
+   '<div class="form-row"><div><label>Название</label><input id="fot_name" value="'+(ot?ot.name:'')+'"></div><div><label>Порядок</label><input type="number" id="fot_sort" value="'+(ot?ot.sort_order:0)+'"></div></div>'+
+   '<div class="form-row"><div><label>Списание на участке</label><select id="fot_wmode">'+['Детали','Материал','Материал+Детали','Нет'].map(function(m){return '<option '+(ot&&ot.writeoff_mode===m?'selected':'')+'>'+m+'</option>'}).join('')+'</select></div>'+
+   '<div><label>Активен</label><select id="fot_active"><option value="true" '+(!ot||ot.is_active?'selected':'')+'>Да</option><option value="false" '+(ot&&!ot.is_active?'selected':'')+'>Нет</option></select></div></div>'+
+   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveOpType('+(otid||0)+')">Сохранить</button></div>')})}
 function saveOpType(otid){var b={name:document.getElementById('fot_name').value,sort_order:+document.getElementById('fot_sort').value,
-  is_active:document.getElementById('fot_active').value==='true'};if(otid)b.id=otid;
+  is_active:document.getElementById('fot_active').value==='true',writeoff_mode:document.getElementById('fot_wmode').value};if(otid)b.id=otid;
   api('/api/op-types/save','POST',b).then(function(){closeModal();toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 function delOpType(otid){if(!confirm('Удалить?'))return;api('/api/op-types/delete','POST',{id:otid}).then(function(){toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 
