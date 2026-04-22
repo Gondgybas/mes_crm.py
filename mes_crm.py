@@ -147,6 +147,7 @@ class Material(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     code = Column(String(50), unique=True, nullable=False, index=True)
     name = Column(String(200), nullable=False)
+    is_active = Column(Boolean, default=True)
     material_type = Column(String(50), nullable=False, default="Лист")
     category_id = Column(Integer, ForeignKey("material_categories.id"), nullable=True)
     primary_unit = Column(String(20), nullable=False, default="кг")
@@ -521,6 +522,10 @@ def audit(db, uid, action, etype="", eid=0, details=""):
     db.flush()
 
 
+def material_internal_code(material_id: int) -> str:
+    return f"MAT-{material_id:06d}"
+
+
 DEFAULT_OP_TYPES = [
     "Лазерная резка", "Плазменная резка", "Координатная пробивка", "Гибка",
     "Сверление", "Фрезеровка", "Токарка", "Сварка", "Сборка",
@@ -530,7 +535,7 @@ DEFAULT_OP_TYPES = [
 DEFAULT_PERMS = [
     ("mat.view", "Просмотр склада", "Склад"), ("mat.receive", "Поступление", "Склад"),
     ("mat.consume", "Списание материалов", "Склад"), ("mat.create", "Создание материалов", "Склад"),
-    ("mat.edit", "Редактирование материалов", "Склад"),
+    ("mat.edit", "Редактирование материалов", "Склад"), ("mat.delete", "Удаление материалов", "Склад"),
     ("order.view", "Просмотр заказов", "Заказы"), ("order.create", "Создание заказов", "Заказы"),
     ("order.edit", "Редактирование заказов", "Заказы"), ("order.delete", "Удаление заказов", "Заказы"), ("order.status", "Смена статуса", "Заказы"),
     ("order.files", "Файлы заказов", "Заказы"), ("order.reports", "Отчёты", "Заказы"),
@@ -582,6 +587,12 @@ def init_database():
             conn.execute(text("ALTER TABLE part_templates ADD COLUMN is_assembly BOOLEAN DEFAULT 0"))
             conn.commit()
         log.info("Migration: added is_assembly to part_templates")
+    mat_cols = [c["name"] for c in insp.get_columns("materials")]
+    if "is_active" not in mat_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE materials ADD COLUMN is_active BOOLEAN DEFAULT 1"))
+            conn.commit()
+        log.info("Migration: added is_active to materials")
     # Миграция: таблица assembly_components
     if not insp.has_table("assembly_components"):
         Base.metadata.tables["assembly_components"].create(engine)
@@ -694,6 +705,11 @@ def init_database():
             mp.set_custom_data({"color_ral": "9005", "paint_type": "Порошковая"})
             db.add(mp)
             db.flush()
+        for m in db.query(Material).filter((Material.code.is_(None)) | (Material.code == "")).all():
+            if m.id:
+                material_id = int(getattr(m, "id"))
+                m.code = material_internal_code(material_id)
+        db.flush()
         if db.query(Resource).count() == 0:
             for name, rtype, ops, sh, sd in [
                 ("Лазер Trumpf", "Лазерный станок", ["Лазерная резка"], 12, 2),
@@ -761,6 +777,17 @@ def create_app():
         if pt and pt.part_number:
             return f"{pt.name} ({pt.part_number})"
         return pt.name if pt else "?"
+
+    def get_user_permissions(db, user_id):
+        user = db.query(User).get(user_id) if user_id else None
+        if not user or not user.is_active:
+            return set()
+        rc = db.query(RoleConfig).filter(RoleConfig.role == user.role).first()
+        return {p.code for p in (rc.permissions or [])} if rc else set()
+
+    def require_permission(db, user_id, perm_code):
+        if perm_code not in get_user_permissions(db, user_id):
+            raise HTTPException(403, "Недостаточно прав")
 
     def find_resources_for_op(db, op_name):
         all_res = db.query(Resource).filter(Resource.is_available == True).all()
@@ -1073,10 +1100,13 @@ def create_app():
 
     # ─── Materials ──────────────────────────────────
     @app.get("/api/materials")
-    def api_materials(cat_id: int = 0, db: Session = Depends(db_dep)):
+    def api_materials(cat_id: int = 0, active_only: int = 1, db: Session = Depends(db_dep)):
         q = db.query(Material).options(joinedload(Material.metal_grade), joinedload(Material.category))
+        if active_only:
+            q = q.filter(Material.is_active == True)
         if cat_id: q = q.filter(Material.category_id == cat_id)
         return [{"id": m.id, "code": m.code, "name": m.name, "type": m.material_type,
+                 "is_active": m.is_active,
                  "unit": m.primary_unit, "category_id": m.category_id,
                  "category": m.category.name if m.category else "—",
                  "grade": m.metal_grade.code if m.metal_grade else "",
@@ -1091,19 +1121,19 @@ def create_app():
                  "min_kg": m.min_stock_kg, "min_sheets": m.min_stock_sheets,
                  "low_stock": m.low_stock, "description": m.description,
                  "custom_data": m.get_custom_data()}
-                for m in q.order_by(Material.code).all()]
+                for m in q.order_by(Material.name).all()]
 
     @app.get("/api/materials/need-for-orders")
     def api_mat_need(db: Session = Depends(db_dep)):
         result = []
-        for m in db.query(Material).all():
+        for m in db.query(Material).filter(Material.is_active == True).order_by(Material.name).all():
             if m.material_type == "Лист":
                 if m.available_sheets < 0:
-                    result.append({"id": m.id, "code": m.code, "name": m.name,
+                    result.append({"id": m.id, "name": m.name,
                                    "deficit": abs(m.available_sheets), "unit": "л"})
             else:
                 if m.available_kg < 0:
-                    result.append({"id": m.id, "code": m.code, "name": m.name,
+                    result.append({"id": m.id, "name": m.name,
                                    "deficit": round(abs(m.available_kg), 2), "unit": "кг"})
         return result
 
@@ -1112,9 +1142,14 @@ def create_app():
         data = await request.json()
         mid = data.get("id")
         if mid: m = db.query(Material).get(mid)
-        else: m = Material(); db.add(m)
-        for k in ["code", "name", "description", "color_ral", "paint_type"]:
+        else:
+            m = Material(code=f"TMP-MAT-{uuid.uuid4().hex[:12]}")
+            db.add(m)
+        for k in ["name", "description", "color_ral", "paint_type"]:
             if k in data: setattr(m, k, data[k])
+        if not (m.name or "").strip():
+            raise HTTPException(400, "Укажите наименование материала")
+        m.is_active = True
         m.material_type = data.get("material_type", m.material_type or "Лист")
         m.primary_unit = data.get("primary_unit", m.primary_unit or "кг")
         m.category_id = data.get("category_id") or None
@@ -1130,8 +1165,40 @@ def create_app():
             if grade:
                 m.metal_grade = grade
                 m.sheet_weight_kg = m.calc_sheet_weight()
+        db.flush()
+        if (not (m.code or "").strip()) or str(m.code).startswith("TMP-MAT-"):
+            material_id = int(getattr(m, "id"))
+            m.code = material_internal_code(material_id)
         db.flush(); db.commit()
         return {"id": m.id, "sheet_weight": m.sheet_weight_kg}
+
+    @app.post("/api/materials/delete")
+    async def api_delete_mat(request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("user_id", 0)
+        require_permission(db, uid, "mat.delete")
+        mid = data.get("id")
+        m = db.query(Material).get(mid)
+        if not m or not m.is_active:
+            raise HTTPException(404, "Материал не найден")
+        if db.query(Reservation).filter(Reservation.material_id == mid, Reservation.is_active == True).count() > 0:
+            raise HTTPException(400, "Есть активные резервы по материалу")
+        if db.query(PartTemplateMaterial).filter(PartTemplateMaterial.material_id == mid).count() > 0:
+            raise HTTPException(400, "Материал используется в деталях/сборках")
+        if any([
+            (m.quantity_sheets or 0) > 0,
+            round(m.quantity_kg or 0, 6) > 0,
+            round(m.quantity_pcs or 0, 6) > 0,
+            (m.reserved_sheets or 0) > 0,
+            round(m.reserved_kg or 0, 6) > 0,
+        ]):
+            raise HTTPException(400, "Сначала обнулите остатки и резервы материала")
+        m.is_active = False
+        material_id = int(getattr(m, "id"))
+        material_name = str(getattr(m, "name"))
+        audit(db, uid, "Удаление материала", "material", material_id, material_name)
+        db.flush(); db.commit()
+        return {"status": "ok"}
 
     @app.post("/api/materials/receive")
     async def api_receive(request: Request, db: Session = Depends(db_dep)):
@@ -1196,7 +1263,6 @@ def create_app():
         if date_to:
             q = q.filter(MaterialMovement.created_at <= datetime.datetime.fromisoformat(date_to + "T23:59:59"))
         return [{"id": mv.id, "material": mv.material.name if mv.material else "",
-                 "material_code": mv.material.code if mv.material else "",
                  "type": mv.movement_type, "kg": mv.quantity_kg,
                  "sheets": mv.quantity_sheets, "pcs": mv.quantity_pcs,
                  "order": mv.order.order_number if mv.order else "",
@@ -1239,7 +1305,6 @@ def create_app():
                  "customer_name": p.customer.name if p.customer else "—",
                  "description": p.description, "operation_times": p.get_op_times(),
                  "materials": [{"id": pm.id, "material_id": pm.material_id,
-                                "material_code": pm.material.code if pm.material else "",
                                 "material_name": pm.material.name if pm.material else "",
                                 "material_id_val": pm.material_id,
                                 "sheets_input": pm.sheets_input,
@@ -1350,7 +1415,7 @@ def create_app():
                             "template_id": it.part_template_id,
                             "quantity": it.quantity, "completed": it.completed_qty,
                             "rejected": it.rejected_qty, "surplus": it.surplus,
-                            "materials": [{"code": pm.material.code, "name": pm.material.name,
+                            "materials": [{"name": pm.material.name,
                                            "material_id": pm.material_id,
                                            "sheets_needed": pm.calc_sheets_for_qty(it.quantity),
                                            "kg_needed": round(pm.calc_sheets_for_qty(it.quantity) * (pm.material.sheet_weight_kg or 0), 2)}
@@ -1525,7 +1590,6 @@ def create_app():
                  "order_display": r.order.display_name if r.order else "",
                  "order_status": r.order.status if r.order else "",
                  "material": r.material.name if r.material else "",
-                 "material_code": r.material.code if r.material else "",
                  "material_id": r.material_id,
                  "material_type": r.material.material_type if r.material else "",
                  "part_name": pt_display(r.part_template) if r.part_template else "",
@@ -1603,7 +1667,6 @@ def create_app():
         ).filter(Reservation.order_item_id == item_id, Reservation.is_active == True).all()
         return [{"id": r.id, "material_id": r.material_id,
                  "material": r.material.name if r.material else "",
-                 "material_code": r.material.code if r.material else "",
                  "sheets": r.quantity_sheets, "kg": r.quantity_kg,
                  "part_template_id": r.part_template_id,
                  "part_name": pt_display(r.part_template) if r.part_template else "—"} for r in rs]
@@ -2002,7 +2065,7 @@ def create_app():
                      "resource": o.resource.name if o.resource else "—"}
                     for o in db.query(ProductionOp).options(joinedload(ProductionOp.order), joinedload(ProductionOp.resource)).filter(ProductionOp.status == "В работе").all()]
         elif widget == "low_stock":
-            return [{"code": m.code, "name": m.name, "available": m.available_sheets, "min": m.min_stock_sheets}
+            return [{"name": m.name, "available": m.available_sheets, "min": m.min_stock_sheets}
                     for m in db.query(Material).filter(Material.material_type == "Лист",
                     (Material.quantity_sheets - Material.reserved_sheets) <= Material.min_stock_sheets).all()]
         elif widget == "parts_today":
@@ -2463,7 +2526,7 @@ function modalOrderDetail(oid){
   '<table><thead><tr><th>Деталь</th><th>Кол-во</th><th>Готово</th><th>Изл.</th><th>Материалы</th><th></th></tr></thead>'+
   '<tbody>'+(o.items||[]).map(function(it){return '<tr><td><strong>'+it.part_name+'</strong></td><td>'+it.quantity+'</td><td>'+it.completed+'/'+it.quantity+'</td>'+
     '<td class="'+(it.surplus>0?'low':'')+'">'+(it.surplus>0?'+'+it.surplus:'—')+'</td>'+
-    '<td style="font-size:.8em">'+((it.materials||[]).map(function(m){return m.code+': '+m.sheets_needed+'л'}).join('<br>')||'—')+'</td>'+
+    '<td style="font-size:.8em">'+((it.materials||[]).map(function(m){return m.name+': '+m.sheets_needed+'л'}).join('<br>')||'—')+'</td>'+
     '<td>'+(hasPerm('order.edit')?'<button class="btn sm" onclick="modalEditItem('+oid+','+it.id+')">✏</button><button class="btn sm" onclick="delItem('+it.id+','+oid+')">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table>'+
   '<div class="section-hdr">Операции</div>'+
   '<table><thead><tr><th>#</th><th>Деталь</th><th>Тип</th><th>Ресурс</th><th>План</th><th>Время</th><th>Статус</th><th></th></tr></thead>'+
@@ -2540,7 +2603,7 @@ function pgPartsDB(c){
     '<input class="ctl" id="ptSearchInput" style="width:280px" placeholder="🔍 Поиск..." value="'+esc(ptSearch)+'"></div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th><th>Чертёж</th><th>Заказчик</th><th>Материалы</th><th>Операции</th><th>📎</th><th></th></tr></thead>'+
   '<tbody>'+pts.map(function(p){
-    var mats=(p.materials||[]).map(function(m){return m.material_code+': '+m.sheets_input+'л→'+m.parts_per_sheets+'шт'}).join('<br>')||'—';
+    var mats=(p.materials||[]).map(function(m){return m.material_name+': '+m.sheets_input+'л→'+m.parts_per_sheets+'шт'}).join('<br>')||'—';
     var opT=p.operation_times||{};var opStr=Object.entries(opT).map(function(e){return e[0]+': '+(typeof e[1]==='object'?fmtMinToH(Math.round(e[1].per_one)):e[1])}).join(', ')||'—';
     var filesHtml='';
     if((p.files||[]).length&&hasPerm('parts.files')){
@@ -2607,7 +2670,7 @@ function calcOneOp(n){var q=document.querySelector('.fp_op_qty[data-op="'+n+'"]'
   if(!q||!t||!o)return;var qty=+q.value||1;var tot=+t.value||0;o.value=qty>0?(tot/qty).toFixed(2):''}
 
 function renderPTMats(allMats){var el=document.getElementById('fp_mats_list');if(!el)return;
-  var matOpts=allMats.map(function(m){return{v:String(m.id),t:m.code+' — '+m.name}});
+  var matOpts=allMats.map(function(m){return{v:String(m.id),t:m.name}});
   el.innerHTML=ptMaterials.map(function(m,i){
     var ssHtml=SS('ptm_'+i,matOpts,String(m.material_id),'Материал...');
     return '<div class="mat-row">'+
@@ -2675,7 +2738,7 @@ function pgWarehouse(c){
     '<button class="btn" onclick="modalEditHistory()">📜 История</button>'+
     (need.length?'<button class="btn warn" onclick="modalNeedMat()">⚠ Дефицит ('+need.length+')</button>':'')+'</div>'+
   '<div class="sub-tabs">'+cats.map(function(ct){return '<button class="'+(ct.id===whCatId?'active':'')+'" onclick="whCatId='+ct.id+';pgWarehouse(document.getElementById(\'mainContent\'))">'+ct.name+'</button>'}).join('')+'</div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Код</th><th>Наименование</th>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th>'+
     catFields.map(function(f){return '<th>'+f.label+'</th>'}).join('')+
     '<th>Кол</th><th>Рез</th><th>Св</th><th></th></tr></thead>'+
   '<tbody>'+filtered.map(function(m){var cd=m.custom_data||{};
@@ -2688,17 +2751,18 @@ function pgWarehouse(c){
     else if(cat&&cat.type==='Краска')qtyCol='<td>'+fmtN(m.qty_kg)+'кг</td><td>—</td><td>'+fmtN(m.available_kg)+'</td>';
     else if(cat&&cat.type==='Метиз')qtyCol='<td>'+fmtN(m.qty_pcs)+'шт</td><td>—</td><td>—</td>';
     else qtyCol='<td>'+fmtN(m.qty_kg||m.qty_pcs)+' '+m.unit+'</td><td>—</td><td>—</td>';
-    return '<tr><td><strong>'+m.code+'</strong></td><td>'+m.name+'</td>'+fieldCols+qtyCol+
+    return '<tr><td><strong>'+m.name+'</strong></td>'+fieldCols+qtyCol+
     '<td><button class="btn sm" onclick="modalMovements('+m.id+',\''+esc(m.name)+'\')">📜</button>'+
-    (hasPerm('mat.edit')?'<button class="btn sm" onclick="modalMaterial('+m.id+')">✏</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+    (hasPerm('mat.edit')?'<button class="btn sm" onclick="modalMaterial('+m.id+')">✏</button>':'')+
+    (hasPerm('mat.delete')?'<button class="btn sm" onclick="delMaterial('+m.id+',\''+esc(m.name)+'\')" style="color:var(--err)" title="Удалить материал">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
 
 function modalNeedMat(){api('/api/materials/need-for-orders').then(function(need){
-  openModal('<h2>⚠ Дефицит</h2><table><thead><tr><th>Код</th><th>Название</th><th>Дефицит</th></tr></thead>'+
-  '<tbody>'+need.map(function(n){return '<tr><td><strong>'+n.code+'</strong></td><td>'+n.name+'</td><td class="low">'+n.deficit+' '+n.unit+'</td></tr>'}).join('')+'</tbody></table>'+
+  openModal('<h2>⚠ Дефицит</h2><table><thead><tr><th>Название</th><th>Дефицит</th></tr></thead>'+
+  '<tbody>'+need.map(function(n){return '<tr><td><strong>'+n.name+'</strong></td><td class="low">'+n.deficit+' '+n.unit+'</td></tr>'}).join('')+'</tbody></table>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')})}
 
 function modalAdjust(){api('/api/materials').then(function(mats){
-  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.code+' — '+m.name,type:m.type,qty_sheets:m.qty_sheets,qty_kg:m.qty_kg,qty_pcs:m.qty_pcs}});
+  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.name,type:m.type,qty_sheets:m.qty_sheets,qty_kg:m.qty_kg,qty_pcs:m.qty_pcs}});
   openModal('<h2>🔧 Изменить количество</h2>'+
   '<div class="form-row full"><div><label>Материал</label>'+SS('fa_mat',matOpts,'','Поиск материала...',function(v){adjChg(v)})+'</div></div>'+
   '<div id="fa_fields"></div>'+
@@ -2725,7 +2789,7 @@ function submitAdjust(){var mid=+ssVal('fa_mat');if(!mid){toast('Выберит�
 function modalEditHistory(){
   Promise.all([api('/api/materials'),api('/api/materials/movement-types'),api('/api/users')]).then(function(arr){
   var mats=arr[0],mvTypes=arr[1],users=arr[2];
-  var matOpts=[{v:'0',t:'Все'}].concat(mats.map(function(m){return{v:String(m.id),t:m.code+' — '+m.name}}));
+  var matOpts=[{v:'0',t:'Все'}].concat(mats.map(function(m){return{v:String(m.id),t:m.name}}));
   var typeOpts=[{v:'',t:'Все'}].concat(mvTypes.map(function(t){return{v:t,t:t}}));
   var userOpts=[{v:'0',t:'Все'}].concat(users.map(function(u){return{v:String(u.id),t:u.full_name}}));
   openModal('<h2>📜 История движений материалов</h2>'+
@@ -2746,7 +2810,7 @@ function loadEditHistory(){var url='/api/materials/edit-history?';
   api(url).then(function(data){
   document.getElementById('ehResult').innerHTML=data.length?
     '<table><thead><tr><th>Дата</th><th>Тип</th><th>Материал</th><th>Л</th><th>Кг</th><th>Шт</th><th>Заказ</th><th>Кто</th><th>Комментарий</th></tr></thead>'+
-    '<tbody>'+data.map(function(m){return '<tr><td style="font-size:.8em;white-space:nowrap">'+fmtDT(m.date)+'</td><td>'+statusBadge(m.type)+'</td><td style="font-size:.8em">'+m.material_code+'</td>'+
+    '<tbody>'+data.map(function(m){return '<tr><td style="font-size:.8em;white-space:nowrap">'+fmtDT(m.date)+'</td><td>'+statusBadge(m.type)+'</td><td style="font-size:.8em">'+m.material+'</td>'+
       '<td>'+(m.sheets||'—')+'</td><td>'+fmtN(m.kg)+'</td><td>'+(m.pcs||'—')+'</td><td>'+(m.order||'—')+'</td><td>'+(m.user||'—')+'</td><td style="font-size:.85em">'+m.note+'</td></tr>'}).join('')+'</tbody></table>'
     :'<div class="info-box">Нет записей</div>'}).catch(function(e){toast(e.message,'err')})}
 
@@ -2773,9 +2837,8 @@ function modalMaterial(mid){
     return h}
 
   openModal('<h2>'+(m?'✏':'+')+' Материал</h2>'+
-  '<div class="form-row"><div><label>Код</label><input id="fm_code" value="'+(m?m.code:'')+'"></div><div><label>Наименование</label><input id="fm_name" value="'+(m?m.name:'')+'"></div></div>'+
-  '<div class="form-row"><div><label>Категория</label>'+SS('fm_cat',catOpts,curCatId,'Категория',function(v){document.getElementById("fm_custom_area").innerHTML=buildCF(v)})+'</div>'+
-    '<div><label>Ед.</label>'+SS('fm_unit',unitOpts,m?m.unit:'кг','Ед.')+'</div></div>'+
+  '<div class="form-row"><div><label>Наименование</label><input id="fm_name" value="'+(m?m.name:'')+'"></div><div><label>Категория</label>'+SS('fm_cat',catOpts,curCatId,'Категория',function(v){document.getElementById("fm_custom_area").innerHTML=buildCF(v)})+'</div></div>'+
+  '<div class="form-row"><div><label>Ед.</label>'+SS('fm_unit',unitOpts,m?m.unit:'кг','Ед.')+'</div><div></div></div>'+
   '<div id="fm_custom_area">'+buildCF(curCatId)+'</div>'+
   '<div class="form-row"><div><label>Мин. остаток (л)</label><input type="number" id="fm_minsh" value="'+(m?m.min_sheets:0)+'"></div>'+
     '<div><label>Мин. остаток (кг)</label><input type="number" id="fm_minkg" step="0.1" value="'+(m?m.min_kg:0)+'"></div></div>'+
@@ -2789,7 +2852,7 @@ function saveMat(mid){
     if(f.type==='grade_select'){var v=ssVal('cf_'+f.key);customData[f.key]=v;if(f.key==='grade')gradeId=+v||null}
     else if(f.type==='number'){var el=document.getElementById('cf_'+f.key);customData[f.key]=el?+el.value||0:0}
     else{var el=document.getElementById('cf_'+f.key);customData[f.key]=el?el.value:''}})}
-  var b={code:document.getElementById('fm_code').value,name:document.getElementById('fm_name').value,
+  var b={name:document.getElementById('fm_name').value,
     material_type:mtype,primary_unit:ssVal('fm_unit'),category_id:catId,grade_id:gradeId,
     thickness:customData.thickness||null,width:customData.width||null,length:customData.length||null,
     diameter:customData.diameter||null,wall:customData.wall||null,
@@ -2799,8 +2862,11 @@ function saveMat(mid){
     custom_data:customData};if(mid)b.id=mid;
   api('/api/materials/save','POST',b).then(function(){closeModal();toast('Сохранено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
+function delMaterial(mid,name){if(!confirm('Удалить материал «'+name+'»?\n\nУдаление доступно только без остатков, резервов и привязок к деталям.'))return;
+  api('/api/materials/delete','POST',{id:mid,user_id:U.id}).then(function(){toast('Материал удалён','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+
 function modalReceive(){api('/api/materials').then(function(mats){
-  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.code+' — '+m.name,type:m.type,sw:m.sheet_weight||0}});
+  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.name,type:m.type,sw:m.sheet_weight||0}});
   openModal('<h2>📥 Поступление</h2>'+
   '<div class="form-row full"><div><label>Материал</label>'+SS('fr_mat',matOpts,'','Поиск...',function(v){recvChg(v)})+'</div></div>'+
   '<div id="fr_sh" class="form-row"><div><label>Листов</label><input type="number" id="fr_sheets" min="1" value="1" oninput="recvCalc()"></div>'+
@@ -2932,7 +2998,7 @@ function opWoCompChg(){
   document.getElementById('fopwo_mat_area').innerHTML=
     '<div class="form-row full"><div><label>Материал</label><select id="fopwo_mat">'+
     items.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
-      r.material_code+' — '+r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
+      r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
     '</select></div></div>'}
 
 function submitOpWriteoff(opid,showMat,showParts){
@@ -2987,7 +3053,7 @@ function pgReservations(c){api('/api/reservations?active_only=1').then(function(
     '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(resFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select></div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Заказ</th><th>Ст.</th><th>Деталь</th><th>Материал</th><th>Зарез. (л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th></tr></thead>'+
   '<tbody>'+rs.map(function(r){return '<tr><td>'+r.order_display+'</td><td>'+statusBadge(r.order_status)+'</td><td>'+(r.part_name||'—')+'</td>'+
-    '<td>'+r.material_code+' — '+r.material+'</td><td>'+(r.sheets||'—')+'</td>'+
+    '<td>'+r.material+'</td><td>'+(r.sheets||'—')+'</td>'+
     '<td>'+(r.consumed_sheets||0)+'</td><td class="'+(r.remaining_sheets>0?'low':'')+'">'+(r.remaining_sheets||0)+'</td>'+
     '<td>'+(r.reserved_by||'—')+'</td>'+
     '<td>'+(hasPerm('reserve.edit')?'<button class="btn sm" onclick="modalEditRes('+r.id+','+r.sheets+','+r.kg+',\''+esc(r.note)+'\')">✏</button>':'')+
@@ -3009,7 +3075,7 @@ function resOrdChg2(val){var ord=window._resOrds.find(function(o){return o.v===v
   document.getElementById('fres_mat').innerHTML='<option value="">— сначала деталь —</option>'}
 function resItemChg2(){var sel=document.getElementById('fres_item');var opt=sel.options[sel.selectedIndex];
   var mats=[];try{mats=JSON.parse(opt.dataset.mats||'[]')}catch(e){}
-  document.getElementById('fres_mat').innerHTML=mats.map(function(m){return '<option value="'+m.material_id+'">'+m.code+' — '+m.name+' ('+m.sheets_needed+'л)</option>'}).join('')||'<option value="">Нет</option>'}
+  document.getElementById('fres_mat').innerHTML=mats.map(function(m){return '<option value="'+m.material_id+'">'+m.name+' ('+m.sheets_needed+'л)</option>'}).join('')||'<option value="">Нет</option>'}
 function submitCreateRes(){var ordId=+ssVal('fres_ord');var itemSel=document.getElementById('fres_item');
   var tid=+(itemSel.options[itemSel.selectedIndex]||{}).dataset?.tid||null;var matId=+document.getElementById('fres_mat').value;
   if(!ordId||!matId){toast('Заполните','err');return}
@@ -3114,7 +3180,7 @@ function woResChg2(){
 
 function woItemChg2(){if(woTab!=='Материал')return;var itemId=+document.getElementById('fwo_item').value;if(!itemId)return;
   api('/api/reservations/by-item/'+itemId).then(function(rs){
-    document.getElementById('fwo_mat').innerHTML=rs.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'">'+r.material_code+' — '+r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
+    document.getElementById('fwo_mat').innerHTML=rs.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'">'+r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
 function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementById('fwo_item').value;
   if(!ordId){toast('Заказ','err');return}if(!itemId){toast('Деталь','err');return}
   var resId=+document.getElementById('fwo_res_sel').value||null;
