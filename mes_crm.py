@@ -133,6 +133,8 @@ class MaterialCategory(Base):
     sort_order = Column(Integer, default=0)
     description = Column(Text, default="")
     custom_fields = Column(Text, default="[]")
+    use_weight_formula = Column(Boolean, default=False)
+    weight_formula = Column(Text, default="")
 
     def get_custom_fields(self):
         try: return json.loads(self.custom_fields or "[]")
@@ -597,6 +599,14 @@ def init_database():
     if not insp.has_table("assembly_components"):
         Base.metadata.tables["assembly_components"].create(engine)
         log.info("Migration: created assembly_components table")
+    # Миграция: weight_formula в material_categories
+    cat_cols = [c["name"] for c in insp.get_columns("material_categories")]
+    if "use_weight_formula" not in cat_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE material_categories ADD COLUMN use_weight_formula BOOLEAN DEFAULT 0"))
+            conn.execute(text("ALTER TABLE material_categories ADD COLUMN weight_formula TEXT DEFAULT ''"))
+            conn.commit()
+        log.info("Migration: added weight_formula to material_categories")
 
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
@@ -1056,7 +1066,9 @@ def create_app():
     def api_mat_cats(db: Session = Depends(db_dep)):
         return [{"id": c.id, "name": c.name, "type": c.material_type,
                  "sort_order": c.sort_order, "description": c.description,
-                 "custom_fields": c.get_custom_fields()}
+                 "custom_fields": c.get_custom_fields(),
+                 "use_weight_formula": bool(c.use_weight_formula),
+                 "weight_formula": c.weight_formula or ""}
                 for c in db.query(MaterialCategory).order_by(MaterialCategory.sort_order).all()]
 
     @app.post("/api/material-categories/save")
@@ -1069,12 +1081,39 @@ def create_app():
         c.material_type = data.get("type", c.material_type or "Прочее")
         c.sort_order = int(data.get("sort_order", c.sort_order or 0))
         c.description = data.get("description", c.description or "")
+        c.use_weight_formula = bool(data.get("use_weight_formula", False))
+        c.weight_formula = data.get("weight_formula", c.weight_formula or "")
         if "custom_fields" in data:
             c.set_custom_fields(data["custom_fields"])
         db.flush(); db.commit()
         return {"id": c.id}
 
     # ─── Customers ──────────────────────────────────
+    @app.post("/api/material-categories/calc-weight")
+    async def api_calc_weight(request: Request, db: Session = Depends(db_dep)):
+        """Вычислить вес по формуле категории с переданными параметрами."""
+        import math as _math
+        data = await request.json()
+        # Поддержка прямой передачи формулы (для теста в UI)
+        formula_test = data.get("formula_test", "").strip()
+        if not formula_test:
+            cat_id = data.get("category_id")
+            if not cat_id:
+                return {"weight": None, "error": "Не указана категория"}
+            cat = db.query(MaterialCategory).get(cat_id)
+            if not cat or not cat.use_weight_formula or not (cat.weight_formula or "").strip():
+                return {"weight": None, "error": "Формула не задана"}
+            formula_test = cat.weight_formula
+        variables = {k: float(v or 0) for k, v in data.get("params", {}).items()}
+        variables.setdefault("pi", _math.pi)
+        variables["sqrt"] = _math.sqrt
+        variables["pow"] = pow
+        try:
+            result = float(eval(formula_test, {"__builtins__": {}}, variables))
+            return {"weight": round(result, 4)}
+        except Exception as e:
+            return {"weight": None, "error": str(e)}
+
     @app.get("/api/customers")
     def api_customers(search: str = "", db: Session = Depends(db_dep)):
         q = db.query(Customer)
@@ -1165,6 +1204,24 @@ def create_app():
             if grade:
                 m.metal_grade = grade
                 m.sheet_weight_kg = m.calc_sheet_weight()
+        # Авторасчёт веса по формуле категории (если задана)
+        if m.category_id:
+            cat = db.query(MaterialCategory).get(m.category_id)
+            if cat and cat.use_weight_formula and (cat.weight_formula or "").strip():
+                import math as _math
+                cdata = m.get_custom_data()
+                variables = {k: float(v or 0) for k, v in cdata.items() if v is not None}
+                # стандартные поля материала
+                for attr, key in [("thickness_mm","thickness"),("width_mm","width"),("length_mm","length"),
+                                   ("diameter_mm","diameter"),("wall_mm","wall")]:
+                    val = getattr(m, attr, None)
+                    if val is not None: variables.setdefault(key, float(val))
+                grade = db.query(MetalGrade).get(m.metal_grade_id) if m.metal_grade_id else None
+                if grade: variables["density"] = float(grade.density)
+                variables.update({"pi": _math.pi, "sqrt": _math.sqrt, "pow": pow})
+                try:
+                    m.sheet_weight_kg = round(float(eval(cat.weight_formula, {"__builtins__": {}}, variables)), 4)
+                except Exception: pass
         db.flush()
         if (not (m.code or "").strip()) or str(m.code).startswith("TMP-MAT-"):
             material_id = int(getattr(m, "id"))
@@ -1234,8 +1291,13 @@ def create_app():
         mat = db.query(Material).get(data["material_id"])
         if not mat: raise HTTPException(404)
         new_sh = int(data.get("new_sheets", mat.quantity_sheets))
-        new_kg = float(data.get("new_kg", mat.quantity_kg))
         new_pcs = float(data.get("new_pcs", mat.quantity_pcs))
+        # Авторасчёт кг: если передан auto_calc_kg=true, вычисляем из sheet_weight_kg
+        if data.get("auto_calc_kg") and mat.material_type == "Лист":
+            sw = mat.sheet_weight_kg or 0
+            new_kg = round(new_sh * sw, 4)
+        else:
+            new_kg = float(data.get("new_kg", mat.quantity_kg))
         diff_sh = new_sh - mat.quantity_sheets
         diff_kg = round(new_kg - mat.quantity_kg, 2)
         diff_pcs = round(new_pcs - mat.quantity_pcs, 2)
@@ -2762,7 +2824,7 @@ function modalNeedMat(){api('/api/materials/need-for-orders').then(function(need
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')})}
 
 function modalAdjust(){api('/api/materials').then(function(mats){
-  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.name,type:m.type,qty_sheets:m.qty_sheets,qty_kg:m.qty_kg,qty_pcs:m.qty_pcs}});
+  var matOpts=mats.map(function(m){return{v:String(m.id),t:m.name,type:m.type,qty_sheets:m.qty_sheets,qty_kg:m.qty_kg,qty_pcs:m.qty_pcs,sheet_weight:m.sheet_weight||0}});
   openModal('<h2>🔧 Изменить количество</h2>'+
   '<div class="form-row full"><div><label>Материал</label>'+SS('fa_mat',matOpts,'','Поиск материала...',function(v){adjChg(v)})+'</div></div>'+
   '<div id="fa_fields"></div>'+
@@ -2771,19 +2833,31 @@ function modalAdjust(){api('/api/materials').then(function(mats){
   window._adjMats=matOpts})}
 function adjChg(val){if(!window._adjMats)return;var m=window._adjMats.find(function(x){return x.v===val});if(!m)return;
   var h='';
-  if(m.type==='Лист')h='<div class="form-row"><div><label>Текущее: '+m.qty_sheets+'л / '+fmtN(m.qty_kg)+'кг</label></div></div>'+
-    '<div class="form-row"><div><label>Новое кол-во (листов)</label><input type="number" id="fa_sheets" value="'+m.qty_sheets+'"></div>'+
-    '<div><label>Новое кол-во (кг)</label><input type="number" id="fa_kg" step="0.01" value="'+m.qty_kg+'"></div></div>';
+  if(m.type==='Лист'){
+    var swHint=m.sheet_weight>0?'<span style="color:var(--text3);font-size:.8em">Вес листа: '+m.sheet_weight+' кг</span>':'';
+    h='<div class="form-row"><div><label>Текущее: '+m.qty_sheets+'л / '+fmtN(m.qty_kg)+'кг</label></div></div>'+
+    '<div class="form-row"><div><label>Новое кол-во (листов)</label><input type="number" id="fa_sheets" value="'+m.qty_sheets+'" oninput="adjCalcKg()"></div>'+
+    '<div><label>Новое кол-во (кг) '+swHint+'</label><input type="number" id="fa_kg" step="0.01" value="'+m.qty_kg+'"></div></div>';
+    if(m.sheet_weight>0){h+='<div class="form-row"><div><label><input type="checkbox" id="fa_auto_kg" checked onchange="adjCalcKg()"> Авто-расчёт кг по весу листа ('+m.sheet_weight+' кг/л)</label></div></div>'}
+  }
   else if(m.type==='Краска'||m.type==='Труба'||m.type==='Пруток')h='<div class="form-row"><div><label>Текущее: '+fmtN(m.qty_kg)+' кг</label></div></div>'+
     '<div class="form-row"><div><label>Новое (кг)</label><input type="number" id="fa_kg" step="0.01" value="'+m.qty_kg+'"></div><div></div></div>';
   else h='<div class="form-row"><div><label>Текущее: '+fmtN(m.qty_pcs)+' шт</label></div></div>'+
     '<div class="form-row"><div><label>Новое (шт)</label><input type="number" id="fa_pcs" step="0.01" value="'+m.qty_pcs+'"></div><div></div></div>';
   document.getElementById('fa_fields').innerHTML=h}
+function adjCalcKg(){var chk=document.getElementById('fa_auto_kg');if(!chk||!chk.checked)return;
+  var mid=+ssVal('fa_mat');if(!window._adjMats)return;var m=window._adjMats.find(function(x){return x.v===String(mid)});
+  if(!m||!m.sheet_weight)return;var sh=+document.getElementById('fa_sheets').value||0;
+  var kgEl=document.getElementById('fa_kg');if(kgEl)kgEl.value=(sh*m.sheet_weight).toFixed(4)}
 function submitAdjust(){var mid=+ssVal('fa_mat');if(!mid){toast('Выберите материал','err');return}
   var note=document.getElementById('fa_note').value.trim();if(!note){toast('Укажите причину корректировки','err');return}
   var b={material_id:mid,user_id:U.id,note:note};
   var shEl=document.getElementById('fa_sheets'),kgEl=document.getElementById('fa_kg'),pcEl=document.getElementById('fa_pcs');
-  if(shEl)b.new_sheets=+shEl.value;if(kgEl)b.new_kg=+kgEl.value;if(pcEl)b.new_pcs=+pcEl.value;
+  var autoChk=document.getElementById('fa_auto_kg');
+  if(shEl)b.new_sheets=+shEl.value;
+  if(kgEl)b.new_kg=+kgEl.value;
+  if(pcEl)b.new_pcs=+pcEl.value;
+  if(autoChk&&autoChk.checked)b.auto_calc_kg=true;
   api('/api/materials/adjust','POST',b).then(function(){closeModal();toast('Количество изменено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 function modalEditHistory(){
@@ -2821,7 +2895,7 @@ function modalMaterial(mid){
   p1.then(function(ms){var m=ms?ms.find(function(x){return x.id===mid}):null;
   var catOpts=cats.map(function(c){return{v:String(c.id),t:c.name}});
   var UNITS=['кг','лист','м','шт','л'];var unitOpts=UNITS.map(function(u){return{v:u,t:u}});
-  var gradeOpts=[{v:'',t:'— нет —'}].concat(grades.map(function(g){return{v:String(g.id),t:g.code+' (ρ='+g.density+')'}}));
+  var gradeOpts=[{v:'',t:'— нет —'}].concat(grades.map(function(g){return{v:String(g.id),t:g.code+' (ρ='+g.density+')',density:g.density}}));
   var curCatId=m?String(m.category_id||''):(cats.length?String(cats[0].id):'');
   window._matGrades=gradeOpts;window._matCats=cats;window._matCustomData=m?m.custom_data:{};
 
@@ -2831,10 +2905,30 @@ function modalMaterial(mid){
     var customData=window._matCustomData||{};
     var h='<div class="section-hdr">Параметры: '+cat.name+'</div>';
     fields.forEach(function(f){var val=customData[f.key]||'';
-      if(f.type==='grade_select')h+='<div class="form-row"><div><label>'+f.label+'</label>'+SS('cf_'+f.key,gradeOpts,val,'Марка')+'</div><div></div></div>';
-      else if(f.type==='number')h+='<div class="form-row"><div><label>'+f.label+'</label><input type="number" id="cf_'+f.key+'" step="0.1" value="'+val+'"></div><div></div></div>';
+      if(f.type==='grade_select')h+='<div class="form-row"><div><label>'+f.label+'</label>'+SS('cf_'+f.key,gradeOpts,val,'Марка',function(){calcWeightFromFormula(catId)})+'</div><div></div></div>';
+      else if(f.type==='number')h+='<div class="form-row"><div><label>'+f.label+'</label><input type="number" id="cf_'+f.key+'" step="0.1" value="'+val+'" oninput="calcWeightFromFormula(\''+catId+'\')"></div><div></div></div>';
       else h+='<div class="form-row"><div><label>'+f.label+'</label><input id="cf_'+f.key+'" value="'+val+'"></div><div></div></div>';});
+    if(cat.use_weight_formula&&cat.weight_formula){
+      h+='<div class="form-row"><div><label>Расчётный вес (кг/ед.)</label>'+
+         '<input id="fm_calc_weight" disabled style="font-weight:700;color:var(--ok);font-size:1.05em" placeholder="Вычисляется...">'+
+         '</div><div><label style="font-size:.75em;color:var(--text3)">Формула: '+esc(cat.weight_formula)+'</label></div></div>'
+    }
     return h}
+  function calcWeightFromFormula(catId){
+    var cat=(window._matCats||[]).find(function(c){return String(c.id)===String(catId)});
+    if(!cat||!cat.use_weight_formula||!cat.weight_formula)return;
+    var params={};(cat.custom_fields||[]).forEach(function(f){
+      if(f.type==='number'){var el=document.getElementById('cf_'+f.key);if(el)params[f.key]=+el.value||0}
+      else if(f.type==='grade_select'){var v=ssVal('cf_'+f.key);
+        var g=(window._matGrades||[]).find(function(x){return String(x.v)===String(v)});
+        if(g&&g.density)params.density=g.density;
+        params[f.key]=v?+v:0}
+    });
+    api('/api/material-categories/calc-weight','POST',{formula_test:cat.weight_formula,params:params}).then(function(r){
+      var el=document.getElementById('fm_calc_weight');if(!el)return;
+      if(r.weight!=null){el.value=r.weight+' кг';el.style.color='var(--ok)'}
+      else{el.value='Ошибка: '+(r.error||'');el.style.color='var(--err)'}
+    }).catch(function(){})}
 
   openModal('<h2>'+(m?'✏':'+')+' Материал</h2>'+
   '<div class="form-row"><div><label>Наименование</label><input id="fm_name" value="'+(m?m.name:'')+'"></div><div><label>Категория</label>'+SS('fm_cat',catOpts,curCatId,'Категория',function(v){document.getElementById("fm_custom_area").innerHTML=buildCF(v)})+'</div></div>'+
@@ -3373,16 +3467,18 @@ function delGrade(gid){if(!confirm('Удалить?'))return;api('/api/grades/de
 var catFields=[];
 function setCategories(sc){api('/api/material-categories').then(function(cats){
   sc.innerHTML='<button class="btn primary" onclick="modalCat()" style="margin-bottom:12px">+ Категория</button>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Тип</th><th>Порядок</th><th>Поля</th><th></th></tr></thead>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Тип</th><th>Порядок</th><th>Поля</th><th>Формула веса</th><th></th></tr></thead>'+
   '<tbody>'+cats.map(function(c){var flds=(c.custom_fields||[]).map(function(f){return f.label+' ('+f.type+')'}).join(', ')||'—';
+    var fml=c.use_weight_formula?'<span class="badge b-ok">✓ '+((c.weight_formula||'').substring(0,30)+(c.weight_formula&&c.weight_formula.length>30?'…':''))+'</span>':'—';
     return '<tr><td><strong>'+c.name+'</strong></td><td>'+c.type+'</td><td>'+c.sort_order+'</td>'+
-    '<td style="font-size:.8em">'+flds+'</td>'+
+    '<td style="font-size:.8em">'+flds+'</td><td style="font-size:.8em">'+fml+'</td>'+
     '<td><button class="btn sm" onclick="modalCat('+c.id+')">✏</button></td></tr>'}).join('')+'</tbody></table></div>'})}
 function modalCat(cid){
   var p1=cid?api('/api/material-categories'):Promise.resolve(null);
   p1.then(function(cs){var c=cs?cs.find(function(x){return x.id===cid}):null;
   catFields=c?(c.custom_fields||[]).map(function(f){return{key:f.key,label:f.label,type:f.type}}):[];
   var TYPES=['Лист','Труба','Пруток','Метиз','Краска','Прочее'];
+  var useFormula=c?c.use_weight_formula:false;var formula=c?c.weight_formula||'':'';
   openModal('<h2>'+(c?'✏':'+')+' Категория</h2>'+
   '<div class="form-row"><div><label>Название</label><input id="fcat_name" value="'+(c?c.name:'')+'"></div>'+
     '<div><label>Тип</label><select id="fcat_type">'+TYPES.map(function(t){return '<option '+(c&&c.type===t?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div></div>'+
@@ -3391,22 +3487,62 @@ function modalCat(cid){
   '<div class="section-hdr">Кастомные параметры <button class="btn sm" onclick="addCatField()">+ Поле</button></div>'+
   '<div class="info-box">Типы: <strong>text</strong> — текст, <strong>number</strong> — число, <strong>grade_select</strong> — выбор марки</div>'+
   '<div id="fcat_fields_list"></div>'+
+  // Формула
+  '<div class="section-hdr">Формула расчёта веса</div>'+
+  '<div style="background:var(--bg);border:1px solid var(--s2);border-radius:var(--r);padding:10px;margin-bottom:8px">'+
+    '<label style="display:flex;align-items:center;gap:8px;cursor:pointer;margin-bottom:8px"><input type="checkbox" id="fcat_use_formula" '+(useFormula?'checked':'')+' onchange="catFormulaToggle()" style="width:16px;height:16px;accent-color:var(--ok)"> <strong>Использовать формулу для авторасчёта веса</strong></label>'+
+    '<div id="fcat_formula_area" style="display:'+(useFormula?'block':'none')+'">'+
+      '<div class="info-box" style="font-size:.8em;margin-bottom:6px">'+
+        'Формула должна возвращать <strong>вес единицы материала в кг</strong>.<br>'+
+        'Доступные переменные: ключи параметров выше + <strong>density</strong> (плотность марки), <strong>pi</strong>, <strong>sqrt(x)</strong><br>'+
+        'Пример (лист): <code>thickness * width * length / 1000000 * density</code><br>'+
+        'Пример (труба): <code>pi * ((diameter/2)**2 - ((diameter - 2*wall)/2)**2) * length / 1000000 * density</code>'+
+      '</div>'+
+      '<div class="form-row full"><div><label>Формула</label>'+
+        '<input id="fcat_formula" value="'+esc(formula)+'" placeholder="thickness * width * length / 1000000 * density" style="font-family:monospace"></div></div>'+
+      '<div><label style="font-size:.8em;color:var(--text3)">Вставить переменную:</label> '+
+        '<span id="fcat_vars_btns"></span>'+
+        '<button class="btn sm" onclick="catInsertVar(\'density\')" style="margin:2px">density</button>'+
+        '<button class="btn sm" onclick="catInsertVar(\'pi\')" style="margin:2px">pi</button>'+
+        '<button class="btn sm" onclick="catInsertVar(\'sqrt(\')" style="margin:2px">sqrt()</button></div>'+
+      '<div style="margin-top:6px"><button class="btn sm ok" onclick="testCatFormula()">🧮 Проверить формулу</button> <span id="fcat_formula_test" style="font-size:.85em"></span></div>'+
+    '</div>'+
+  '</div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveCat('+(cid||0)+')">Сохранить</button></div>');
   renderCatFields()})}
+function catFormulaToggle(){var chk=document.getElementById('fcat_use_formula');
+  document.getElementById('fcat_formula_area').style.display=chk.checked?'block':'none'}
+function catInsertVar(v){var inp=document.getElementById('fcat_formula');if(!inp)return;
+  var pos=inp.selectionStart;var val=inp.value;inp.value=val.substring(0,pos)+v+val.substring(pos);
+  inp.focus();inp.setSelectionRange(pos+v.length,pos+v.length)}
+function catUpdateVarBtns(){var btns=document.getElementById('fcat_vars_btns');if(!btns)return;
+  btns.innerHTML=catFields.filter(function(f){return f.type==='number'||f.type==='grade_select'}).map(function(f){
+    return '<button class="btn sm" onclick="catInsertVar(\''+f.key+'\')" style="margin:2px">'+f.key+'</button>'}).join('')}
+function testCatFormula(){var formula=document.getElementById('fcat_formula').value.trim();var out=document.getElementById('fcat_formula_test');
+  if(!formula){out.textContent='Формула не задана';return}
+  // Собираем тестовые значения из параметров (все number/grade_select = 1)
+  var vars={};catFields.forEach(function(f){if(f.type==='number'||f.type==='grade_select')vars[f.key]=1});
+  vars.density=7.85;vars.thickness=3;vars.width=1500;vars.length=3000;
+  api('/api/material-categories/calc-weight','POST',{category_id:null,params:vars,formula_test:formula}).then(function(r){
+    if(r.error)out.innerHTML='<span style="color:var(--err)">Ошибка: '+r.error+'</span>';
+    else out.innerHTML='<span style="color:var(--ok)">= '+r.weight+' кг <span style="color:var(--text3)">(тест: толщ=3,ш=1500,д=3000,ρ=7.85)</span></span>'
+  }).catch(function(e){out.innerHTML='<span style="color:var(--err)">'+e.message+'</span>'})}
 function renderCatFields(){var el=document.getElementById('fcat_fields_list');if(!el)return;
   var FT=['text','number','grade_select'];
   el.innerHTML=catFields.map(function(f,i){
     return '<div class="cf-row">'+
-    '<div style="flex:0 0 120px"><label>Ключ</label><input value="'+f.key+'" onchange="catFields['+i+'].key=this.value" style="width:100%"></div>'+
+    '<div style="flex:0 0 120px"><label>Ключ</label><input value="'+f.key+'" onchange="catFields['+i+'].key=this.value;catUpdateVarBtns()" style="width:100%"></div>'+
     '<div style="flex:1"><label>Название</label><input value="'+f.label+'" onchange="catFields['+i+'].label=this.value" style="width:100%"></div>'+
-    '<div style="flex:0 0 140px"><label>Тип</label><select onchange="catFields['+i+'].type=this.value" style="width:100%">'+
+    '<div style="flex:0 0 140px"><label>Тип</label><select onchange="catFields['+i+'].type=this.value;catUpdateVarBtns()" style="width:100%">'+
       FT.map(function(t){return '<option '+(f.type===t?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div>'+
     '<button class="btn sm" onclick="catFields.splice('+i+',1);renderCatFields()" style="align-self:end">🗑</button></div>'
-  }).join('')}
+  }).join('');catUpdateVarBtns()}
 function addCatField(){catFields.push({key:'field_'+(catFields.length+1),label:'Параметр '+(catFields.length+1),type:'text'});renderCatFields()}
 function saveCat(cid){var b={name:document.getElementById('fcat_name').value,type:document.getElementById('fcat_type').value,
   sort_order:+document.getElementById('fcat_sort').value,description:document.getElementById('fcat_desc').value,
-  custom_fields:catFields};if(cid)b.id=cid;
+  custom_fields:catFields,
+  use_weight_formula:document.getElementById('fcat_use_formula').checked,
+  weight_formula:(document.getElementById('fcat_formula')||{}).value||''};if(cid)b.id=cid;
   api('/api/material-categories/save','POST',b).then(function(){closeModal();toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 
 function setOpTypes(sc){api('/api/op-types').then(function(opTypes){
@@ -3467,4 +3603,5 @@ def main():
 
 
 if __name__ == "__main__":
+    main()
     main()
