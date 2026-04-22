@@ -854,11 +854,20 @@ def create_app():
             op_times = template.get_op_times()
             seq = 0
             for op_name, entry in op_times.items():
-                per_one = entry.get("per_one", 0) if isinstance(entry, dict) else float(entry or 0)
-                if per_one <= 0: continue
+                if not op_name: continue
+                if isinstance(entry, dict):
+                    per_one = float(entry.get("per_one", 0) or 0)
+                    saved_total = float(entry.get("total_min", 0) or 0)
+                    qty_batch = float(entry.get("qty", 1) or 1)
+                    if per_one <= 0 and saved_total > 0:
+                        per_one = round(saved_total / qty_batch, 4)
+                else:
+                    per_one = float(entry or 0)
+                    saved_total = 0
+                if per_one <= 0 and saved_total <= 0: continue
                 seq += 1
                 total_qty = order_item.quantity * qty_multiplier
-                total_min = math.ceil(per_one * total_qty)
+                total_min = math.ceil(per_one * total_qty) if per_one > 0 else math.ceil(saved_total)
                 matching = find_resources_for_op(db, op_name)
                 res_id = matching[0].id if len(matching) == 1 else None
                 db.add(ProductionOp(
@@ -898,19 +907,43 @@ def create_app():
         db.flush()
 
     def recalc_linked_items(db, pt_id, user_id=None):
-        items = db.query(OrderItem).join(Order).filter(
-            OrderItem.part_template_id == pt_id,
-            Order.status.notin_(["Завершён", "Отменён", "Отгружен"])
+        # Собираем все pt_id для пересчёта: сама деталь + все сборки, в которые она входит
+        pt_ids_to_recalc = {pt_id}
+        assemblies_containing = db.query(AssemblyComponent).filter(
+            AssemblyComponent.component_id == pt_id
         ).all()
-        for it in items:
-            remove_item_reservations(db, it.id)
-            auto_create_reservations(db, it, user_id)
-            ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
-            all_pending = all(o.status == "Ожидает" for o in ops)
-            if all_pending:
-                remove_item_operations(db, it.id)
-                auto_create_operations(db, it)
+        for asm in assemblies_containing:
+            pt_ids_to_recalc.add(asm.assembly_id)
+
+        recalced_items = 0
+        for recalc_id in pt_ids_to_recalc:
+            items = db.query(OrderItem).join(Order).filter(
+                OrderItem.part_template_id == recalc_id,
+                Order.status.notin_(["Завершён", "Отменён", "Отгружен"])
+            ).all()
+            for it in items:
+                remove_item_reservations(db, it.id)
+                auto_create_reservations(db, it, user_id)
+                ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
+                all_pending = all(o.status == "Ожидает" for o in ops)
+                if all_pending:
+                    # Сохраняем назначения ресурсов перед пересозданием операций
+                    saved_resources = {}
+                    for o in ops:
+                        key = (o.operation_type, o.component_template_id)
+                        if o.resource_id:
+                            saved_resources[key] = o.resource_id
+                    remove_item_operations(db, it.id)
+                    auto_create_operations(db, it)
+                    # Восстанавливаем ранее назначенные ресурсы
+                    new_ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
+                    for o in new_ops:
+                        key = (o.operation_type, o.component_template_id)
+                        if key in saved_resources:
+                            o.resource_id = saved_resources[key]
+                recalced_items += 1
         db.flush()
+        return recalced_items
 
     def check_sequence_anomaly(db, order_item_id, resource_id, good_qty):
         item = db.query(OrderItem).get(order_item_id)
@@ -1438,9 +1471,10 @@ def create_app():
                 db.add(AssemblyComponent(assembly_id=p.id, component_id=int(cd["component_id"]),
                                          quantity=int(cd.get("quantity", 1)), sort_order=i))
         db.flush()
-        if pid: recalc_linked_items(db, p.id, data.get("user_id"))
+        recalced = 0
+        if pid: recalced = recalc_linked_items(db, p.id, data.get("user_id"))
         db.commit()
-        return {"id": p.id}
+        return {"id": p.id, "recalced_items": recalced}
 
     @app.post("/api/part-templates/delete")
     async def api_del_pt(req: IdReq, db: Session = Depends(db_dep)):
@@ -2607,8 +2641,12 @@ function modalOrderDetail(oid){
   Promise.all([api('/api/orders'),api('/api/operations?order_id='+oid),api('/api/resources')]).then(function(arr){
   var orders=arr[0],ops=arr[1],resources=arr[2];
   var o=orders.find(function(x){return x.id===oid});if(!o)return;
-  var resOpts=[{v:'',t:'— не назначен —'}].concat(resources.map(function(r){return{v:String(r.id),t:r.name}}));
   window._orderResources=resources;
+  function resOptsFor(opType){
+    var filtered=resources.filter(function(r){
+      var ao=r.allowed_ops||[];return ao.length===0||ao.indexOf(opType)>=0});
+    return [{v:'',t:'— не назначен —'}].concat(filtered.map(function(r){return{v:String(r.id),t:r.name}}));
+  }
   openModal('<h2>📋 '+o.number+' — '+o.customer+'</h2>'+
   '<div class="info-box">'+statusBadge(o.priority)+' '+statusBadge(o.status)+(o.overdue?' <span class="low">⚠ ПРОСРОЧЕН</span>':'')+' | Дедлайн: '+fmtD(o.deadline)+' | Сумма: '+fmtMoney(o.total_amount)+
     (o.completed_at?' | <strong>Завершён:</strong> '+fmtDT(o.completed_at):'')+
@@ -2624,7 +2662,7 @@ function modalOrderDetail(oid){
   '<tbody>'+ops.map(function(op){return '<tr><td>'+op.sequence+'</td>'+
     '<td>'+(op.component_name?'<div><strong style="font-size:.85em">🔩 '+op.component_name+'</strong><div style="font-size:.75em;color:var(--text3)">сб: '+(op.item||'—')+'</div></div>':(op.item||'—'))+'</td>'+
     '<td>'+op.type+'</td>'+
-    '<td><div style="min-width:160px">'+SS('op_res_'+op.id,resOpts,String(op.resource_id||''),'Ресурс...',function(v){updateOpRes(op.id,v)})+'</div></td>'+
+    '<td><div style="min-width:160px">'+SS('op_res_'+op.id,resOptsFor(op.type),String(op.resource_id||''),'Ресурс...',function(v){updateOpRes(op.id,v)})+'</div></td>'+
     '<td>'+op.planned_qty+'</td>'+
     '<td>'+fmtMinToH(op.estimated_min)+'</td>'+
     '<td>'+statusBadge(op.status)+'</td>'+
@@ -2766,7 +2804,7 @@ function renderPTOps(allOpTypes){
   el.innerHTML=ptOpTimes.map(function(op,i){
     var opts=types.map(function(o){return'<option value="'+o.name+'"'+(o.name===op.name?' selected':'')+'>'+o.name+'</option>'}).join('');
     return'<div class="mat-row">'+
-      '<div style="flex:2"><label>Операция</label><select onchange="ptOpTimes['+i+'].name=this.value" style="width:100%">'+opts+'</select></div>'+
+      '<div style="flex:2"><label>Операция</label><select id="ptop_sel_'+i+'" onchange="ptOpTimes['+i+'].name=this.value" style="width:100%">'+opts+'</select></div>'+
       '<div><label>Партия</label><input type="number" value="'+op.qty+'" min="1" style="width:60px" oninput="ptOpTimes['+i+'].qty=+this.value;calcPTOpOne('+i+')"></div>'+
       '<div><label>Всего (мин)</label><input type="number" value="'+op.total_min+'" min="0" step="0.1" style="width:80px" id="ptop_total_'+i+'" oninput="ptOpTimes['+i+'].total_min=+this.value;calcPTOpOne('+i+')"></div>'+
       '<div><label>На 1 шт</label><input id="ptop_one_'+i+'" value="'+op.per_one+'" disabled style="width:70px;color:var(--ok);font-weight:700"></div>'+
@@ -2816,10 +2854,15 @@ function addPTComp(){var allPts=(window._allPTs||[]).filter(function(p){return!p
   if(!allPts.length){toast('Нет деталей для компонентов','err');return}
   ptComponents.push({component_id:allPts[0].id,component_name:allPts[0].display_name,quantity:1});renderPTComps()}
 
-function savePT(pid){var opTimes={};
+function savePT(pid){
+  // sync select values from DOM before saving
+  ptOpTimes.forEach(function(op,i){var sel=document.getElementById('ptop_sel_'+i);if(sel)op.name=sel.value});
+  var opTimes={};
   ptOpTimes.forEach(function(op){
-    if((+(op.total_min||0))>0||(+(op.per_one||0))>0){
-      opTimes[op.name]={qty:op.qty||1,total_min:+(op.total_min||0),per_one:+(op.per_one||0)}}});
+    var tm=+(op.total_min||0),po=+(op.per_one||0),qty=op.qty||1;
+    if(tm>0&&po<=0)po=Math.round(tm/qty*100)/100;
+    if(tm>0||po>0){
+      opTimes[op.name]={qty:qty,total_min:tm,per_one:po}}});
   ptMaterials.forEach(function(m,i){var v=ssVal('ptm_'+i);if(v)m.material_id=+v});
   var b={name:document.getElementById('fp_name').value,part_number:document.getElementById('fp_num').value,
     customer_id:+ssVal('fp_cust')||null,description:document.getElementById('fp_desc').value,
@@ -2827,7 +2870,10 @@ function savePT(pid){var opTimes={};
     is_assembly:document.getElementById('fp_is_asm').checked,
     components:ptComponents.map(function(c,i){var v=ssVal('ptc_'+i);return{component_id:+(v||c.component_id),quantity:c.quantity}})};
   if(pid)b.id=pid;
-  api('/api/part-templates/save','POST',b).then(function(){closeModal();toast('Сохранено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+  api('/api/part-templates/save','POST',b).then(function(r){closeModal();
+    if(r.recalced_items>0)toast('Сохранено. Пересчитано позиций в заказах: '+r.recalced_items,'ok');
+    else toast('Сохранено','ok');
+    refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function delPT(pid){if(!confirm('Удалить?'))return;api('/api/part-templates/delete','POST',{id:pid}).then(function(){refreshPage()})}
 
 function modalPTUpload(ptid){openModal('<h2>📎 Файл детали</h2>'+
@@ -3401,8 +3447,12 @@ function pgResources(c){api('/api/resources').then(function(rs){
 function delRes(rid){if(!confirm('Удалить ресурс?'))return;api('/api/resources/delete','POST',{id:rid}).then(function(){toast('Удалено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function modalRes(rid){api('/api/op-types').then(function(opTypes){
   var p1=rid?api('/api/resources'):Promise.resolve(null);p1.then(function(rs){var r=rs?rs.find(function(x){return x.id===rid}):null;
-  var curOps=r?r.allowed_ops:[];var activeOps=opTypes.filter(function(o){return o.is_active});
+  var curOps=r?r.allowed_ops:[];
+  // Показываем все активные типы операций; is_active может быть 1/true/null
+  var activeOps=opTypes.filter(function(o){return o.is_active!==false&&o.is_active!==0});
   var RES_TYPES=['Лазерный станок','Плазменный станок','Координатно-пробивной','Листогиб','Сверлильный','Фрезерный','Токарный','Сварочный пост','Сборочный пост','Покрасочная камера','Финишный участок','ОТК'];
+  // Добавляем тип ресурса из БД если не входит в список (пользовательские)
+  if(r&&r.type&&RES_TYPES.indexOf(r.type)<0)RES_TYPES.push(r.type);
   var typeOpts=RES_TYPES.map(function(t){return{v:t,t:t}});
   openModal('<h2>'+(r?'✏':'+')+' Ресурс</h2>'+
   '<div class="form-row"><div><label>Название</label><input id="frs_name" value="'+(r?r.name:'')+'"></div><div><label>Код</label><input id="frs_code" value="'+(r?r.code:'')+'"></div></div>'+
@@ -3411,8 +3461,8 @@ function modalRes(rid){api('/api/op-types').then(function(opTypes){
   '<div class="form-row"><div><label>Смена (ч)</label><input type="number" id="frs_sh" step="0.5" value="'+(r?r.shift_hours:8)+'"></div>'+
     '<div><label>Смен/сутки</label><input type="number" id="frs_shd" min="1" value="'+(r?r.shifts_per_day:1)+'"></div></div>'+
   '<div class="form-row full"><div><label>Описание</label><textarea id="frs_desc" rows="2">'+(r?r.description:'')+'</textarea></div></div>'+
-  '<div class="section-hdr">Допустимые операции</div>'+
-  '<div class="check-grid">'+activeOps.map(function(ot){return '<label><input type="checkbox" class="frs_op" value="'+ot.name+'" '+(curOps.indexOf(ot.name)>=0?'checked':'')+'> '+ot.name+'</label>'}).join('')+'</div>'+
+  '<div class="section-hdr">Допустимые операции '+(activeOps.length?'('+activeOps.length+' типов)':'<span style="color:var(--err)">— нет активных типов операций</span>')+'</div>'+
+  (activeOps.length?'<div class="check-grid">'+activeOps.map(function(ot){return '<label><input type="checkbox" class="frs_op" value="'+ot.name+'" '+(curOps.indexOf(ot.name)>=0?'checked':'')+'> '+ot.name+'</label>'}).join('')+'</div>':'<div class="info-box" style="color:var(--text3);font-size:.85em">Создайте типы операций в Настройки → 🔧 Типы операций</div>')+
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveRes('+(rid||0)+')">Сохранить</button></div>')})})}
 function saveRes(rid){var ops=Array.from(document.querySelectorAll('.frs_op:checked')).map(function(cb){return cb.value});
   var b={name:document.getElementById('frs_name').value,code:document.getElementById('frs_code').value,
