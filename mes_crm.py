@@ -431,6 +431,7 @@ class ProductionOp(Base):
     actual_minutes = Column(Integer, nullable=True)
     assigned_to = Column(Integer, ForeignKey("users.id"), nullable=True)
     description = Column(Text, default="")
+    component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
     paused_at = Column(DateTime, nullable=True)
@@ -439,6 +440,7 @@ class ProductionOp(Base):
     order_item = relationship("OrderItem")
     resource = relationship("Resource")
     operator = relationship("User")
+    component_template = relationship("PartTemplate", foreign_keys=[component_template_id], lazy="joined")
 
 
 class PartStationLog(Base):
@@ -607,6 +609,14 @@ def init_database():
             conn.execute(text("ALTER TABLE material_categories ADD COLUMN weight_formula TEXT DEFAULT ''"))
             conn.commit()
         log.info("Migration: added weight_formula to material_categories")
+
+    # Миграция: component_template_id в production_ops
+    prod_cols = [c["name"] for c in insp.get_columns("production_ops")]
+    if "component_template_id" not in prod_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE production_ops ADD COLUMN component_template_id INTEGER REFERENCES part_templates(id)"))
+            conn.commit()
+        log.info("Migration: added component_template_id to production_ops")
 
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
@@ -839,20 +849,37 @@ def create_app():
     def auto_create_operations(db, order_item):
         pt = order_item.part_template
         if not pt: return
-        op_times = pt.get_op_times()
-        seq = 0
-        for op_name, entry in op_times.items():
-            per_one = entry.get("per_one", 0) if isinstance(entry, dict) else float(entry or 0)
-            if per_one <= 0: continue
-            seq += 1
-            total_min = math.ceil(per_one * order_item.quantity)
-            matching = find_resources_for_op(db, op_name)
-            res_id = matching[0].id if len(matching) == 1 else None
-            db.add(ProductionOp(
-                order_id=order_item.order_id, order_item_id=order_item.id,
-                operation_type=op_name, sequence=seq, sort_order=seq,
-                planned_qty=order_item.quantity, estimated_minutes=total_min,
-                resource_id=res_id))
+
+        def _create_ops(template, qty_multiplier, comp_template_id=None, comp_label=""):
+            op_times = template.get_op_times()
+            seq = 0
+            for op_name, entry in op_times.items():
+                per_one = entry.get("per_one", 0) if isinstance(entry, dict) else float(entry or 0)
+                if per_one <= 0: continue
+                seq += 1
+                total_qty = order_item.quantity * qty_multiplier
+                total_min = math.ceil(per_one * total_qty)
+                matching = find_resources_for_op(db, op_name)
+                res_id = matching[0].id if len(matching) == 1 else None
+                db.add(ProductionOp(
+                    order_id=order_item.order_id, order_item_id=order_item.id,
+                    operation_type=op_name, sequence=seq, sort_order=seq,
+                    planned_qty=total_qty, estimated_minutes=total_min,
+                    resource_id=res_id,
+                    description=comp_label,
+                    component_template_id=comp_template_id))
+
+        # Операции самой детали/сборки
+        _create_ops(pt, 1)
+
+        # Операции компонентов сборки
+        if pt.is_assembly:
+            for comp in (pt.components or []):
+                comp_pt = db.query(PartTemplate).get(comp.component_id)
+                if comp_pt:
+                    label = f"Деталь сборки: {comp_pt.name}"
+                    _create_ops(comp_pt, comp.quantity, comp_pt.id, label)
+
         db.flush()
 
     def remove_item_reservations(db, order_item_id):
@@ -1775,7 +1802,8 @@ def create_app():
         q = db.query(ProductionOp).options(
             joinedload(ProductionOp.order).joinedload(Order.customer),
             joinedload(ProductionOp.resource), joinedload(ProductionOp.operator),
-            joinedload(ProductionOp.order_item).joinedload(OrderItem.part_template))
+            joinedload(ProductionOp.order_item).joinedload(OrderItem.part_template),
+            joinedload(ProductionOp.component_template))
         if order_id: q = q.filter(ProductionOp.order_id == order_id)
         if active_only: q = q.join(Order).filter(Order.status == "В работе")
         if resource_id: q = q.filter(ProductionOp.resource_id == resource_id)
@@ -1783,6 +1811,7 @@ def create_app():
                  "order_number": o.order.order_number if o.order else "",
                  "order_display": o.order.display_name if o.order else "",
                  "item": pt_display(o.order_item.part_template) if o.order_item and o.order_item.part_template else "",
+                 "component_name": pt_display(o.component_template) if o.component_template else "",
                  "item_id": o.order_item_id,
                  "type": o.operation_type, "status": o.status,
                  "resource": o.resource.name if o.resource else "—",
@@ -2592,7 +2621,9 @@ function modalOrderDetail(oid){
     '<td>'+(hasPerm('order.edit')?'<button class="btn sm" onclick="modalEditItem('+oid+','+it.id+')">✏</button><button class="btn sm" onclick="delItem('+it.id+','+oid+')">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table>'+
   '<div class="section-hdr">Операции</div>'+
   '<table><thead><tr><th>#</th><th>Деталь</th><th>Тип</th><th>Ресурс</th><th>План</th><th>Время</th><th>Статус</th><th></th></tr></thead>'+
-  '<tbody>'+ops.map(function(op){return '<tr><td>'+op.sequence+'</td><td>'+(op.item||'—')+'</td><td>'+op.type+'</td>'+
+  '<tbody>'+ops.map(function(op){return '<tr><td>'+op.sequence+'</td>'+
+    '<td>'+(op.component_name?'<div><strong style="font-size:.85em">🔩 '+op.component_name+'</strong><div style="font-size:.75em;color:var(--text3)">сб: '+(op.item||'—')+'</div></div>':(op.item||'—'))+'</td>'+
+    '<td>'+op.type+'</td>'+
     '<td><div style="min-width:160px">'+SS('op_res_'+op.id,resOpts,String(op.resource_id||''),'Ресурс...',function(v){updateOpRes(op.id,v)})+'</div></td>'+
     '<td>'+op.planned_qty+'</td>'+
     '<td>'+fmtMinToH(op.estimated_min)+'</td>'+
@@ -2693,16 +2724,18 @@ function modalPTFiles(ptid,name){
     '<span style="color:var(--text3);font-size:.8em">'+fmtDT(f.date)+'</span></div>'}).join('')+'</div>'}
   h+='<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)})}
 
-var ptMaterials=[],ptComponents=[];
+var ptMaterials=[],ptComponents=[],ptOpTimes=[];
 function modalPartTpl(pid){
   Promise.all([api('/api/customers'),api('/api/materials'),api('/api/op-types'),api('/api/part-templates')]).then(function(arr){
   var custs=arr[0],mats=arr[1],opTypes=arr[2],allPts=arr[3];
   var p=pid?allPts.find(function(x){return x.id===pid}):null;
   ptMaterials=p?(p.materials||[]).map(function(m){return{material_id:m.material_id_val||m.material_id,sheets_input:m.sheets_input,parts_per_sheets:m.parts_per_sheets}}):[];
   ptComponents=p?(p.components||[]).map(function(c){return{component_id:c.component_id,component_name:c.component_name,quantity:c.quantity}}):[];
+  var opT=p?p.operation_times:{};
+  ptOpTimes=Object.entries(opT).filter(function(e){var en=e[1];var po=typeof en==='object'?(en.per_one||0):parseFloat(en||0);return po>0||((typeof en==='object')&&(en.total_min||0)>0)}).map(function(e){var n=e[0],en=e[1];return{name:n,qty:typeof en==='object'?en.qty||1:1,total_min:typeof en==='object'?en.total_min||'':'',per_one:typeof en==='object'?en.per_one||'':parseFloat(en||0)||''};});
   window._allPTs=allPts;window._allMats=mats;
-  var opT=p?p.operation_times:{};var activeOps=opTypes.filter(function(o){return o.is_active});
   var custOpts=[{v:'',t:'— не привязан —'}].concat(custs.map(function(c){return{v:String(c.id),t:c.name}}));
+  var activeOps=opTypes.filter(function(o){return o.is_active});
   var h='<h2>'+(p?'✏':'+')+' Деталь</h2>'+
   '<div class="form-row"><div><label>Наименование</label><input id="fp_name" value="'+(p?p.name:'')+'"></div>'+
     '<div><label>Чертёжный номер</label><input id="fp_num" value="'+(p?p.part_number:'')+'"></div></div>'+
@@ -2711,25 +2744,47 @@ function modalPartTpl(pid){
   '<div id="fp_asm_section" style="display:'+(p&&p.is_assembly?'block':'none')+'">'+
     '<div class="section-hdr">Компоненты сборки <button class="btn sm" onclick="addPTComp()">+</button></div><div id="fp_comps_list"></div></div>'+
   '<div class="section-hdr">Материалы <button class="btn sm" onclick="addPTMat()">+</button></div><div id="fp_mats_list"></div>'+
-  '<div class="section-hdr">Калькулятор операций</div><div class="info-box">Партия + общее время → авто мин/шт</div>';
-  activeOps.forEach(function(ot){var entry=opT[ot.name];var qty=entry&&typeof entry==='object'?entry.qty||1:1;
-    var totalMin=entry&&typeof entry==='object'?entry.total_min||'':'';var perOne=entry&&typeof entry==='object'?entry.per_one||'':'';
-    h+='<div style="background:var(--bg);border:1px solid var(--s2);border-radius:var(--r);padding:8px;margin-bottom:6px">'+
-      '<div style="font-weight:600;font-size:.85em;margin-bottom:4px;color:var(--accent)">'+ot.name+'</div>'+
-      '<div class="form-row triple" style="margin:0">'+
-        '<div><label>Партия</label><input type="number" class="fp_op_qty" data-op="'+ot.name+'" value="'+qty+'" min="1" oninput="calcOneOp(\''+ot.name+'\')"></div>'+
-        '<div><label>Общее (мин)</label><input type="number" class="fp_op_total" data-op="'+ot.name+'" value="'+totalMin+'" min="0" step="0.1" oninput="calcOneOp(\''+ot.name+'\')"></div>'+
-        '<div><label>= На 1 шт</label><input class="fp_op_one" data-op="'+ot.name+'" value="'+perOne+'" disabled style="font-weight:700;color:var(--ok)"></div></div></div>'});
-  h+='<div class="section-hdr">Файлы '+(p?'<button class="btn sm" onclick="modalPTUpload('+p.id+')">📎 Загрузить</button>':'')+'</div>'+
+  '<div class="section-hdr">Операции <button class="btn sm" onclick="addPTOp()">+</button></div>'+
+  '<div class="info-box" style="font-size:.8em;margin-bottom:6px">Партия + общее время → мин/шт автоматически</div>'+
+  '<div id="fp_ops_list"></div>'+
+  '<div class="section-hdr">Файлы '+(p?'<button class="btn sm" onclick="modalPTUpload('+p.id+')">📎 Загрузить</button>':'')+'</div>'+
   '<div id="fp_files">'+(p?(p.files||[]).map(function(f){return '<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid var(--s2);font-size:.85em">'+
     '<a href="/api/part-template-files/'+f.id+'/download" target="_blank" style="color:var(--info)">📄 '+f.name+'</a>'+
     '<button class="btn sm" onclick="delPTFile('+f.id+','+p.id+')">🗑</button></div>'}).join('')||'<div style="color:var(--text3)">Нет файлов</div>':'<div class="info-box">Сохраните деталь, чтобы загрузить файлы</div>')+'</div>'+
   '<div class="form-row full"><div><label>Описание</label><textarea id="fp_desc" rows="2">'+(p?p.description:'')+'</textarea></div></div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="savePT('+(pid||0)+')">Сохранить</button></div>';
-  openModal(h);renderPTMats(mats);renderPTComps();activeOps.forEach(function(ot){calcOneOp(ot.name)})})}
+  openModal(h);renderPTMats(mats);renderPTComps();renderPTOps(activeOps)})}
 
 function calcOneOp(n){var q=document.querySelector('.fp_op_qty[data-op="'+n+'"]');var t=document.querySelector('.fp_op_total[data-op="'+n+'"]');var o=document.querySelector('.fp_op_one[data-op="'+n+'"]');
   if(!q||!t||!o)return;var qty=+q.value||1;var tot=+t.value||0;o.value=qty>0?(tot/qty).toFixed(2):''}
+
+function renderPTOps(allOpTypes){
+  window._allOpTypes=allOpTypes||window._allOpTypes;
+  var el=document.getElementById('fp_ops_list');if(!el)return;
+  var types=(window._allOpTypes||[]).filter(function(o){return o.is_active});
+  if(!ptOpTimes.length){el.innerHTML='<div style="color:var(--text3);padding:8px;font-size:.85em">Нет операций. Нажмите + для добавления.</div>';return}
+  el.innerHTML=ptOpTimes.map(function(op,i){
+    var opts=types.map(function(o){return'<option value="'+o.name+'"'+(o.name===op.name?' selected':'')+'>'+o.name+'</option>'}).join('');
+    return'<div class="mat-row">'+
+      '<div style="flex:2"><label>Операция</label><select onchange="ptOpTimes['+i+'].name=this.value" style="width:100%">'+opts+'</select></div>'+
+      '<div><label>Партия</label><input type="number" value="'+op.qty+'" min="1" style="width:60px" oninput="ptOpTimes['+i+'].qty=+this.value;calcPTOpOne('+i+')"></div>'+
+      '<div><label>Всего (мин)</label><input type="number" value="'+op.total_min+'" min="0" step="0.1" style="width:80px" id="ptop_total_'+i+'" oninput="ptOpTimes['+i+'].total_min=+this.value;calcPTOpOne('+i+')"></div>'+
+      '<div><label>На 1 шт</label><input id="ptop_one_'+i+'" value="'+op.per_one+'" disabled style="width:70px;color:var(--ok);font-weight:700"></div>'+
+      '<button class="btn sm" onclick="ptOpTimes.splice('+i+',1);renderPTOps()" style="align-self:end">🗑</button></div>'
+  }).join('')}
+
+function addPTOp(){
+  var types=(window._allOpTypes||[]).filter(function(o){return o.is_active});
+  if(!types.length){toast('Нет типов операций','err');return}
+  var used=ptOpTimes.map(function(o){return o.name});
+  var first=types.find(function(t){return used.indexOf(t.name)<0})||types[0];
+  ptOpTimes.push({name:first.name,qty:1,total_min:'',per_one:''});renderPTOps()}
+
+function calcPTOpOne(i){
+  var op=ptOpTimes[i];if(!op)return;
+  var qty=op.qty||1;var total=+(op.total_min||0);
+  op.per_one=qty>0?Math.round(total/qty*100)/100:0;
+  var el=document.getElementById('ptop_one_'+i);if(el)el.value=op.per_one}
 
 function renderPTMats(allMats){var el=document.getElementById('fp_mats_list');if(!el)return;
   var matOpts=allMats.map(function(m){return{v:String(m.id),t:m.name}});
@@ -2762,9 +2817,9 @@ function addPTComp(){var allPts=(window._allPTs||[]).filter(function(p){return!p
   ptComponents.push({component_id:allPts[0].id,component_name:allPts[0].display_name,quantity:1});renderPTComps()}
 
 function savePT(pid){var opTimes={};
-  document.querySelectorAll('.fp_op_total').forEach(function(el){var t=+el.value;if(!t)return;var n=el.dataset.op;
-    var q=+document.querySelector('.fp_op_qty[data-op="'+n+'"]').value||1;
-    opTimes[n]={qty:q,total_min:t,per_one:q>0?Math.round(t/q*100)/100:0}});
+  ptOpTimes.forEach(function(op){
+    if((+(op.total_min||0))>0||(+(op.per_one||0))>0){
+      opTimes[op.name]={qty:op.qty||1,total_min:+(op.total_min||0),per_one:+(op.per_one||0)}}});
   ptMaterials.forEach(function(m,i){var v=ssVal('ptm_'+i);if(v)m.material_id=+v});
   var b={name:document.getElementById('fp_name').value,part_number:document.getElementById('fp_num').value,
     customer_id:+ssVal('fp_cust')||null,description:document.getElementById('fp_desc').value,
@@ -3013,7 +3068,9 @@ function pgOperations(c){
     html+='<div class="section-hdr">'+rname+'<span style="font-weight:400;font-size:.85em;color:var(--text3);margin-left:12px">'+fmtMinToH(totalMin)+' | ~'+totalShifts+' смен</span></div>'+
     '<div class="tbl-wrap"><table><thead><tr><th>↕</th><th>Заказ</th><th>Деталь</th><th>Тип</th><th>План</th><th>Гот</th><th>Брак</th><th>Время</th><th>Ст.</th><th></th></tr></thead><tbody>'+
     data.ops.map(function(o){return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)">'+
-      '<td style="cursor:grab">☰</td><td>'+(o.order_display||o.order_number)+'</td><td>'+(o.item||'—')+'</td><td>'+o.type+'</td>'+
+      '<td style="cursor:grab">☰</td><td>'+(o.order_display||o.order_number)+'</td>'+
+       '<td>'+(o.component_name?'<div><strong style="font-size:.9em">🔩 '+o.component_name+'</strong><div style="font-size:.75em;color:var(--text3)">сб: '+(o.item||'—')+'</div></div>':(o.item||'—'))+'</td>'+
+       '<td>'+o.type+'</td>'+
       '<td>'+o.planned_qty+'</td><td>'+o.completed_qty+'</td><td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td><td>'+fmtMinToH(o.estimated_min)+'</td><td>'+statusBadge(o.status)+'</td>'+
       '<td style="white-space:nowrap">'+
         (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
