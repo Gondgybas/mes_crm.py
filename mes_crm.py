@@ -479,6 +479,8 @@ class WriteOff(Base):
     parts_good = Column(Integer, default=0)
     parts_rejected = Column(Integer, default=0)
     component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
+    operation_type = Column(String(200), default="")
+    group_id = Column(String(64), default="", nullable=True)
     is_anomaly = Column(Boolean, default=False)
     anomaly_note = Column(Text, default="")
     is_cancelled = Column(Boolean, default=False)
@@ -664,6 +666,16 @@ def init_database():
             conn.execute(text("ALTER TABLE writeoffs ADD COLUMN component_template_id INTEGER REFERENCES part_templates(id)"))
             conn.commit()
         log.info("Migration: added component_template_id to writeoffs")
+    if "operation_type" not in wo_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE writeoffs ADD COLUMN operation_type VARCHAR(200) DEFAULT ''"))
+            conn.commit()
+        log.info("Migration: added operation_type to writeoffs")
+    if "group_id" not in wo_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE writeoffs ADD COLUMN group_id VARCHAR(64) DEFAULT ''"))
+            conn.commit()
+        log.info("Migration: added group_id to writeoffs")
 
     # Миграция: таблицы пересорта
     if not insp.has_table("surplus_pool"):
@@ -2264,7 +2276,17 @@ def create_app():
             joinedload(WriteOff.component_template),
             joinedload(WriteOff.reservation), joinedload(WriteOff.cancelled_user))
         if wtype: q = q.filter(WriteOff.writeoff_type == wtype)
+        import re as _re
+        def _op_type(w):
+            if w.operation_type: return w.operation_type
+            # fallback: извлечь из примечания вида "[Лазерная резка] ..."
+            if w.note:
+                m = _re.match(r'^\[([^\]]+)\]', w.note)
+                if m: return m.group(1)
+            return ""
         return [{"id": w.id, "type": w.writeoff_type,
+                 "order_item_id": w.order_item_id,
+                 "group_id": w.group_id or "",
                  "user": w.user.full_name if w.user else "",
                  "resource": w.resource.name if w.resource else "",
                  "order_display": w.order.display_name if w.order else "",
@@ -2273,6 +2295,7 @@ def create_app():
                  "sheets": w.quantity_sheets, "kg": w.quantity_kg, "pcs": w.quantity_pcs,
                  "part_name": pt_display(w.order_item.part_template) if w.order_item and w.order_item.part_template else "",
                  "component_name": pt_display(w.component_template) if w.component_template else "",
+                 "op_type": _op_type(w),
                  "parts_good": w.parts_good, "parts_rejected": w.parts_rejected,
                  "is_anomaly": w.is_anomaly, "anomaly_note": w.anomaly_note,
                  "is_cancelled": w.is_cancelled,
@@ -2337,6 +2360,7 @@ def create_app():
         uid = data.get("user_id", 1); wtype = data["writeoff_type"]
         wo = WriteOff(writeoff_type=wtype, user_id=uid, resource_id=data.get("resource_id"),
                       order_id=data.get("order_id"), order_item_id=data.get("order_item_id"),
+                      group_id=data.get("group_id", ""),
                       note=data.get("note", ""))
         if wtype == "Материал":
             res_id = data.get("reservation_id")
@@ -2369,8 +2393,10 @@ def create_app():
             if good == 0 and rej == 0:
                 raise HTTPException(400, "Укажите количество годных или брак (не может быть 0)")
             wo.parts_good = good; wo.parts_rejected = rej
+            op_type = data.get("operation_type", "")
             comp_tid = data.get("component_template_id")
             wo.component_template_id = comp_tid
+            wo.operation_type = op_type
             is_anom, anom_note = check_sequence_anomaly(db, data["order_item_id"], data.get("resource_id"), good)
             wo.is_anomaly = is_anom; wo.anomaly_note = anom_note
             db.add(PartStationLog(order_item_id=data["order_item_id"], resource_id=data.get("resource_id"),
@@ -3738,6 +3764,8 @@ function modalOpWriteoff(opid){
 function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
   var note=(document.getElementById('fopwo_note')||{}).value||'';
+  // Общий group_id для связывания материальных и детальных записей одного списания
+  var gid=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)+'-u'+U.id;
 
   // Определяем эффективный станок
   var effResId=op.resource_id||null;
@@ -3755,7 +3783,7 @@ function submitOpWriteoff(opid,showMat,showParts){
       var matOpt=matSel.options[matSel.selectedIndex];
       promises.push(api('/api/writeoffs/create','POST',{
         writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
-        order_item_id:op.item_id,resource_id:effResId,
+        order_item_id:op.item_id,resource_id:effResId,group_id:gid,
         material_id:+matSel.value,reservation_id:+(matOpt.dataset.rid)||null,
         sheets:shVal,note:'['+op.type+'] '+note}))
     }
@@ -3766,7 +3794,7 @@ function submitOpWriteoff(opid,showMat,showParts){
     if(good>0||rej>0){
       promises.push(api('/api/writeoffs/create','POST',{
         writeoff_type:'Детали',user_id:U.id,order_id:op.order_id,
-        order_item_id:op.item_id,resource_id:effResId,
+        order_item_id:op.item_id,resource_id:effResId,group_id:gid,
         operation_type:op.type,parts_good:good,parts_rejected:rej,
         component_template_id:op.component_template_id||null,
         note:'['+op.type+'] '+note}))
@@ -4143,58 +4171,129 @@ function deleteSurplusEntry(sid){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
-var woFilter={order:'',resource:'',wtype:''};
+var woFilter={order:'',op_type:'',resource:'',wtype:'',user:''};
+window._woAllData=[];
+
 function pgWriteoffs(c){
   api('/api/writeoffs').then(function(allWos){
+    window._woAllData=allWos;
+    var uniq=function(arr){return arr.filter(function(v,i,a){return v&&a.indexOf(v)===i}).sort()};
+    var orders=uniq(allWos.map(function(w){return w.order_display}));
+    var opTypes=uniq(allWos.map(function(w){return w.op_type}));
+    var resources=uniq(allWos.map(function(w){return w.resource}));
+    var users=uniq(allWos.map(function(w){return w.user}));
+    var ordOpts=[{v:'',t:'Все заказы'}].concat(orders.map(function(v){return{v:v,t:v}}));
+    var opOpts=[{v:'',t:'Все типы операций'}].concat(opTypes.map(function(v){return{v:v,t:v}}));
+    var resOpts=[{v:'',t:'Все станки'}].concat(resources.map(function(v){return{v:v,t:v}}));
+    var wtOpts=[{v:'',t:'Все'},{v:'Материал',t:'📦 Материал'},{v:'Детали',t:'🔩 Детали'},{v:'Материал+Детали',t:'📦🔩 Мат+Дет'}];
+    var usrOpts=[{v:'',t:'Все операторы'}].concat(users.map(function(v){return{v:v,t:v}}));
+    function refilter(){var el=document.getElementById('wo_table_area');if(el)woFillTable(el)}
+    c.innerHTML='<div class="toolbar"><span class="spacer"></span>'+
+      '<span id="wo_count_badge" style="font-size:.85em;color:var(--text2)"></span>'+
+      '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
+      '<div class="filter-bar" style="flex-wrap:wrap;row-gap:6px;gap:10px">'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказ:</label><div style="min-width:170px">'+SS('wf_order',ordOpts,woFilter.order,'Все заказы',function(v){woFilter.order=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип операции:</label><div style="min-width:170px">'+SS('wf_optype',opOpts,woFilter.op_type,'Все типы',function(v){woFilter.op_type=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Станок:</label><div style="min-width:160px">'+SS('wf_res',resOpts,woFilter.resource,'Все станки',function(v){woFilter.resource=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип списания:</label><div style="min-width:150px">'+SS('wf_wtype',wtOpts,woFilter.wtype,'Все',function(v){woFilter.wtype=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Оператор:</label><div style="min-width:150px">'+SS('wf_user',usrOpts,woFilter.user,'Все',function(v){woFilter.user=v;refilter()})+'</div></div>'+
+        '<button class="btn sm" onclick="woFilter={order:\'\',op_type:\'\',resource:\'\',wtype:\'\',user:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+      '</div>'+
+      '<div id="wo_table_area"></div>';
+    refilter();
+  });
+}
+
+function woFillTable(el){
+  var allWos=window._woAllData||[];
   var wos=allWos;
-  if(woFilter.order){var sq=woFilter.order.toLowerCase();wos=wos.filter(function(w){return(w.order_display||'').toLowerCase().indexOf(sq)>=0})}
-  if(woFilter.resource)wos=wos.filter(function(w){return(w.resource||'').toLowerCase().indexOf(woFilter.resource.toLowerCase())>=0});
-  if(woFilter.wtype)wos=wos.filter(function(w){return w.type===woFilter.wtype});
-  c.innerHTML='<div class="toolbar">'+
-    '<span class="spacer"></span><span style="font-size:.85em;color:var(--text2)">Показано: <strong>'+wos.length+'</strong> / '+allWos.length+'</span>'+
-    '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
-  '<div class="filter-bar">'+
-    '<label>Заказ:</label><input style="width:160px" placeholder="Поиск по заказу..." value="'+esc(woFilter.order)+'" oninput="woFilter.order=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
-    '<label>Станок:</label><input style="width:140px" placeholder="Станок..." value="'+esc(woFilter.resource)+'" oninput="woFilter.resource=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
-    '<label>Тип:</label><select onchange="woFilter.wtype=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
-      '<option value="" '+(woFilter.wtype===''?'selected':'')+'>Все</option>'+
-      '<option value="Материал" '+(woFilter.wtype==='Материал'?'selected':'')+'>📦 Материал</option>'+
-      '<option value="Детали" '+(woFilter.wtype==='Детали'?'selected':'')+'>🔩 Детали</option>'+
-    '</select>'+
-    '<button class="btn sm" onclick="woFilter={order:\'\',resource:\'\',wtype:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
-  '</div>'+
-  '<div class="tbl-wrap"><table><thead><tr>'+
+  if(woFilter.order)wos=wos.filter(function(w){return w.order_display===woFilter.order});
+  if(woFilter.op_type)wos=wos.filter(function(w){return w.op_type===woFilter.op_type});
+  if(woFilter.resource)wos=wos.filter(function(w){return w.resource===woFilter.resource});
+  if(woFilter.wtype)wos=wos.filter(function(w){
+    if(woFilter.wtype==='Материал+Детали')return w._merged;
+    if(woFilter.wtype==='Материал')return w.type==='Материал'&&!w._merged;
+    if(woFilter.wtype==='Детали')return w.type==='Детали'&&!w._merged;
+    return true;
+  });
+  if(woFilter.user)wos=wos.filter(function(w){return w.user===woFilter.user});
+  var badge=document.getElementById('wo_count_badge');
+
+  // ── Группировка строго по group_id: только пары с одинаковым непустым group_id ──
+  var used={};var rows=[];
+  var sorted=wos.slice().sort(function(a,b){return b.date.localeCompare(a.date)});
+  // Строим индекс group_id -> [записи]
+  var byGroup={};
+  sorted.forEach(function(w){
+    if(!w.group_id)return;
+    if(!byGroup[w.group_id])byGroup[w.group_id]=[];
+    byGroup[w.group_id].push(w);
+  });
+  sorted.forEach(function(w){
+    if(used[w.id])return;
+    if(w.group_id&&byGroup[w.group_id]&&byGroup[w.group_id].length>=2){
+      var grp=byGroup[w.group_id];
+      var matW=grp.find(function(x){return x.type==='Материал'});
+      var partsW=grp.find(function(x){return x.type==='Детали'});
+      if(matW&&partsW){
+        grp.forEach(function(x){used[x.id]=true});
+        rows.push({kind:'both',parts:partsW,mat:matW});
+        return;
+      }
+    }
+    used[w.id]=true;
+    rows.push(w.type==='Материал'?{kind:'mat',mat:w}:{kind:'parts',parts:w});
+  });
+
+  if(badge)badge.innerHTML='Показано: <strong>'+rows.length+'</strong> / '+allWos.length;
+  if(!rows.length){el.innerHTML='<div class="info-box">Нет записей по выбранным фильтрам</div>';return}
+
+  el.innerHTML='<div class="tbl-wrap"><table><thead><tr>'+
     '<th>Дата</th><th>Тип</th><th>Заказ</th><th>Деталь</th>'+
+    '<th title="Годных">Годн.</th><th title="Брак">Брак</th><th>Тип операции</th>'+
     '<th>Материал</th><th>Л</th><th>Кг</th>'+
-    '<th>Годн.</th><th>Брак</th>'+
-    '<th>Станок</th><th>Кто</th><th>Прим.</th><th></th>'+
-  '</tr></thead>'+
-  '<tbody>'+wos.map(function(w){
-    var isMat=w.type==='Материал';
-    var typeBadge=isMat
-      ?'<span class="badge b-info" style="font-size:.75em">📦</span>'
-      :'<span class="badge b-ok" style="font-size:.75em">🔩</span>';
-    var anomalyNote=w.is_anomaly?'<div style="font-size:.78em;color:var(--err)">⚠ '+w.anomaly_note+'</div>':'';
-    var cancelNote=w.is_cancelled?'<span class="badge b-err" style="font-size:.75em">↩ '+w.cancelled_by+'</span>':'';
-    return '<tr class="'+(w.is_cancelled?'cancelled-row':w.is_anomaly?'anomaly':'')+'">'+
+    '<th>Станок</th><th>Оператор</th><th>Прим.</th><th></th>'+
+  '</tr></thead><tbody>'+rows.map(function(row){
+    var w=row.parts||row.mat;
+    var isBoth=row.kind==='both';var isMat=row.kind==='mat';var isParts=row.kind==='parts';
+    var typeBadge=isBoth
+      ?'<span class="badge" style="font-size:.72em;background:rgba(139,92,246,.14);color:#7c3aed;border:1px solid rgba(139,92,246,.3)">📦🔩 Мат+Дет</span>'
+      :isMat?'<span class="badge b-info" style="font-size:.73em">📦 Матер.</span>'
+      :'<span class="badge b-ok" style="font-size:.73em">🔩 Детали</span>';
+    var partsW=row.parts;var matW=row.mat;
+    var cancelled=w.is_cancelled||(matW&&matW.is_cancelled);
+    var anomaly=partsW&&partsW.is_anomaly;
+    var partCell=partsW
+      ?(partsW.component_name
+        ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(partsW.part_name||'—')+'</span><br>🔩 <strong>'+esc(partsW.component_name)+'</strong></div>'
+        :(partsW.part_name||'—'))
+      :(matW?(matW.component_name
+        ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(matW.part_name||'—')+'</span><br>🔩 <strong>'+esc(matW.component_name)+'</strong></div>'
+        :(matW.part_name||'—')):'—');
+    var anomNote=anomaly?'<div style="font-size:.78em;color:var(--err)">⚠ '+esc(partsW.anomaly_note||'')+'</div>':'';
+    var cancelNote=cancelled?'<span class="badge b-err" style="font-size:.73em">↩</span>':'';
+    var noteText=w.note?esc(w.note.replace(/^\[[^\]]+\]\s*/,'')):'';
+    var cancelIds=(partsW?partsW.id+'':(matW?matW.id+'':''));
+    var cancelBtn=cancelled?'':
+      '<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>';
+    return '<tr class="'+(cancelled?'cancelled-row':anomaly?'anomaly':'')+'">'+
       '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(w.date)+'</td>'+
       '<td>'+typeBadge+'</td>'+
       '<td style="font-size:.85em">'+(w.order_display||'—')+'</td>'+
-      '<td>'+(w.component_name
-        ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(w.part_name||'—')+'</span><br>🔩 <strong>'+esc(w.component_name)+'</strong></div>'
-        :(w.part_name||'—'))+'</td>'+
-      '<td>'+(isMat?(w.material||'—'):'<span style="color:var(--text3)">—</span>')+'</td>'+
-      '<td>'+(isMat?(w.sheets||'—'):'<span style="color:var(--text3)">—</span>')+'</td>'+
-      '<td>'+(isMat?fmtN(w.kg):'<span style="color:var(--text3)">—</span>')+'</td>'+
-      '<td>'+(isMat?'<span style="color:var(--text3)">—</span>':w.parts_good)+'</td>'+
-      '<td class="'+((!isMat&&w.parts_rejected)?'low':'')+'">'+(isMat?'<span style="color:var(--text3)">—</span>':w.parts_rejected)+'</td>'+
+      '<td>'+partCell+'</td>'+
+      '<td>'+(partsW&&(partsW.parts_good||partsW.parts_rejected)?partsW.parts_good:'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td class="'+(partsW&&partsW.parts_rejected?'low':'')+'">'+(partsW&&partsW.parts_rejected?partsW.parts_rejected:'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td style="font-size:.85em">'+(partsW&&partsW.op_type?'<span class="badge" style="background:rgba(99,102,241,.1);color:var(--acc);border-color:transparent;font-size:.85em">'+esc(partsW.op_type)+'</span>':'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(matW&&matW.material?esc(matW.material):'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(matW&&matW.sheets?matW.sheets:'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(matW&&matW.kg?fmtN(matW.kg):'<span style="color:var(--text3)">—</span>')+'</td>'+
       '<td style="font-size:.85em">'+(w.resource||'—')+'</td>'+
-      '<td style="font-size:.85em">'+w.user+'</td>'+
-      '<td style="font-size:.82em">'+(w.note||'')+anomalyNote+cancelNote+'</td>'+
-      '<td>'+(w.is_cancelled?'':'<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>')+'</td>'+
+      '<td style="font-size:.85em">'+esc(w.user||'—')+'</td>'+
+      '<td style="font-size:.82em">'+noteText+anomNote+cancelNote+'</td>'+
+      '<td>'+cancelBtn+'</td>'+
     '</tr>';
   }).join('')+'</tbody></table></div>';
-  })}
+}
 
 function cancelWO(wid){if(!confirm('Отменить списание? Все параметры вернутся в состояние "до списания".'))return;
   api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(){toast('Списание отменено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
