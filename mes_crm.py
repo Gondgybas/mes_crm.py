@@ -2017,8 +2017,10 @@ def create_app():
             first_res_id = get_first_op_resource_id(db, it.id)
             by_res = {}; first_res_good = 0
             # Словари фактических данных:
-            # act_dict[(comp_id, res_id, op_type)] -> {good, rejected}
+            # act_dict[(comp_id, op_type)] -> {good, rejected}
+            # act_res_dict[(comp_id, op_type)] -> set of resource names (фактически использованные станки)
             act_dict = {}
+            act_res_dict = {}
             asm_good = 0; asm_rej = 0   # логи БЕЗ компонента (сборочный уровень)
             for l in (it.station_logs or []):
                 rn = l.resource.name if l.resource else "—"
@@ -2032,10 +2034,16 @@ def create_app():
                     "user": l.user.full_name if l.user else "",
                     "note": l.note, "date": l.created_at.isoformat()})
                 if l.resource_id == first_res_id: first_res_good += l.good_qty
-                act_key = (l.component_template_id, l.resource_id, l.operation_type or "")
+                # Ключ без resource_id — станок может быть выбран оператором при списании,
+                # поэтому привязка идёт по (компонент, тип операции)
+                act_key = (l.component_template_id, l.operation_type or "")
                 if act_key not in act_dict: act_dict[act_key] = {"good": 0, "rejected": 0}
                 act_dict[act_key]["good"] += l.good_qty
                 act_dict[act_key]["rejected"] += l.rejected_qty
+                # Собираем фактически использованные станки
+                if act_key not in act_res_dict: act_res_dict[act_key] = []
+                if rn != "—" and rn not in act_res_dict[act_key]:
+                    act_res_dict[act_key].append(rn)
                 # Считаем отдельно логи сборочного уровня (без component_template_id)
                 if l.component_template_id is None:
                     asm_good += l.good_qty
@@ -2056,7 +2064,7 @@ def create_app():
             planned_ops = []
             for idx, op in enumerate(ops_q):
                 rn = op.resource.name if op.resource else "—"
-                act_key = (op.component_template_id, op.resource_id, op.operation_type or "")
+                act_key = (op.component_template_id, op.operation_type or "")
                 actual = act_dict.get(act_key, {"good": 0, "rejected": 0})
                 planned_ops.append({
                     "seq": idx + 1,
@@ -2068,7 +2076,8 @@ def create_app():
                     "rejected_qty": actual["rejected"],
                     "status": op.status,
                     "component_name": pt_display(op.component_template) if op.component_template else None,
-                    "component_id": op.component_template_id
+                    "component_id": op.component_template_id,
+                    "actual_resources": act_res_dict.get(act_key, [])
                 })
             result.append({
                 "item_id": it.id, "order_id": it.order_id,
@@ -3661,7 +3670,10 @@ function modalOpWriteoff(opid){
   var showParts=mode.indexOf('Детали')>=0&&U.writeoff_types.indexOf('Детали')>=0;
   if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
   var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
-  p.then(function(reservations){
+  // Если станок не назначен — подгружаем только совместимые со станком типы
+  var pRes=!op.resource_id?api('/api/resources/for-operation/'+encodeURIComponent(op.type)):Promise.resolve(null);
+  Promise.all([p,pRes]).then(function(arr){
+    var reservations=arr[0];var compatResources=arr[1];
     // Автоматически определяем нужный компонент из операции — без выбора
     var autoCompKey=op.component_template_id?String(op.component_template_id):'0';
     // Группируем резервы по компоненту
@@ -3673,13 +3685,16 @@ function modalOpWriteoff(opid){
     var matchedItems=(byComp[autoCompKey]&&byComp[autoCompKey].items)||
                      (byComp['0']&&byComp['0'].items)||[];
 
-    // Блок: выбор участка если не задан в заказе
+    // Блок: выбор участка если не задан в заказе — только совместимые станки
     var resBlockHtml='';
     if(!op.resource_id){
-      var resOpts=(window._opsResources||[]).map(function(r){return'<option value="'+r.id+'">'+r.name+'</option>'}).join('');
+      var resList=compatResources&&compatResources.length?compatResources:(window._opsResources||[]);
+      var resOpts=resList.map(function(r){return'<option value="'+r.id+'">'+r.name+'</option>'}).join('');
+      var compatNote=compatResources&&compatResources.length
+        ?'<span style="font-size:.8em;color:var(--text3);margin-left:6px">(показаны только станки типа «'+op.type+'»)</span>':'';
       resBlockHtml='<div class="form-row full" style="background:rgba(239,68,68,.07);border:1px solid var(--err);border-radius:var(--r);padding:8px 10px;margin-bottom:6px">'+
-        '<div><label style="color:var(--err);font-weight:700">🏭 Участок <span>*</span> — не задан в заказе, выберите обязательно:</label>'+
-        '<select id="fopwo_res_sel" style="border-color:var(--err)"><option value="">— выберите участок —</option>'+resOpts+'</select></div></div>';
+        '<div><label style="color:var(--err);font-weight:700">🏭 Станок <span>*</span> — не задан в заказе, выберите обязательно:'+compatNote+'</label>'+
+        '<select id="fopwo_res_sel" style="border-color:var(--err)"><option value="">— выберите станок —</option>'+resOpts+'</select></div></div>';
     }
 
     // Блок: фиксированная деталь — без выбора
@@ -3691,7 +3706,7 @@ function modalOpWriteoff(opid){
     var h='<h2>📤 Списание: '+op.type+'</h2>'+
       '<div class="info-box" style="margin-bottom:6px">'+
         '<strong>Заказ:</strong> '+(op.order_display||op.order_number)+
-        ' | <strong>Участок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+
+        ' | <strong>Станок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+
       '</div>'+
       partFixedHtml+
       resBlockHtml;
@@ -3721,12 +3736,12 @@ function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
   var note=(document.getElementById('fopwo_note')||{}).value||'';
 
-  // Определяем эффективный участок
+  // Определяем эффективный станок
   var effResId=op.resource_id||null;
   if(!effResId){
     var resSel=document.getElementById('fopwo_res_sel');
     if(resSel&&resSel.value){effResId=+resSel.value}
-    else{toast('Выберите участок — он не задан в заказе','err');return}
+    else{toast('Выберите станок — он не задан в заказе','err');return}
   }
 
   var promises=[];
@@ -3978,7 +3993,17 @@ function plOpCell(op){
     h+='<div style="font-size:.78em">'+statusBadge(op.status||'—')+'</div>';
   }
   if(op.rejected_qty>0)h+='<div style="font-size:.72em;color:var(--err)">✗ '+op.rejected_qty+'</div>';
-  if(op.resource&&op.resource!=='—')h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:3px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+op.resource+'">📍'+op.resource+'</div>';
+  // Показываем фактически использованные станки (из логов), если нет — плановый станок
+  var actRes=op.actual_resources&&op.actual_resources.length?op.actual_resources:[];
+  if(actRes.length){
+    // Один или несколько фактически задействованных станков
+    actRes.forEach(function(r){
+      h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:2px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+r+'">📍'+r+'</div>';
+    });
+  } else if(op.resource&&op.resource!=='—'){
+    // Плановый станок (ещё не было списаний)
+    h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:3px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+op.resource+'">📍'+op.resource+'</div>';
+  }
   return h;
 }
 
