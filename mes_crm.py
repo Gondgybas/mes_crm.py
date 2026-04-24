@@ -586,8 +586,8 @@ DEFAULT_PERMS = [
     ("writeoff.cancel", "Отмена списания", "Списания"),
     ("cust.view", "Просмотр клиентов", "Клиенты"), ("cust.create", "Создание клиентов", "Клиенты"),
     ("cust.edit", "Редактирование клиентов", "Клиенты"),
-    ("res.view", "Просмотр ресурсов", "Ресурсы"), ("res.create", "Создание ресурсов", "Ресурсы"),
-    ("res.edit", "Редактирование ресурсов", "Ресурсы"), ("res.delete", "Удаление ресурсов", "Ресурсы"),
+    ("res.view", "Просмотр станков", "Станки"), ("res.create", "Создание станков", "Станки"),
+    ("res.edit", "Редактирование станков", "Станки"), ("res.delete", "Удаление станков", "Станки"),
     ("load.view", "Загруженность", "Загруженность"),
     ("admin.users", "Пользователи", "Админ"), ("admin.roles", "Роли", "Админ"),
     ("admin.grades", "Марки металла", "Админ"), ("admin.categories", "Категории склада", "Админ"),
@@ -981,7 +981,7 @@ def create_app():
                 ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
                 all_pending = all(o.status == "Ожидает" for o in ops)
                 if all_pending:
-                    # Сохраняем назначения ресурсов перед пересозданием операций
+                    # Сохраняем назначения станков перед пересозданием операций
                     saved_resources = {}
                     for o in ops:
                         key = (o.operation_type, o.component_template_id)
@@ -989,7 +989,7 @@ def create_app():
                             saved_resources[key] = o.resource_id
                     remove_item_operations(db, it.id)
                     auto_create_operations(db, it)
-                    # Восстанавливаем ранее назначенные ресурсы
+                    # Восстанавливаем ранее назначенные станки
                     new_ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
                     for o in new_ops:
                         key = (o.operation_type, o.component_template_id)
@@ -1879,7 +1879,7 @@ def create_app():
         r = db.query(Resource).get(req.id)
         if not r: raise HTTPException(404)
         if db.query(ProductionOp).filter(ProductionOp.resource_id == req.id).count() > 0:
-            raise HTTPException(400, "Есть операции на этом ресурсе")
+            raise HTTPException(400, "Есть операции на этом станке")
         db.delete(r); db.commit()
         return {"status": "ok"}
 
@@ -2579,6 +2579,77 @@ def create_app():
             data["details"] = [{"part": k, **v} for k, v in data["details"].items()]
         return {"customers": list(by_cust.values()), "summary": total_summary}
 
+    # ─── Export CSV ─────────────────────────────────
+    @app.get("/api/export/orders")
+    def api_export_orders(status: str = "", db: Session = Depends(db_dep)):
+        from fastapi.responses import StreamingResponse
+        import csv, io
+        q = db.query(Order).options(joinedload(Order.customer), joinedload(Order.items))
+        if status: q = q.filter(Order.status == status)
+        orders = q.order_by(Order.created_at.desc()).all()
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';')
+        writer.writerow(["№ заказа", "Клиент", "Статус", "Приоритет", "Сумма",
+                         "Позиций", "Дедлайн", "Создан", "Завершён", "Описание"])
+        for o in orders:
+            writer.writerow([
+                o.order_number,
+                o.customer.name if o.customer else "",
+                o.status, o.priority,
+                o.total_amount or 0,
+                len(o.items or []),
+                o.deadline.strftime("%d.%m.%Y") if o.deadline else "",
+                o.created_at.strftime("%d.%m.%Y %H:%M"),
+                o.completed_at.strftime("%d.%m.%Y %H:%M") if o.completed_at else "",
+                (o.description or "").replace("\n", " ")
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue().encode("utf-8-sig")]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=orders_export.csv"})
+
+    @app.get("/api/export/materials")
+    def api_export_materials(db: Session = Depends(db_dep)):
+        from fastapi.responses import StreamingResponse
+        import csv, io
+        mats = db.query(Material).filter(Material.is_active == True).options(
+            joinedload(Material.metal_grade), joinedload(Material.category)).order_by(Material.name).all()
+        output = io.StringIO()
+        writer = csv.writer(output, delimiter=';')
+        writer.writerow(["Код", "Наименование", "Тип", "Категория", "Ед.",
+                         "Кол-во (л)", "Кол-во (кг)", "Зарезервировано (л)", "Зарезервировано (кг)",
+                         "Свободно (л)", "Свободно (кг)", "Мин. остаток (л)", "Мин. остаток (кг)"])
+        for m in mats:
+            writer.writerow([
+                m.code, m.name, m.material_type,
+                m.category.name if m.category else "",
+                m.primary_unit,
+                m.quantity_sheets, round(m.quantity_kg or 0, 2),
+                m.reserved_sheets, round(m.reserved_kg or 0, 2),
+                m.available_sheets, m.available_kg,
+                m.min_stock_sheets, round(m.min_stock_kg or 0, 2)
+            ])
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue().encode("utf-8-sig")]),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=materials_export.csv"})
+
+    @app.get("/api/analytics/production-by-day")
+    def api_production_by_day(days: int = 14, db: Session = Depends(db_dep)):
+        """Производство деталей по дням за последние N дней."""
+        n = now_msk()
+        start = n - datetime.timedelta(days=days)
+        rows = db.query(
+            func.date(PartStationLog.created_at).label("day"),
+            func.sum(PartStationLog.good_qty).label("good"),
+            func.sum(PartStationLog.rejected_qty).label("rejected")
+        ).filter(PartStationLog.created_at >= start).group_by(
+            func.date(PartStationLog.created_at)
+        ).order_by(func.date(PartStationLog.created_at)).all()
+        return [{"day": str(r.day), "good": int(r.good or 0), "rejected": int(r.rejected or 0)} for r in rows]
+
     # ─── Logs ───────────────────────────────────────
     @app.get("/api/logs")
     def api_logs(limit: int = 300, action: str = "", user_id: int = 0, db: Session = Depends(db_dep)):
@@ -2864,7 +2935,7 @@ var PAGES=[{id:'dashboard',icon:'📊',label:'Панель',perm:null},{id:'orde
   {id:'operations',icon:'🔧',label:'Операции',perm:'op.view'},{id:'reservations',icon:'🔒',label:'Резервы',perm:'reserve.view'},
   {id:'parts_log',icon:'📝',label:'Учёт деталей',perm:'parts.log'},{id:'writeoffs',icon:'📤',label:'Списания',perm:'writeoff.material'},
   {id:'load',icon:'📈',label:'Загруженность',perm:'load.view'},{id:'customers',icon:'🏢',label:'Клиенты',perm:'cust.view'},
-  {id:'resources',icon:'🏭',label:'Ресурсы',perm:'res.view'},{id:'logs',icon:'📜',label:'Логи',perm:'admin.logs'},
+  {id:'resources',icon:'🏭',label:'Станки',perm:'res.view'},{id:'logs',icon:'📜',label:'Логи',perm:'admin.logs'},
   {id:'settings',icon:'⚙',label:'Настройки',perm:'admin.users'}];
 function buildNav(){document.getElementById('mainNav').innerHTML=PAGES.filter(function(p){return!p.perm||hasPerm(p.perm)}).map(function(p){
   return '<button data-p="'+p.id+'" onclick="navTo(\''+p.id+'\')" class="'+(p.id===curPage?'active':'')+'">'+p.icon+' '+p.label+'</button>'}).join('')}
@@ -2878,13 +2949,32 @@ function loadPage(p){var c=document.getElementById('mainContent');try{switch(p){
 
 // ═══ ПАНЕЛЬ ═══
 function pgDashboard(c){
-  Promise.all([api('/api/analytics/dashboard'),api('/api/analytics/operations')]).then(function(arr){var d=arr[0],ops=arr[1];
+  Promise.all([api('/api/analytics/dashboard'),api('/api/analytics/operations'),api('/api/analytics/production-by-day?days=14')]).then(function(arr){var d=arr[0],ops=arr[1],byDay=arr[2];
   var widgets=[{k:'orders_total',lbl:'Заказы всего',cls:'info',v:d.orders_total},{k:'orders_active',lbl:'Активные',cls:'ok',v:d.orders_active},
     {k:'orders_completed',lbl:'Выполнено',cls:'ok',v:d.orders_completed},{k:'orders_overdue',lbl:'Просрочено',cls:d.orders_overdue?'err':'',v:d.orders_overdue},
     {k:'ops_pending',lbl:'Ожидает операций',cls:'warn',v:d.ops_pending},{k:'ops_in_progress',lbl:'В работе',cls:'',v:d.ops_in_progress},
     {k:'ops_completed_today',lbl:'Завершено сегодня',cls:'ok',v:d.ops_completed_today},{k:'parts_today',lbl:'Деталей сегодня',cls:'ok',v:d.parts_today},
     {k:'rejected_today',lbl:'Брак сегодня',cls:d.rejected_today?'err':'',v:d.rejected_today},{k:'low_stock',lbl:'Мало на складе',cls:d.low_stock?'err':'ok',v:d.low_stock}];
+  // График производства по дням
+  var maxGood=Math.max.apply(null,byDay.map(function(d){return d.good})||[1])||1;
+  var chartHtml='';
+  if(byDay.length){
+    chartHtml='<div class="section-hdr">📅 Производство за 14 дней</div>'+
+    '<div style="background:var(--s1);border-radius:var(--r);padding:12px;border:1px solid var(--s2);margin-bottom:16px;overflow-x:auto">'+
+    '<div style="display:flex;align-items:flex-end;gap:4px;height:80px;min-width:'+Math.max(byDay.length*36,300)+'px">'+
+    byDay.map(function(d){
+      var h=Math.max(4,Math.round(d.good/maxGood*72));var hr=d.rejected>0?Math.max(2,Math.round(d.rejected/maxGood*72)):0;
+      return '<div style="display:flex;flex-direction:column;align-items:center;gap:1px;flex:1;min-width:30px">'+
+        (hr>0?'<div style="width:100%;background:var(--err);height:'+hr+'px;border-radius:2px 2px 0 0;opacity:.7" title="Брак: '+d.rejected+'"></div>':'')+
+        '<div style="width:100%;background:var(--ok);height:'+h+'px;border-radius:2px 2px 0 0" title="Годных: '+d.good+'"></div>'+
+        '<div style="font-size:.65em;color:var(--text3);margin-top:2px;white-space:nowrap">'+d.day.slice(5)+'</div>'+
+        '<div style="font-size:.7em;font-weight:700;color:var(--text2)">'+d.good+'</div></div>';
+    }).join('')+
+    '</div><div style="font-size:.75em;color:var(--text3);margin-top:4px"><span style="color:var(--ok)">■</span> Годных &nbsp;<span style="color:var(--err)">■</span> Брак</div>'+
+    '</div>';
+  }
   c.innerHTML='<div class="cards">'+widgets.map(function(w){return '<div class="card '+w.cls+'" onclick="dashDetail(\''+w.k+'\')"><h4>'+w.lbl+'</h4><div class="val">'+w.v+'</div></div>'}).join('')+'</div>'+
+  chartHtml+
   '<div class="section-hdr">Статистика по операциям</div><div class="tbl-wrap"><table><thead><tr><th>Тип</th><th>Всего</th><th>Выполнено</th><th>Ср. время</th></tr></thead>'+
   '<tbody>'+ops.map(function(o){return '<tr><td>'+o.type+'</td><td>'+o.total+'</td><td>'+o.completed+'</td><td>'+fmtMinToH(Math.round(o.avg_min))+'</td></tr>'}).join('')+'</tbody></table></div>'})}
 function dashDetail(w){api('/api/analytics/dashboard/detail/'+w).then(function(data){if(!data.length){toast('Нет данных');return}
@@ -2893,11 +2983,30 @@ function dashDetail(w){api('/api/analytics/dashboard/detail/'+w).then(function(d
   h+='</tbody></table></div><div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ЗАКАЗЫ ═══
-function pgOrders(c){api('/api/orders').then(function(orders){
+var ordFilter={status:'',priority:'',search:'',overdue:false};var ordSearchTimer=null;
+function pgOrders(c){api('/api/orders').then(function(allOrders){
+  var orders=allOrders;
+  if(ordFilter.status)orders=orders.filter(function(o){return o.status===ordFilter.status});
+  if(ordFilter.priority)orders=orders.filter(function(o){return o.priority===ordFilter.priority});
+  if(ordFilter.overdue)orders=orders.filter(function(o){return o.overdue});
+  if(ordFilter.search){var sq=ordFilter.search.toLowerCase();orders=orders.filter(function(o){return o.number.toLowerCase().indexOf(sq)>=0||(o.customer||'').toLowerCase().indexOf(sq)>=0||(o.description||'').toLowerCase().indexOf(sq)>=0})}
+  var activeCnt=allOrders.filter(function(o){return['Новый','Ожидает','В работе'].indexOf(o.status)>=0}).length;
+  var overdueCnt=allOrders.filter(function(o){return o.overdue}).length;
   c.innerHTML='<div class="toolbar">'+(hasPerm('order.create')?'<button class="btn primary" onclick="modalOrder()">+ Новый заказ</button>':'')+
-    (hasPerm('order.reports')?'<button class="btn" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalReports()">📊 Отчёты</button>':'')+'</div>'+
+    (hasPerm('order.reports')?'<button class="btn" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalReports()">📊 Отчёты</button>':'')+
+    '<span class="spacer"></span><span style="font-size:.85em;color:var(--text2)">Показано: <strong>'+orders.length+'</strong> / '+allOrders.length+'</span>'+
+    '<a href="/api/export/orders'+(ordFilter.status?'?status='+encodeURIComponent(ordFilter.status):'')+'" class="btn sm" title="Экспорт в CSV" download>📥 CSV</a></div>'+
+  '<div class="filter-bar">'+
+    '<label>Поиск:</label><input id="ordSearchInp" style="width:200px" placeholder="№, клиент, описание..." value="'+esc(ordFilter.search)+'">'+
+    '<label>Статус:</label><select onchange="ordFilter.status=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
+      '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(ordFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
+    '<label>Приоритет:</label><select onchange="ordFilter.priority=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
+      '<option value="">Все</option>'+PRIORITIES.map(function(p){return '<option '+(ordFilter.priority===p?'selected':'')+'>'+p+'</option>'}).join('')+'</select>'+
+    (overdueCnt>0?'<button class="btn sm '+(ordFilter.overdue?'primary warn':'')+'" onclick="ordFilter.overdue=!ordFilter.overdue;pgOrders(document.getElementById(\'mainContent\'))">⚠ Просроч. ('+overdueCnt+')</button>':'')+
+    '<button class="btn sm" onclick="ordFilter={status:\'\',priority:\'\',search:\'\',overdue:false};pgOrders(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+  '</div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>№</th><th>Клиент</th><th>Описание</th><th>Сумма</th><th>Поз.</th><th>Приор.</th><th>Статус</th><th>Дедлайн</th><th>Заверш.</th><th>📎</th><th></th></tr></thead>'+
-  '<tbody>'+orders.map(function(o){return '<tr '+(o.overdue?'class="overdue-row"':'')+'>'+
+  '<tbody>'+(orders.length?orders.map(function(o){return '<tr '+(o.overdue?'class="overdue-row"':'')+'>'+
     '<td><strong>'+o.number+'</strong></td><td>'+o.customer+'</td><td title="'+esc(o.description)+'">'+(o.description||'').substring(0,35)+'</td>'+
     '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td><td>'+statusBadge(o.priority)+'</td><td>'+statusBadge(o.status)+'</td>'+
     '<td '+(o.overdue?'class="low"':'')+'>'+fmtD(o.deadline)+(o.overdue?' ⚠':'')+'</td>'+
@@ -2909,7 +3018,11 @@ function pgOrders(c){api('/api/orders').then(function(orders){
       (hasPerm('order.edit')?'<button class="btn sm" onclick="modalOrder('+o.id+')">✏</button>':'')+
       (hasPerm('order.delete')?'<button class="btn sm" onclick="delOrder('+o.id+',\''+esc(o.number)+'\')" style="color:var(--err)" title="Удалить заказ">🗑</button>':'')+
       (hasPerm('order.status')?'<select class="ctl" style="padding:3px;font-size:.8em" onchange="chgStatus('+o.id+',this.value)">'+STATUSES.map(function(s){return '<option '+(s===o.status?'selected':'')+'>'+s+'</option>'}).join('')+'</select>':'')+
-    '</td></tr>'}).join('')+'</tbody></table></div>'})}
+    '</td></tr>'}).join(''):'<tr><td colspan="11" style="text-align:center;color:var(--text3);padding:20px">Нет заказов по выбранным фильтрам</td></tr>')+'</tbody></table></div>';
+  var inp=document.getElementById('ordSearchInp');
+  if(inp){inp.addEventListener('input',function(){ordFilter.search=this.value;clearTimeout(ordSearchTimer);ordSearchTimer=setTimeout(function(){pgOrders(document.getElementById('mainContent'))},350)});
+    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);}
+})}
 function chgStatus(oid,s){
   api('/api/orders/'+oid+'/status','POST',{status:s,user_id:U.id}).then(function(r){
     if(r.status==='warning'){if(confirm(r.message)){api('/api/orders/'+oid+'/status','POST',{status:s,user_id:U.id,force:true}).then(function(){toast('Обновлён','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}else{refreshPage()}}
@@ -2975,11 +3088,11 @@ function modalOrderDetail(oid){
     '<td style="font-size:.8em">'+((it.materials||[]).map(function(m){return m.name+': '+m.sheets_needed+'л'}).join('<br>')||'—')+'</td>'+
     '<td>'+(hasPerm('order.edit')?'<button class="btn sm" onclick="modalEditItem('+oid+','+it.id+')">✏</button><button class="btn sm" onclick="delItem('+it.id+','+oid+')">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table>'+
   '<div class="section-hdr">Операции</div>'+
-  '<table><thead><tr><th>#</th><th>Деталь</th><th>Тип</th><th>Ресурс</th><th>План</th><th>Время</th><th>Статус</th><th></th></tr></thead>'+
+  '<table><thead><tr><th>#</th><th>Деталь</th><th>Тип</th><th>Станок</th><th>План</th><th>Время</th><th>Статус</th><th></th></tr></thead>'+
   '<tbody>'+ops.map(function(op){return '<tr><td>'+op.sequence+'</td>'+
     '<td>'+(op.component_name?'<div><strong style="font-size:.85em">🔩 '+op.component_name+'</strong><div style="font-size:.75em;color:var(--text3)">сб: '+(op.item||'—')+'</div></div>':(op.item||'—'))+'</td>'+
     '<td>'+op.type+'</td>'+
-    '<td><div style="min-width:160px">'+SS('op_res_'+op.id,resOptsFor(op.type),String(op.resource_id||''),'Ресурс...',function(v){updateOpRes(op.id,v)})+'</div></td>'+
+    '<td><div style="min-width:160px">'+SS('op_res_'+op.id,resOptsFor(op.type),String(op.resource_id||''),'Станок...',function(v){updateOpRes(op.id,v)})+'</div></td>'+
     '<td>'+op.planned_qty+'</td>'+
     '<td>'+fmtMinToH(op.estimated_min)+'</td>'+
     '<td>'+statusBadge(op.status)+'</td>'+
@@ -2990,7 +3103,7 @@ function modalOrderDetail(oid){
     (hasPerm('order.files')?'<button class="btn sm" onclick="delFile('+f.id+','+oid+')">🗑</button>':'')+'</div>'}).join('')||'<div style="color:var(--text3);padding:8px">Нет файлов</div>')+'</div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')})}
 
-function updateOpRes(opid,val){api('/api/operations/save','POST',{id:opid,resource_id:+val||null}).then(function(){toast('Ресурс назначен','ok')}).catch(function(e){toast(e.message,'err')})}
+function updateOpRes(opid,val){api('/api/operations/save','POST',{id:opid,resource_id:+val||null}).then(function(){toast('Станок назначен','ok')}).catch(function(e){toast(e.message,'err')})}
 
 function modalAddItem(oid,custId){
   var url='/api/part-templates'+(custId?'?customer_id='+custId:'');
@@ -3036,7 +3149,7 @@ function doSaveItem(oid,tid,qty,fromSurplus){
   p.then(function(){
     return api('/api/order-items/save','POST',{order_id:oid,part_template_id:tid,quantity:qty,user_id:U.id})
   }).then(function(r){
-    if(r.unassigned_ops>0){toast('⚠ '+r.unassigned_ops+' операций без ресурса — назначьте вручную','err')}
+    if(r.unassigned_ops>0){toast('⚠ '+r.unassigned_ops+' операций без станка — назначьте вручную','err')}
     var msg=fromSurplus>0?'Добавлено ('+fromSurplus+' шт из пересорта)':'Добавлено';
     closeModal();toast(msg,'ok');modalOrderDetail(oid)
   }).catch(function(e){toast(e.message,'err')})}
@@ -3076,28 +3189,42 @@ function loadReport(){var f=document.getElementById('rpt_from').value;var t=docu
   document.getElementById('rptResult').innerHTML=h}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ДЕТАЛИ БД ═══
-var ptSearch='',ptSearchTimer=null;
+var ptSearch='',ptSearchTimer=null,ptSubTab='parts';
 function pgPartsDB(c){
   api('/api/part-templates?search='+encodeURIComponent(ptSearch)).then(function(pts){
+
+  // Под-табы
+  var parts=pts.filter(function(p){return !p.is_assembly});
+  var assemblies=pts.filter(function(p){return p.is_assembly});
+  var tabData=ptSubTab==='assemblies'?assemblies:parts;
+
+  var subTabsHtml='<div style="display:flex;gap:6px;padding:0 0 12px">'+
+    '<button class="btn'+(ptSubTab==='parts'?' primary':'')+'" onclick="ptSubTab=\'parts\';pgPartsDB(document.getElementById(\'mainContent\'))">'+
+      '🔩 Детали ('+parts.length+')</button>'+
+    '<button class="btn'+(ptSubTab==='assemblies'?' primary':'')+'" onclick="ptSubTab=\'assemblies\';pgPartsDB(document.getElementById(\'mainContent\'))">'+
+      '🔧 Сборочные единицы ('+assemblies.length+')</button>'+
+  '</div>';
+
   c.innerHTML='<div class="toolbar">'+(hasPerm('parts.create')?'<button class="btn primary" onclick="modalPartTpl()">+ Новая деталь</button>':'')+
     '<span class="spacer"></span>'+
     '<input class="ctl" id="ptSearchInput" style="width:280px" placeholder="🔍 Поиск..." value="'+esc(ptSearch)+'"></div>'+
+  subTabsHtml+
   '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th><th>Чертёж</th><th>Заказчик</th><th>Материалы</th><th>Операции</th><th>📎</th><th></th></tr></thead>'+
-  '<tbody>'+pts.map(function(p){
+  '<tbody>'+(tabData.length?tabData.map(function(p){
     var mats=(p.materials||[]).map(function(m){return m.material_name+': '+m.sheets_input+'л→'+m.parts_per_sheets+'шт'}).join('<br>')||'—';
     var opT=p.operation_times||{};var opStr=Object.entries(opT).map(function(e){return e[0]+': '+(typeof e[1]==='object'?fmtMinToH(Math.round(e[1].per_one)):e[1])}).join(', ')||'—';
     var filesHtml='';
     if((p.files||[]).length&&hasPerm('parts.files')){
       filesHtml='<button class="btn sm" onclick="modalPTFiles('+p.id+',\''+esc(p.display_name)+'\')">📎'+p.files.length+'</button>';
     } else if((p.files||[]).length){filesHtml='📎'+p.files.length}else{filesHtml='—'}
-    return '<tr><td><strong>'+p.display_name+'</strong></td><td>'+(p.part_number||'—')+'</td><td>'+p.customer_name+'</td>'+
+    return '<tr><td><strong>'+(p.is_assembly?'🔧 ':'🔩 ')+p.display_name+'</strong></td><td>'+(p.part_number||'—')+'</td><td>'+p.customer_name+'</td>'+
     '<td style="font-size:.8em">'+mats+'</td><td style="font-size:.8em">'+opStr+'</td>'+
     '<td>'+filesHtml+'</td>'+
-    '<td>'+(hasPerm('parts.edit')?'<button class="btn sm" onclick="modalPartTpl('+p.id+')">✏</button><button class="btn sm" onclick="delPT('+p.id+')">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>';
-  // Attach input event after render
+    '<td>'+(hasPerm('parts.edit')?'<button class="btn sm" onclick="modalPartTpl('+p.id+')">✏</button><button class="btn sm" onclick="delPT('+p.id+')">🗑</button>':'')+'</td></tr>';
+  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text3)">Нет данных</td></tr>')+'</tbody></table></div>';
+
   var inp=document.getElementById('ptSearchInput');
   if(inp){inp.addEventListener('input',function(){ptSearch=this.value;clearTimeout(ptSearchTimer);ptSearchTimer=setTimeout(function(){pgPartsDB(document.getElementById('mainContent'))},400)});
-    // restore cursor
     inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)}
   })}
 
@@ -3249,6 +3376,7 @@ function pgWarehouse(c){
     (hasPerm('mat.receive')?'<button class="btn ok" onclick="modalReceive()">📥 Поступление</button>':'')+
     (hasPerm('mat.edit')?'<button class="btn" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalAdjust()">🔧 Изменить количество</button>':'')+
     '<button class="btn" onclick="modalEditHistory()">📜 История</button>'+
+    '<a href="/api/export/materials" class="btn sm" title="Экспорт склада в CSV" download>📥 CSV</a>'+
     (need.length?'<button class="btn warn" onclick="modalNeedMat()">⚠ Дефицит ('+need.length+')</button>':'')+'</div>'+
   '<div class="sub-tabs">'+cats.map(function(ct){return '<button class="'+(ct.id===whCatId?'active':'')+'" onclick="whCatId='+ct.id+';pgWarehouse(document.getElementById(\'mainContent\'))">'+ct.name+'</button>'}).join('')+'</div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th>'+
@@ -3441,7 +3569,7 @@ function modalMovements(mid,name){api('/api/materials/'+mid+'/movements').then(f
     '<td>'+(m.order||'—')+'</td><td>'+(m.user||'—')+'</td><td style="font-size:.85em">'+m.note+'</td></tr>'}).join('')+'</tbody></table></div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')})}
 
-// ═══ ОПЕРАЦИИ (+ фильтр по типу) ═══
+// ═══ ОПЕРАЦИИ ═══
 var opsResFilter=0,opsTypeFilter='';
 function pgOperations(c){
   Promise.all([api('/api/resources'),api('/api/op-types')]).then(function(arr2){
@@ -3452,30 +3580,65 @@ function pgOperations(c){
   api(url).then(function(ops){
   window._opsData={};ops.forEach(function(o){window._opsData[o.id]=o});
   if(opsTypeFilter)ops=ops.filter(function(o){return o.type===opsTypeFilter});
-  var byRes={};
-  ops.forEach(function(o){var rn=o.resource||'Не назначен';if(!byRes[rn])byRes[rn]={ops:[],rid:o.resource_id,shift_h:0};byRes[rn].ops.push(o)});
-  resources.forEach(function(r){if(byRes[r.name])byRes[r.name].shift_h=r.shift_hours});
+
+  // ─ Группируем по ТИПУ операции ─
+  var typeOrder=[];var byType={};
+  ops.forEach(function(o){
+    var tn=o.type||'Без типа';
+    if(!byType[tn]){byType[tn]={ops:[]};typeOrder.push(tn);}
+    byType[tn].ops.push(o);
+  });
+
   var resOpts=[{v:'0',t:'Все участки'}].concat(resources.map(function(r){return{v:String(r.id),t:r.name}}));
   var typeOpts=[{v:'',t:'Все типы'}].concat(opTypes.filter(function(o){return o.is_active}).map(function(o){return{v:o.name,t:o.name}}));
   var html='<div class="toolbar"><div class="info-box" style="margin:0;padding:6px 12px">Операции «В работе»</div><span class="spacer"></span></div>'+
-  '<div class="filter-bar"><label>Участок:</label><div style="min-width:200px">'+SS('ops_res',resOpts,String(opsResFilter),'Все',function(v){opsResFilter=+v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
-    '<label>Тип:</label><div style="min-width:200px">'+SS('ops_type',typeOpts,opsTypeFilter,'Все типы',function(v){opsTypeFilter=v;pgOperations(document.getElementById('mainContent'))})+'</div></div>';
-  Object.keys(byRes).forEach(function(rname){var data=byRes[rname];var totalMin=data.ops.reduce(function(s,o){return s+o.estimated_min},0);
-    var shiftMin=data.shift_h*60;var totalShifts=shiftMin>0?Math.ceil(totalMin/shiftMin):0;
-    html+='<div class="section-hdr">'+rname+'<span style="font-weight:400;font-size:.85em;color:var(--text3);margin-left:12px">'+fmtMinToH(totalMin)+' | ~'+totalShifts+' смен</span></div>'+
-    '<div class="tbl-wrap"><table><thead><tr><th>↕</th><th>Заказ</th><th>Деталь</th><th>Тип</th><th>План</th><th>Гот</th><th>Брак</th><th>Время</th><th>Ст.</th><th></th></tr></thead><tbody>'+
-    data.ops.map(function(o){return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)">'+
-      '<td style="cursor:grab">☰</td><td>'+(o.order_display||o.order_number)+'</td>'+
-       '<td>'+(o.component_name?'<div><strong style="font-size:.9em">🔩 '+o.component_name+'</strong><div style="font-size:.75em;color:var(--text3)">сб: '+(o.item||'—')+'</div></div>':(o.item||'—'))+'</td>'+
-       '<td>'+o.type+'</td>'+
-      '<td>'+o.planned_qty+'</td><td>'+o.completed_qty+'</td><td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td><td>'+fmtMinToH(o.estimated_min)+'</td><td>'+statusBadge(o.status)+'</td>'+
-      '<td style="white-space:nowrap">'+
-        (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
-        (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
-        ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
-        (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)">↩</button>':'')+
-      '</td></tr>'}).join('')+'</tbody></table></div>'});
-  if(!Object.keys(byRes).length)html+='<div class="info-box">Нет операций</div>';c.innerHTML=html})})}
+    '<div class="filter-bar">'+
+      '<label>Участок:</label><div style="min-width:200px">'+SS('ops_res',resOpts,String(opsResFilter),'Все',function(v){opsResFilter=+v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
+      '<label>Тип:</label><div style="min-width:200px">'+SS('ops_type',typeOpts,opsTypeFilter,'Все типы',function(v){opsTypeFilter=v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
+    '</div>';
+
+  typeOrder.forEach(function(tname){
+    var data=byType[tname];
+    var totalMin=data.ops.reduce(function(s,o){return s+o.estimated_min},0);
+    var noRes=data.ops.filter(function(o){return !o.resource_id}).length;
+    html+='<div class="section-hdr">'+
+        '<span style="font-size:1.05em">⚙ '+tname+'</span>'+
+        '<span style="font-weight:400;font-size:.82em;color:var(--text3);margin-left:12px">'+data.ops.length+' оп. | '+fmtMinToH(totalMin)+'</span>'+
+        (noRes>0?'<span style="font-size:.78em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 7px;margin-left:8px">'+noRes+' без участка</span>':'')+
+      '</div>'+
+      '<div class="tbl-wrap"><table><thead><tr>'+
+        '<th>↕</th><th>Заказ</th><th>Деталь / Компонент</th><th>Станок / Участок</th>'+
+        '<th>План</th><th>Гот</th><th>Брак</th><th>Время</th><th>Ст.</th><th></th>'+
+      '</tr></thead><tbody>'+
+      data.ops.map(function(o){
+        var resCell=o.resource&&o.resource!=='—'
+          ?'<span style="font-size:.82em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.12);border-radius:3px;padding:1px 6px">📍'+o.resource+'</span>'
+          :'<span style="color:var(--err);font-size:.8em;background:rgba(239,68,68,.1);border-radius:3px;padding:1px 6px">⚠ не назначен</span>';
+        return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)">'+
+          '<td style="cursor:grab">☰</td>'+
+          '<td style="font-size:.85em">'+(o.order_display||o.order_number)+'</td>'+
+          '<td>'+(o.component_name
+            ?'<div><strong style="font-size:.88em">🔩 '+o.component_name+'</strong><div style="font-size:.73em;color:var(--text3)">сб: '+(o.item||'—')+'</div></div>'
+            :(o.item||'—'))+
+          '</td>'+
+          '<td>'+resCell+'</td>'+
+          '<td>'+o.planned_qty+'</td>'+
+          '<td>'+o.completed_qty+'</td>'+
+          '<td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td>'+
+          '<td style="font-size:.82em">'+fmtMinToH(o.estimated_min)+'</td>'+
+          '<td>'+statusBadge(o.status)+'</td>'+
+          '<td style="white-space:nowrap">'+
+            (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
+            (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
+            ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
+            (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)">↩</button>':'')+
+          '</td></tr>';
+      }).join('')+'</tbody></table></div>';
+  });
+
+  if(!typeOrder.length)html+='<div class="info-box">Нет операций</div>';
+  c.innerHTML=html;
+  })})}
 
 var draggedOpId=null;function dragOp(e){draggedOpId=e.target.closest('tr').dataset.opid;e.dataTransfer.effectAllowed='move'}
 function dropOp(e){e.preventDefault();var tr=e.target.closest('tr');if(!tr||!draggedOpId)return;
@@ -3654,24 +3817,17 @@ function submitEditRes(rid){api('/api/reservations/'+rid+'/edit','POST',{user_id
 function cancelRes(rid){if(!confirm('Снять?'))return;api('/api/reservations/'+rid+'/cancel','POST',{user_id:U.id}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ УЧЁТ ДЕТАЛЕЙ ═══
-var plFilter={name:'',active_only:1},plSearchTimer=null,plSubTab='parts';
+var plFilter={name:'',active_only:1},plSearchTimer=null;
 function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active_only).then(function(data){
   var filtered=data;
   if(plFilter.name)filtered=filtered.filter(function(d){return d.part_name.toLowerCase().indexOf(plFilter.name.toLowerCase())>=0});
 
-  // Разделяем на детали и сборочные единицы
-  var parts=filtered.filter(function(d){return !d.is_assembly});
-  var assemblies=filtered.filter(function(d){return d.is_assembly});
-  var tabData=plSubTab==='assemblies'?assemblies:parts;
+  var surplusItems=filtered.filter(function(d){return d.surplus>0});
+  var totalSurplus=surplusItems.reduce(function(s,d){return s+d.surplus},0);
 
-  // Пересорт по каждому под-табу
-  var partsSurplusQty=parts.filter(function(d){return d.surplus>0}).reduce(function(s,d){return s+d.surplus},0);
-  var asmSurplusQty=assemblies.filter(function(d){return d.surplus>0}).reduce(function(s,d){return s+d.surplus},0);
-  var totalSurplus=partsSurplusQty+asmSurplusQty;
-
-  // Типы операций только для текущего под-таба
+  // Типы операций: компонентные — слева, сборочные/одиночные — справа
   var compOpSeq={},asmOpSeq={};
-  tabData.forEach(function(d){
+  filtered.forEach(function(d){
     (d.planned_ops||[]).forEach(function(op){
       if(!op.op_type) return;
       if(op.component_id!=null){
@@ -3689,21 +3845,9 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
   if(totalSurplus>0){
     bannerHtml='<div class="surplus-banner" onclick="modalSurplus()">'+
       '<span class="sb-icon">🚨</span>'+
-      '<span class="sb-text">ПЕРЕСОРТ! Деталей изготовлено сверх плана. Нажмите для подробностей.</span>'+
+      '<span class="sb-text">ПЕРЕСОРТ! Деталей изготовлено сверх плана: '+surplusItems.length+' позиций. Нажмите для подробностей.</span>'+
       '<span class="sb-count">+'+totalSurplus+' шт</span></div>';
   }
-
-  // Под-табы
-  var subTabsHtml='<div style="display:flex;gap:6px;padding:10px 0 14px;border-bottom:2px solid var(--brd);margin-bottom:10px">'+
-    '<button class="btn'+(plSubTab==='parts'?' primary':'')+'" onclick="plSubTab=\'parts\';pgPartsLog(document.getElementById(\'mainContent\'))">'+
-      '🔩 Детали ('+parts.length+')'+
-      (partsSurplusQty>0?' <span style="background:var(--err);color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em;margin-left:4px">ПС +'+partsSurplusQty+'</span>':'')+
-    '</button>'+
-    '<button class="btn'+(plSubTab==='assemblies'?' primary':'')+'" onclick="plSubTab=\'assemblies\';pgPartsLog(document.getElementById(\'mainContent\'))">'+
-      '🔧 Сборочные единицы ('+assemblies.length+')'+
-      (asmSurplusQty>0?' <span style="background:var(--err);color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em;margin-left:4px">ПС +'+asmSurplusQty+'</span>':'')+
-    '</button>'+
-  '</div>';
 
   c.innerHTML='<div class="toolbar">'+
     (totalSurplus>0?'<button class="btn" style="background:var(--err);border-color:var(--err);color:#fff" onclick="modalSurplus()">🚨 Пересорт из пр-ва (+'+totalSurplus+')</button>':'')+
@@ -3714,8 +3858,7 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
     '<option value="1" '+(plFilter.active_only?'selected':'')+'>В работе</option>'+
     '<option value="0" '+(!plFilter.active_only?'selected':'')+'>Все</option></select></div>'+
     bannerHtml+
-    subTabsHtml+
-    (tabData.length?renderPartsMatrix(tabData,allOpTypes):'<div class="info-box">Нет данных</div>');
+    (filtered.length?renderPartsMatrix(filtered,allOpTypes):'<div class="info-box">Нет данных</div>');
 
   var inp=document.getElementById('plNameInput');
   if(inp){
@@ -3972,13 +4115,22 @@ function deleteSurplusEntry(sid){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
-var woTab='Материал';
+var woTab='Материал',woFilter={order:'',resource:'',user:''};
 function pgWriteoffs(c){var canMat=U.writeoff_types.indexOf('Материал')>=0,canParts=U.writeoff_types.indexOf('Детали')>=0;
-  if(!canMat&&canParts)woTab='Детали';api('/api/writeoffs?wtype='+woTab).then(function(wos){
+  if(!canMat&&canParts)woTab='Детали';api('/api/writeoffs?wtype='+woTab).then(function(allWos){
+  var wos=allWos;
+  if(woFilter.order){var sq=woFilter.order.toLowerCase();wos=wos.filter(function(w){return(w.order_display||'').toLowerCase().indexOf(sq)>=0})}
+  if(woFilter.resource)wos=wos.filter(function(w){return(w.resource||'').toLowerCase().indexOf(woFilter.resource.toLowerCase())>=0});
   c.innerHTML='<div class="toolbar">'+
-    (canMat?'<button class="btn '+(woTab==='Материал'?'primary':'')+'" onclick="woTab=\'Материал\';pgWriteoffs(document.getElementById(\'mainContent\'))">📦 Материал</button>':'')+
-    (canParts?'<button class="btn '+(woTab==='Детали'?'primary':'')+'" onclick="woTab=\'Детали\';pgWriteoffs(document.getElementById(\'mainContent\'))">🔩 Детали</button>':'')+
-    '<span class="spacer"></span><button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
+    (canMat?'<button class="btn '+(woTab==='Материал'?'primary':'')+'" onclick="woTab=\'Материал\';woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">📦 Материал</button>':'')+
+    (canParts?'<button class="btn '+(woTab==='Детали'?'primary':'')+'" onclick="woTab=\'Детали\';woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">🔩 Детали</button>':'')+
+    '<span class="spacer"></span><span style="font-size:.85em;color:var(--text2)">Показано: <strong>'+wos.length+'</strong> / '+allWos.length+'</span>'+
+    '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
+  '<div class="filter-bar">'+
+    '<label>Заказ:</label><input style="width:160px" placeholder="Поиск по заказу..." value="'+esc(woFilter.order)+'" oninput="woFilter.order=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
+    '<label>Участок:</label><input style="width:140px" placeholder="Участок..." value="'+esc(woFilter.resource)+'" oninput="woFilter.resource=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
+    '<button class="btn sm" onclick="woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+  '</div>'+
   (woTab==='Материал'?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th>Заказ</th><th>Деталь</th><th>Материал</th><th>Л</th><th>Кг</th><th>Уч.</th><th>Кто</th><th>Прим.</th><th></th></tr></thead>'+
   '<tbody>'+wos.map(function(w){return '<tr class="'+(w.is_cancelled?'cancelled-row':'')+'"><td style="font-size:.8em">'+fmtDT(w.date)+'</td><td>'+(w.order_display||'—')+'</td><td>'+(w.part_name||'—')+'</td><td>'+(w.material||'—')+'</td>'+
     '<td>'+(w.sheets||'—')+'</td><td>'+fmtN(w.kg)+'</td><td>'+(w.resource||'—')+'</td><td>'+w.user+'</td><td style="font-size:.85em">'+(w.note||'')+
@@ -4116,12 +4268,12 @@ function saveCust(cid){var b={name:document.getElementById('fcu_name').value,sho
   phone:document.getElementById('fcu_ph').value,email:document.getElementById('fcu_em').value,address:document.getElementById('fcu_addr').value};
   if(cid)b.id=cid;api('/api/customers/save','POST',b).then(function(){closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
-// ═══ РЕСУРСЫ (+ фильтр по типу + удаление) ═══
+// ═══ СТАНКИ (+ фильтр по типу + удаление) ═══
 var resTypeFilter='';
 function pgResources(c){api('/api/resources').then(function(rs){
   var types=[];rs.forEach(function(r){if(types.indexOf(r.type)<0)types.push(r.type)});types.sort();
   var filtered=resTypeFilter?rs.filter(function(r){return r.type===resTypeFilter}):rs;
-  c.innerHTML='<div class="toolbar">'+(hasPerm('res.create')?'<button class="btn primary" onclick="modalRes()">+ Ресурс</button>':'')+'</div>'+
+  c.innerHTML='<div class="toolbar">'+(hasPerm('res.create')?'<button class="btn primary" onclick="modalRes()">+ Станок</button>':'')+'</div>'+
   '<div class="filter-bar"><label>Тип:</label><select onchange="resTypeFilter=this.value;pgResources(document.getElementById(\'mainContent\'))">'+
     '<option value="">Все</option>'+types.map(function(t){return '<option '+(resTypeFilter===t?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Тип</th><th>Код</th><th>Операции</th><th>Смена</th><th>Дост.</th><th></th></tr></thead>'+
@@ -4129,17 +4281,17 @@ function pgResources(c){api('/api/resources').then(function(rs){
     '<td style="font-size:.8em">'+((r.allowed_ops||[]).join(', ')||'—')+'</td><td>'+r.shift_hours+'ч × '+r.shifts_per_day+'см</td><td>'+(r.available?'✅':'❌')+'</td>'+
     '<td>'+(hasPerm('res.edit')?'<button class="btn sm" onclick="modalRes('+r.id+')">✏</button>':'')+
     (hasPerm('res.delete')?'<button class="btn sm" onclick="delRes('+r.id+')" style="color:var(--err)">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
-function delRes(rid){if(!confirm('Удалить ресурс?'))return;api('/api/resources/delete','POST',{id:rid}).then(function(){toast('Удалено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+function delRes(rid){if(!confirm('Удалить станок?'))return;api('/api/resources/delete','POST',{id:rid}).then(function(){toast('Удалено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function modalRes(rid){api('/api/op-types').then(function(opTypes){
   var p1=rid?api('/api/resources'):Promise.resolve(null);p1.then(function(rs){var r=rs?rs.find(function(x){return x.id===rid}):null;
   var curOps=r?r.allowed_ops:[];
   // Показываем все активные типы операций; is_active может быть 1/true/null
   var activeOps=opTypes.filter(function(o){return o.is_active!==false&&o.is_active!==0});
   var RES_TYPES=['Лазерный станок','Плазменный станок','Координатно-пробивной','Листогиб','Сверлильный','Фрезерный','Токарный','Сварочный пост','Сборочный пост','Покрасочная камера','Финишный участок','ОТК'];
-  // Добавляем тип ресурса из БД если не входит в список (пользовательские)
+  // Добавляем тип станка из БД если не входит в список (пользовательские)
   if(r&&r.type&&RES_TYPES.indexOf(r.type)<0)RES_TYPES.push(r.type);
   var typeOpts=RES_TYPES.map(function(t){return{v:t,t:t}});
-  openModal('<h2>'+(r?'✏':'+')+' Ресурс</h2>'+
+  openModal('<h2>'+(r?'✏':'+')+' Станок</h2>'+
   '<div class="form-row"><div><label>Название</label><input id="frs_name" value="'+(r?r.name:'')+'"></div><div><label>Код</label><input id="frs_code" value="'+(r?r.code:'')+'"></div></div>'+
   '<div class="form-row"><div><label>Тип</label>'+SS('frs_type',typeOpts,r?r.type:RES_TYPES[0],'Тип')+'</div>'+
     '<div><label>Доступен</label><select id="frs_av"><option value="true" '+(!r||r.available?'selected':'')+'>Да</option><option value="false" '+(r&&!r.available?'selected':'')+'>Нет</option></select></div></div>'+
@@ -4338,9 +4490,11 @@ function saveCat(cid){var b={name:document.getElementById('fcat_name').value,typ
   api('/api/material-categories/save','POST',b).then(function(){closeModal();toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 
 function setOpTypes(sc){api('/api/op-types').then(function(opTypes){
+  var WO_MODE_BADGE={'Детали':'b-info','Материал':'b-warn','Материал+Детали':'b-purple','Нет':'b-gray'};
   sc.innerHTML='<button class="btn primary" onclick="modalOpType()" style="margin-bottom:12px">+ Тип</button>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Порядок</th><th>Акт.</th><th></th></tr></thead>'+
-  '<tbody>'+opTypes.map(function(ot){return '<tr><td><strong>'+ot.name+'</strong></td><td>'+ot.sort_order+'</td><td>'+(ot.is_active?'✅':'❌')+'</td>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Порядок</th><th>Режим списания</th><th>Акт.</th><th></th></tr></thead>'+
+  '<tbody>'+opTypes.map(function(ot){var wm=ot.writeoff_mode||'Детали';return '<tr><td><strong>'+ot.name+'</strong></td><td>'+ot.sort_order+'</td>'+
+    '<td><span class="badge '+(WO_MODE_BADGE[wm]||'b-gray')+'">'+wm+'</span></td><td>'+(ot.is_active?'✅':'❌')+'</td>'+
     '<td><button class="btn sm" onclick="modalOpType('+ot.id+')">✏</button><button class="btn sm" onclick="delOpType('+ot.id+')">🗑</button></td></tr>'}).join('')+'</tbody></table></div>'})}
 function modalOpType(otid){var p1=otid?api('/api/op-types'):Promise.resolve(null);p1.then(function(ots){var ot=ots?ots.find(function(x){return x.id===otid}):null;
    openModal('<h2>'+(ot?'✏':'+')+' Тип операции</h2>'+
@@ -4395,5 +4549,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
     main()
