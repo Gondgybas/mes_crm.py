@@ -493,6 +493,7 @@ class WriteOff(Base):
     order_item = relationship("OrderItem")
     material = relationship("Material")
     reservation = relationship("Reservation")
+    component_template = relationship("PartTemplate", foreign_keys=[component_template_id])
 
 
 class AuditLog(Base):
@@ -2260,6 +2261,7 @@ def create_app():
             joinedload(WriteOff.order).joinedload(Order.customer),
             joinedload(WriteOff.material),
             joinedload(WriteOff.order_item).joinedload(OrderItem.part_template),
+            joinedload(WriteOff.component_template),
             joinedload(WriteOff.reservation), joinedload(WriteOff.cancelled_user))
         if wtype: q = q.filter(WriteOff.writeoff_type == wtype)
         return [{"id": w.id, "type": w.writeoff_type,
@@ -2270,6 +2272,7 @@ def create_app():
                  "material_type": w.material.material_type if w.material else "",
                  "sheets": w.quantity_sheets, "kg": w.quantity_kg, "pcs": w.quantity_pcs,
                  "part_name": pt_display(w.order_item.part_template) if w.order_item and w.order_item.part_template else "",
+                 "component_name": pt_display(w.component_template) if w.component_template else "",
                  "parts_good": w.parts_good, "parts_rejected": w.parts_rejected,
                  "is_anomaly": w.is_anomaly, "anomaly_note": w.anomaly_note,
                  "is_cancelled": w.is_cancelled,
@@ -4140,57 +4143,99 @@ function deleteSurplusEntry(sid){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
-var woTab='Материал',woFilter={order:'',resource:'',user:''};
-function pgWriteoffs(c){var canMat=U.writeoff_types.indexOf('Материал')>=0,canParts=U.writeoff_types.indexOf('Детали')>=0;
-  if(!canMat&&canParts)woTab='Детали';api('/api/writeoffs?wtype='+woTab).then(function(allWos){
+var woFilter={order:'',resource:'',wtype:''};
+function pgWriteoffs(c){
+  api('/api/writeoffs').then(function(allWos){
   var wos=allWos;
   if(woFilter.order){var sq=woFilter.order.toLowerCase();wos=wos.filter(function(w){return(w.order_display||'').toLowerCase().indexOf(sq)>=0})}
   if(woFilter.resource)wos=wos.filter(function(w){return(w.resource||'').toLowerCase().indexOf(woFilter.resource.toLowerCase())>=0});
+  if(woFilter.wtype)wos=wos.filter(function(w){return w.type===woFilter.wtype});
   c.innerHTML='<div class="toolbar">'+
-    (canMat?'<button class="btn '+(woTab==='Материал'?'primary':'')+'" onclick="woTab=\'Материал\';woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">📦 Материал</button>':'')+
-    (canParts?'<button class="btn '+(woTab==='Детали'?'primary':'')+'" onclick="woTab=\'Детали\';woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">🔩 Детали</button>':'')+
     '<span class="spacer"></span><span style="font-size:.85em;color:var(--text2)">Показано: <strong>'+wos.length+'</strong> / '+allWos.length+'</span>'+
     '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
   '<div class="filter-bar">'+
     '<label>Заказ:</label><input style="width:160px" placeholder="Поиск по заказу..." value="'+esc(woFilter.order)+'" oninput="woFilter.order=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
-    '<label>Участок:</label><input style="width:140px" placeholder="Участок..." value="'+esc(woFilter.resource)+'" oninput="woFilter.resource=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
-    '<button class="btn sm" onclick="woFilter={order:\'\',resource:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+    '<label>Станок:</label><input style="width:140px" placeholder="Станок..." value="'+esc(woFilter.resource)+'" oninput="woFilter.resource=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
+    '<label>Тип:</label><select onchange="woFilter.wtype=this.value;pgWriteoffs(document.getElementById(\'mainContent\'))">'+
+      '<option value="" '+(woFilter.wtype===''?'selected':'')+'>Все</option>'+
+      '<option value="Материал" '+(woFilter.wtype==='Материал'?'selected':'')+'>📦 Материал</option>'+
+      '<option value="Детали" '+(woFilter.wtype==='Детали'?'selected':'')+'>🔩 Детали</option>'+
+    '</select>'+
+    '<button class="btn sm" onclick="woFilter={order:\'\',resource:\'\',wtype:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
   '</div>'+
-  (woTab==='Материал'?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th>Заказ</th><th>Деталь</th><th>Материал</th><th>Л</th><th>Кг</th><th>Уч.</th><th>Кто</th><th>Прим.</th><th></th></tr></thead>'+
-  '<tbody>'+wos.map(function(w){return '<tr class="'+(w.is_cancelled?'cancelled-row':'')+'"><td style="font-size:.8em">'+fmtDT(w.date)+'</td><td>'+(w.order_display||'—')+'</td><td>'+(w.part_name||'—')+'</td><td>'+(w.material||'—')+'</td>'+
-    '<td>'+(w.sheets||'—')+'</td><td>'+fmtN(w.kg)+'</td><td>'+(w.resource||'—')+'</td><td>'+w.user+'</td><td style="font-size:.85em">'+(w.note||'')+
-    (w.is_cancelled?' <span class="badge b-err">Отменено: '+w.cancelled_by+'</span>':'')+'</td>'+
-    '<td>'+(w.is_cancelled?'':'<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>')+'</td></tr>'}).join('')+'</tbody></table></div>'
-  :'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th>Заказ</th><th>Деталь</th><th>Годн</th><th>Брак</th><th>Уч.</th><th>Кто</th><th>⚠</th><th>Прим.</th><th></th></tr></thead>'+
-  '<tbody>'+wos.map(function(w){return '<tr class="'+(w.is_cancelled?'cancelled-row':(w.is_anomaly?'anomaly':''))+'"><td style="font-size:.8em">'+fmtDT(w.date)+'</td><td>'+(w.order_display||'—')+'</td><td>'+(w.part_name||'—')+'</td>'+
-    '<td>'+w.parts_good+'</td><td class="'+(w.parts_rejected?'low':'')+'">'+w.parts_rejected+'</td><td>'+(w.resource||'—')+'</td><td>'+w.user+'</td>'+
-    '<td>'+(w.is_anomaly?'<span class="low" title="'+w.anomaly_note+'">⚠</span>':'')+'</td>'+
-    '<td style="font-size:.85em">'+(w.is_anomaly?'<span class="low">'+w.anomaly_note+'</span> ':'')+(w.note||'')+
-    (w.is_cancelled?' <span class="badge b-err">Отменено: '+w.cancelled_by+'</span>':'')+'</td>'+
-    '<td>'+(w.is_cancelled?'':'<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>')+'</td></tr>'}).join('')+'</tbody></table></div>')})}
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    '<th>Дата</th><th>Тип</th><th>Заказ</th><th>Деталь</th>'+
+    '<th>Материал</th><th>Л</th><th>Кг</th>'+
+    '<th>Годн.</th><th>Брак</th>'+
+    '<th>Станок</th><th>Кто</th><th>Прим.</th><th></th>'+
+  '</tr></thead>'+
+  '<tbody>'+wos.map(function(w){
+    var isMat=w.type==='Материал';
+    var typeBadge=isMat
+      ?'<span class="badge b-info" style="font-size:.75em">📦</span>'
+      :'<span class="badge b-ok" style="font-size:.75em">🔩</span>';
+    var anomalyNote=w.is_anomaly?'<div style="font-size:.78em;color:var(--err)">⚠ '+w.anomaly_note+'</div>':'';
+    var cancelNote=w.is_cancelled?'<span class="badge b-err" style="font-size:.75em">↩ '+w.cancelled_by+'</span>':'';
+    return '<tr class="'+(w.is_cancelled?'cancelled-row':w.is_anomaly?'anomaly':'')+'">'+
+      '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(w.date)+'</td>'+
+      '<td>'+typeBadge+'</td>'+
+      '<td style="font-size:.85em">'+(w.order_display||'—')+'</td>'+
+      '<td>'+(w.component_name
+        ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(w.part_name||'—')+'</span><br>🔩 <strong>'+esc(w.component_name)+'</strong></div>'
+        :(w.part_name||'—'))+'</td>'+
+      '<td>'+(isMat?(w.material||'—'):'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(isMat?(w.sheets||'—'):'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(isMat?fmtN(w.kg):'<span style="color:var(--text3)">—</span>')+'</td>'+
+      '<td>'+(isMat?'<span style="color:var(--text3)">—</span>':w.parts_good)+'</td>'+
+      '<td class="'+((!isMat&&w.parts_rejected)?'low':'')+'">'+(isMat?'<span style="color:var(--text3)">—</span>':w.parts_rejected)+'</td>'+
+      '<td style="font-size:.85em">'+(w.resource||'—')+'</td>'+
+      '<td style="font-size:.85em">'+w.user+'</td>'+
+      '<td style="font-size:.82em">'+(w.note||'')+anomalyNote+cancelNote+'</td>'+
+      '<td>'+(w.is_cancelled?'':'<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>')+'</td>'+
+    '</tr>';
+  }).join('')+'</tbody></table></div>';
+  })}
 
 function cancelWO(wid){if(!confirm('Отменить списание? Все параметры вернутся в состояние "до списания".'))return;
   api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(){toast('Списание отменено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),api('/api/op-types')]).then(function(arr){
   var orders=arr[0],resources=arr[1],opTypes=arr[2];
-  var active=orders.filter(function(o){return o.status==='В работе'});var userSt=U.stations||[];
+  var active=orders.filter(function(o){return o.status==='В работе'});
   window._woResources=resources;window._woOpTypes=opTypes.filter(function(o){return o.is_active});window._woAllResources=resources;
   var ordOpts=active.map(function(o){return{v:String(o.id),t:o.display}});
-  openModal('<h2>+ Списание ('+woTab+')</h2>'+
+  var canMat=U.writeoff_types.indexOf('Материал')>=0,canParts=U.writeoff_types.indexOf('Детали')>=0;
+  var defTab=canMat?'Материал':'Детали';
+  openModal('<h2>+ Списание</h2>'+
+  '<div class="form-row"><div><label>Тип списания</label><select id="fwo_wotype" onchange="woTypeChg()">'+
+    (canMat?'<option value="Материал">📦 Материал</option>':'')+
+    (canParts?'<option value="Детали" '+(canMat?'':'selected')+'>🔩 Детали</option>':'')+
+  '</select></div><div></div></div>'+
   '<div class="form-row full"><div><label>Заказ</label>'+SS('fwo_ord',ordOpts,'','Заказ...',function(v){woOrdChg2(v)})+'</div></div>'+
   '<div class="form-row full"><div><label>Деталь / Изделие</label><select id="fwo_item" onchange="woItemChg2()"><option value="">— сначала заказ —</option></select></div></div>'+
-  '<div class="form-row full" id="fwo_comp_wrap" style="display:none"><div><label>Компонент сборки <span style="color:var(--text3);font-size:.85em">(необязательно — для заготовительных операций)</span></label><select id="fwo_comp_sel"><option value="">— вся сборка / сборочная операция —</option></select></div></div>'+
-  '<div class="form-row"><div><label>Участок</label><div id="fwo_res_wrap"><select id="fwo_res_sel"><option value="">— сначала заказ —</option></select></div></div><div></div></div>'+
-  (woTab==='Материал'?'<div class="form-row full"><div><label>Материал (из резервов)</label><select id="fwo_mat"><option value="">— сначала деталь —</option></select></div></div>'+
-  '<div class="form-row"><div><label>Листов</label><input type="number" id="fwo_sheets" min="1" value="1"></div><div></div></div>'
-  :'<div class="form-row"><div><label>Операция</label><div id="fwo_optype_wrap"><select id="fwo_optype_sel">'+window._woOpTypes.map(function(o){return '<option value="'+o.name+'">'+o.name+'</option>'}).join('')+'</select></div></div><div></div></div>'+
-  '<div class="form-row"><div><label>Годных</label><input type="number" id="fwo_good" value="0" min="0"></div><div><label>Брак</label><input type="number" id="fwo_rej" value="0" min="0"></div></div>')+
+  '<div class="form-row full" id="fwo_comp_wrap" style="display:none"><div><label>Компонент сборки <span style="color:var(--text3);font-size:.85em">(необязательно)</span></label><select id="fwo_comp_sel"><option value="">— вся сборка —</option></select></div></div>'+
+  '<div class="form-row"><div><label>Станок</label><div id="fwo_res_wrap"><select id="fwo_res_sel"><option value="">— сначала заказ —</option></select></div></div><div></div></div>'+
+  '<div id="fwo_mat_block">'+
+    '<div class="form-row full"><div><label>Материал (из резервов)</label><select id="fwo_mat"><option value="">— сначала деталь —</option></select></div></div>'+
+    '<div class="form-row"><div><label>Листов</label><input type="number" id="fwo_sheets" min="1" value="1"></div><div></div></div>'+
+  '</div>'+
+  '<div id="fwo_parts_block" style="display:none">'+
+    '<div class="form-row"><div><label>Операция</label><div id="fwo_optype_wrap"><select id="fwo_optype_sel">'+window._woOpTypes.map(function(o){return '<option value="'+o.name+'">'+o.name+'</option>'}).join('')+'</select></div></div><div></div></div>'+
+    '<div class="form-row"><div><label>Годных</label><input type="number" id="fwo_good" value="0" min="0"></div><div><label>Брак</label><input type="number" id="fwo_rej" value="0" min="0"></div></div>'+
+  '</div>'+
   '<div class="form-row full"><div><label>Прим.</label><input id="fwo_note"></div></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="submitWO()">Списать</button></div>')})}
+  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="submitWO()">Списать</button></div>');
+  if(defTab==='Детали')woTypeChg()})}
+function woTypeChg(){
+  var sel=document.getElementById('fwo_wotype');var t=sel?sel.value:'Материал';
+  var mb=document.getElementById('fwo_mat_block');var pb=document.getElementById('fwo_parts_block');
+  if(mb)mb.style.display=t==='Материал'?'':'none';
+  if(pb)pb.style.display=t==='Детали'?'':'none';
+  // сбросить компонент-селектор
+  var cw=document.getElementById('fwo_comp_wrap');if(cw)cw.style.display='none';
+}
 
 function woOrdChg2(val){var ordId=+val;if(!ordId)return;
-  // Загружаем участки для этого заказа
   api('/api/orders/'+ordId+'/resources-for-writeoff').then(function(res){
     var sel=document.getElementById('fwo_res_sel');
     sel.innerHTML='<option value="">—</option>'+res.map(function(r){return '<option value="'+r.id+'" data-ops=\''+JSON.stringify(r.allowed_ops||[]).replace(/'/g,"&#39;")+'\'>'+r.name+'</option>'}).join('');
@@ -4203,12 +4248,12 @@ function woOrdChg2(val){var ordId=+val;if(!ordId)return;
         return '<option value="'+it.id+'" data-tid="'+it.template_id+'" data-asm="'+(it.is_assembly?'1':'0')+'" data-comps=\''+compsJson+'\'>'+
           it.part_name+' ('+it.quantity+'/'+it.completed+')</option>'}).join('')
   }).catch(function(e){toast(e.message,'err')});
-  // Скрыть компонент-селектор при смене заказа
   var cw=document.getElementById('fwo_comp_wrap');if(cw)cw.style.display='none';
-  if(woTab==='Материал'){var ms=document.getElementById('fwo_mat');if(ms)ms.innerHTML='<option value="">— деталь —</option>'}}
+  var ms=document.getElementById('fwo_mat');if(ms)ms.innerHTML='<option value="">— деталь —</option>';}
 
 function woResChg2(){
-  if(woTab!=='Детали')return;
+  var tSel=document.getElementById('fwo_wotype');var t=tSel?tSel.value:'Материал';
+  if(t!=='Детали')return;
   var sel=document.getElementById('fwo_res_sel');if(!sel)return;
   var opt=sel.options[sel.selectedIndex];if(!opt)return;
   var ops=[];try{ops=JSON.parse(opt.dataset.ops||'[]')}catch(e){}
@@ -4217,6 +4262,7 @@ function woResChg2(){
 }
 
 function woItemChg2(){
+  var tSel=document.getElementById('fwo_wotype');var t=tSel?tSel.value:'Материал';
   var itemSel=document.getElementById('fwo_item');
   var opt=itemSel?itemSel.options[itemSel.selectedIndex]:null;
   var isAsm=opt&&opt.dataset.asm==='1';
@@ -4224,7 +4270,7 @@ function woItemChg2(){
   var cw=document.getElementById('fwo_comp_wrap');
   var cs=document.getElementById('fwo_comp_sel');
   if(cw&&cs){
-    if(woTab==='Детали'&&isAsm&&comps.length>0){
+    if(t==='Детали'&&isAsm&&comps.length>0){
       cw.style.display='';
       cs.innerHTML='<option value="">— вся сборка / сборочная операция —</option>'+
         comps.map(function(c){return '<option value="'+c.id+'">🔩 '+c.name+' ×'+c.qty+'</option>'}).join('');
@@ -4233,20 +4279,20 @@ function woItemChg2(){
       cs.innerHTML='<option value="">—</option>';
     }
   }
-  if(woTab!=='Материал')return;
+  if(t!=='Материал')return;
   var itemId=+itemSel.value;if(!itemId)return;
   api('/api/reservations/by-item/'+itemId).then(function(rs){
     document.getElementById('fwo_mat').innerHTML=rs.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'">'+r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
 
 function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementById('fwo_item').value;
   if(!ordId){toast('Заказ','err');return}if(!itemId){toast('Деталь','err');return}
+  var tSel=document.getElementById('fwo_wotype');var wtype=tSel?tSel.value:'Материал';
   var resId=+document.getElementById('fwo_res_sel').value||null;
-  var b={writeoff_type:woTab,user_id:U.id,order_id:ordId,order_item_id:itemId,resource_id:resId,note:document.getElementById('fwo_note').value};
-  if(woTab==='Материал'){var ms=document.getElementById('fwo_mat');var matId=+ms.value;if(!matId){toast('Материал','err');return}
+  var b={writeoff_type:wtype,user_id:U.id,order_id:ordId,order_item_id:itemId,resource_id:resId,note:document.getElementById('fwo_note').value};
+  if(wtype==='Материал'){var ms=document.getElementById('fwo_mat');var matId=+ms.value;if(!matId){toast('Материал','err');return}
     b.material_id=matId;b.reservation_id=+(ms.options[ms.selectedIndex].dataset.rid)||null;b.sheets=+document.getElementById('fwo_sheets').value}
   else{var sel=document.getElementById('fwo_optype_sel');b.operation_type=sel?sel.value:'';
     b.parts_good=+document.getElementById('fwo_good').value;b.parts_rejected=+document.getElementById('fwo_rej').value;
-    // Компонент сборки (если выбран)
     var compSel=document.getElementById('fwo_comp_sel');b.component_template_id=compSel&&+compSel.value?+compSel.value:null;
     if(b.parts_good===0&&b.parts_rejected===0){toast('Укажите количество годных или брак','err');return}}
   api('/api/writeoffs/create','POST',b).then(function(r){closeModal();if(r.is_anomaly)toast('⚠ '+r.anomaly_note,'err');else toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
