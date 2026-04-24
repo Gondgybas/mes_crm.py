@@ -3499,12 +3499,16 @@ function modalOpWriteoff(opid){
   if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
   var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
   p.then(function(reservations){
-    window._opWoReservations=reservations;
-    // Группируем по компоненту
+    // Автоматически определяем нужный компонент из операции — без выбора
+    var autoCompKey=op.component_template_id?String(op.component_template_id):'0';
+    // Группируем резервы по компоненту
     var byComp={};reservations.forEach(function(r){
-      var key=r.part_template_id||0;var name=r.part_name||'Общие';
+      var key=r.part_template_id?String(r.part_template_id):'0';
+      var name=r.part_name||'Общие';
       if(!byComp[key])byComp[key]={name:name,items:[]};byComp[key].items.push(r)});
-    var compKeys=Object.keys(byComp);var hasComponents=compKeys.length>1;
+    // Выбираем резервы строго по операции: если нет точного совпадения — берём "общие" (0)
+    var matchedItems=(byComp[autoCompKey]&&byComp[autoCompKey].items)||
+                     (byComp['0']&&byComp['0'].items)||[];
 
     // Блок: выбор участка если не задан в заказе
     var resBlockHtml='';
@@ -3515,63 +3519,40 @@ function modalOpWriteoff(opid){
         '<select id="fopwo_res_sel" style="border-color:var(--err)"><option value="">— выберите участок —</option>'+resOpts+'</select></div></div>';
     }
 
-    // Блок: что именно списывается
-    var partInfoHtml='';
-    if(showParts){
-      if(op.component_template_id&&op.component_name){
-        partInfoHtml='<div class="info-box" style="background:rgba(99,102,241,.08);border-color:var(--acc);margin-bottom:6px">'+
-          '🔩 Списание для компонента: <strong>'+op.component_name+'</strong>'+
-          '<div style="font-size:.8em;color:var(--text3);margin-top:2px">Будет учтено только в строке этого компонента в «Учёт деталей» — <em>не входит в итог сборочной единицы</em></div></div>';
-      } else {
-        partInfoHtml='<div class="info-box" style="background:rgba(34,197,94,.08);border-color:var(--ok);margin-bottom:6px">'+
-          '🔧 Списание для <strong>'+(op.component_name||op.item||'готового изделия')+'</strong>'+
-          '<div style="font-size:.8em;color:var(--text3);margin-top:2px">Учитывается в итоговой строке изделия/сборки в «Учёт деталей»</div></div>';
-      }
-    }
+    // Блок: фиксированная деталь — без выбора
+    var partLabel=op.component_template_id&&op.component_name
+      ?'🔩 Компонент: <strong>'+op.component_name+'</strong><span style="font-size:.8em;color:var(--text3);margin-left:6px">— учитывается только в строке компонента, не в итоге сборки</span>'
+      :'🔧 Изделие: <strong>'+(op.item||'—')+'</strong><span style="font-size:.8em;color:var(--text3);margin-left:6px">— учитывается в итоговой строке</span>';
+    var partFixedHtml='<div class="info-box" style="background:rgba(99,102,241,.07);border-color:var(--acc);margin-bottom:8px">'+partLabel+'</div>';
 
     var h='<h2>📤 Списание: '+op.type+'</h2>'+
-      '<div class="info-box"><strong>Заказ:</strong> '+(op.order_display||op.order_number)+
-      ' | <strong>Деталь:</strong> '+(op.item||'—')+
-      ' | <strong>Участок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+'</div>'+
+      '<div class="info-box" style="margin-bottom:6px">'+
+        '<strong>Заказ:</strong> '+(op.order_display||op.order_number)+
+        ' | <strong>Участок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+
+      '</div>'+
+      partFixedHtml+
       resBlockHtml;
 
-    if(showMat&&reservations.length){
-      h+='<div class="section-hdr">📦 Материал</div>';
-      if(hasComponents){
-        h+='<div class="form-row full"><div><label>Компонент сборки</label><select id="fopwo_comp" onchange="opWoCompChg()">'+
-          compKeys.map(function(k){return '<option value="'+k+'">'+byComp[k].name+' ('+byComp[k].items.length+' мат.)</option>'}).join('')+
-          '</select></div></div>'
-      }
-      h+='<div id="fopwo_mat_area"></div>'+
-        '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>'
+    if(showMat&&matchedItems.length){
+      h+='<div class="section-hdr">📦 Материал</div>'+
+        '<div class="form-row full"><div><label>Материал</label><select id="fopwo_mat">'+
+        matchedItems.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
+          r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
+        '</select></div></div>'+
+        '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>';
     } else if(showMat){
-      h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов</div>'
+      h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов для этой операции</div>';
     }
     if(showParts){
-      h+='<div class="section-hdr">🔩 Детали</div>'+partInfoHtml+
+      h+='<div class="section-hdr">🔩 Детали</div>'+
         '<div class="form-row"><div><label>Годных</label><input type="number" id="fopwo_good" value="0" min="0"></div>'+
-        '<div><label>Брак</label><input type="number" id="fopwo_rej" value="0" min="0"></div></div>'
+        '<div><label>Брак</label><input type="number" id="fopwo_rej" value="0" min="0"></div></div>';
     }
     h+='<div class="form-row full"><div><label>Примечание</label><input id="fopwo_note"></div></div>'+
       '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
       '<button class="btn primary" onclick="submitOpWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
     openModal(h);
-    // Инициализируем материалы
-    if(showMat&&reservations.length){
-      window._opWoByComp=byComp;window._opWoCompKeys=compKeys;
-      opWoCompChg()
-    }
   }).catch(function(e){toast(e.message,'err')})}
-
-function opWoCompChg(){
-  var sel=document.getElementById('fopwo_comp');
-  var key=sel?sel.value:window._opWoCompKeys[0];
-  var items=window._opWoByComp[key].items;
-  document.getElementById('fopwo_mat_area').innerHTML=
-    '<div class="form-row full"><div><label>Материал</label><select id="fopwo_mat">'+
-    items.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
-      r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
-    '</select></div></div>'}
 
 function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
@@ -3673,40 +3654,56 @@ function submitEditRes(rid){api('/api/reservations/'+rid+'/edit','POST',{user_id
 function cancelRes(rid){if(!confirm('Снять?'))return;api('/api/reservations/'+rid+'/cancel','POST',{user_id:U.id}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ УЧЁТ ДЕТАЛЕЙ ═══
-var plFilter={name:'',active_only:1},plSearchTimer=null;
+var plFilter={name:'',active_only:1},plSearchTimer=null,plSubTab='parts';
 function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active_only).then(function(data){
   var filtered=data;
   if(plFilter.name)filtered=filtered.filter(function(d){return d.part_name.toLowerCase().indexOf(plFilter.name.toLowerCase())>=0});
-  var surplusItems=filtered.filter(function(d){return d.surplus>0});
-  var totalSurplus=surplusItems.reduce(function(s,d){return s+d.surplus},0);
 
-  // Собираем глобальный список типов операций.
-  // Компонентные операции (component_id != null) — первыми (слева),
-  // затем — сборочные/одиночные операции (без component_id).
-  var compOpSeq = {}; // op_type -> минимальный seq у компонентных операций
-  var asmOpSeq  = {}; // op_type -> минимальный seq у операций без компонента
-  filtered.forEach(function(d){
+  // Разделяем на детали и сборочные единицы
+  var parts=filtered.filter(function(d){return !d.is_assembly});
+  var assemblies=filtered.filter(function(d){return d.is_assembly});
+  var tabData=plSubTab==='assemblies'?assemblies:parts;
+
+  // Пересорт по каждому под-табу
+  var partsSurplusQty=parts.filter(function(d){return d.surplus>0}).reduce(function(s,d){return s+d.surplus},0);
+  var asmSurplusQty=assemblies.filter(function(d){return d.surplus>0}).reduce(function(s,d){return s+d.surplus},0);
+  var totalSurplus=partsSurplusQty+asmSurplusQty;
+
+  // Типы операций только для текущего под-таба
+  var compOpSeq={},asmOpSeq={};
+  tabData.forEach(function(d){
     (d.planned_ops||[]).forEach(function(op){
       if(!op.op_type) return;
-      if(op.component_id != null){
+      if(op.component_id!=null){
         if(!(op.op_type in compOpSeq)||op.seq<compOpSeq[op.op_type]) compOpSeq[op.op_type]=op.seq;
       } else {
         if(!(op.op_type in asmOpSeq)||op.seq<asmOpSeq[op.op_type]) asmOpSeq[op.op_type]=op.seq;
       }
     });
   });
-  // Сначала типы, встречающиеся у компонентов; потом — только у сборки/детали
-  var compTypes   = Object.keys(compOpSeq).sort(function(a,b){return compOpSeq[a]-compOpSeq[b]});
-  var asmOnlyTypes= Object.keys(asmOpSeq).filter(function(t){return !(t in compOpSeq)}).sort(function(a,b){return asmOpSeq[a]-asmOpSeq[b]});
-  var allOpTypes  = compTypes.concat(asmOnlyTypes);
+  var compTypes=Object.keys(compOpSeq).sort(function(a,b){return compOpSeq[a]-compOpSeq[b]});
+  var asmOnlyTypes=Object.keys(asmOpSeq).filter(function(t){return !(t in compOpSeq)}).sort(function(a,b){return asmOpSeq[a]-asmOpSeq[b]});
+  var allOpTypes=compTypes.concat(asmOnlyTypes);
 
   var bannerHtml='';
   if(totalSurplus>0){
     bannerHtml='<div class="surplus-banner" onclick="modalSurplus()">'+
       '<span class="sb-icon">🚨</span>'+
-      '<span class="sb-text">ПЕРЕСОРТ! Деталей изготовлено сверх плана: '+surplusItems.length+' позиций. Нажмите для подробностей.</span>'+
+      '<span class="sb-text">ПЕРЕСОРТ! Деталей изготовлено сверх плана. Нажмите для подробностей.</span>'+
       '<span class="sb-count">+'+totalSurplus+' шт</span></div>';
   }
+
+  // Под-табы
+  var subTabsHtml='<div style="display:flex;gap:6px;padding:10px 0 14px;border-bottom:2px solid var(--brd);margin-bottom:10px">'+
+    '<button class="btn'+(plSubTab==='parts'?' primary':'')+'" onclick="plSubTab=\'parts\';pgPartsLog(document.getElementById(\'mainContent\'))">'+
+      '🔩 Детали ('+parts.length+')'+
+      (partsSurplusQty>0?' <span style="background:var(--err);color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em;margin-left:4px">ПС +'+partsSurplusQty+'</span>':'')+
+    '</button>'+
+    '<button class="btn'+(plSubTab==='assemblies'?' primary':'')+'" onclick="plSubTab=\'assemblies\';pgPartsLog(document.getElementById(\'mainContent\'))">'+
+      '🔧 Сборочные единицы ('+assemblies.length+')'+
+      (asmSurplusQty>0?' <span style="background:var(--err);color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em;margin-left:4px">ПС +'+asmSurplusQty+'</span>':'')+
+    '</button>'+
+  '</div>';
 
   c.innerHTML='<div class="toolbar">'+
     (totalSurplus>0?'<button class="btn" style="background:var(--err);border-color:var(--err);color:#fff" onclick="modalSurplus()">🚨 Пересорт из пр-ва (+'+totalSurplus+')</button>':'')+
@@ -3717,7 +3714,8 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
     '<option value="1" '+(plFilter.active_only?'selected':'')+'>В работе</option>'+
     '<option value="0" '+(!plFilter.active_only?'selected':'')+'>Все</option></select></div>'+
     bannerHtml+
-    (filtered.length?renderPartsMatrix(filtered,allOpTypes):'<div class="info-box">Нет данных</div>');
+    subTabsHtml+
+    (tabData.length?renderPartsMatrix(tabData,allOpTypes):'<div class="info-box">Нет данных</div>');
 
   var inp=document.getElementById('plNameInput');
   if(inp){
