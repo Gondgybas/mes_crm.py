@@ -449,6 +449,7 @@ class PartStationLog(Base):
     order_item_id = Column(Integer, ForeignKey("order_items.id"), nullable=False, index=True)
     resource_id = Column(Integer, ForeignKey("resources.id"), nullable=True)
     operation_type = Column(String(200), default="")
+    component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
     good_qty = Column(Integer, default=0)
     rejected_qty = Column(Integer, default=0)
     is_anomaly = Column(Boolean, default=False)
@@ -459,6 +460,7 @@ class PartStationLog(Base):
     order_item = relationship("OrderItem", back_populates="station_logs")
     resource = relationship("Resource")
     user = relationship("User")
+    component_template = relationship("PartTemplate", foreign_keys=[component_template_id])
 
 
 class WriteOff(Base):
@@ -476,6 +478,7 @@ class WriteOff(Base):
     quantity_pcs = Column(Float, default=0.0)
     parts_good = Column(Integer, default=0)
     parts_rejected = Column(Integer, default=0)
+    component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
     is_anomaly = Column(Boolean, default=False)
     anomaly_note = Column(Text, default="")
     is_cancelled = Column(Boolean, default=False)
@@ -501,6 +504,33 @@ class AuditLog(Base):
     entity_id = Column(Integer, nullable=True)
     details = Column(Text, default="")
     created_at = Column(DateTime, default=now_msk, index=True)
+    user = relationship("User")
+
+
+class SurplusPool(Base):
+    """Склад пересорта — управляемый запас излишков деталей."""
+    __tablename__ = "surplus_pool"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    part_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=False, unique=True)
+    quantity = Column(Integer, default=0)
+    note = Column(Text, default="")
+    created_at = Column(DateTime, default=now_msk)
+    updated_at = Column(DateTime, default=now_msk)
+    part_template = relationship("PartTemplate", lazy="joined")
+
+
+class SurplusLog(Base):
+    """История изменений пересорта."""
+    __tablename__ = "surplus_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    part_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    delta = Column(Integer, nullable=False)          # >0 = добавлено, <0 = использовано/снято
+    reason = Column(String(100), default="")         # "Добавлен", "Использован", "Коррекция", "Удалён"
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=True)
+    note = Column(Text, default="")
+    created_at = Column(DateTime, default=now_msk)
+    part_template = relationship("PartTemplate", lazy="joined")
     user = relationship("User")
 
 
@@ -617,6 +647,30 @@ def init_database():
             conn.execute(text("ALTER TABLE production_ops ADD COLUMN component_template_id INTEGER REFERENCES part_templates(id)"))
             conn.commit()
         log.info("Migration: added component_template_id to production_ops")
+
+    # Миграция: component_template_id в part_station_logs
+    psl_cols = [c["name"] for c in insp.get_columns("part_station_logs")]
+    if "component_template_id" not in psl_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE part_station_logs ADD COLUMN component_template_id INTEGER REFERENCES part_templates(id)"))
+            conn.commit()
+        log.info("Migration: added component_template_id to part_station_logs")
+
+    # Миграция: component_template_id в writeoffs
+    wo_cols = [c["name"] for c in insp.get_columns("writeoffs")]
+    if "component_template_id" not in wo_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE writeoffs ADD COLUMN component_template_id INTEGER REFERENCES part_templates(id)"))
+            conn.commit()
+        log.info("Migration: added component_template_id to writeoffs")
+
+    # Миграция: таблицы пересорта
+    if not insp.has_table("surplus_pool"):
+        Base.metadata.tables["surplus_pool"].create(engine)
+        log.info("Migration: created surplus_pool table")
+    if not insp.has_table("surplus_logs"):
+        Base.metadata.tables["surplus_logs"].create(engine)
+        log.info("Migration: created surplus_logs table")
 
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
@@ -1846,6 +1900,7 @@ def create_app():
                  "order_display": o.order.display_name if o.order else "",
                  "item": pt_display(o.order_item.part_template) if o.order_item and o.order_item.part_template else "",
                  "component_name": pt_display(o.component_template) if o.component_template else "",
+                 "component_template_id": o.component_template_id,
                  "item_id": o.order_item_id,
                  "type": o.operation_type, "status": o.status,
                  "resource": o.resource.name if o.resource else "—",
@@ -1953,7 +2008,7 @@ def create_app():
     def api_part_station_logs(active_only: int = 1, db: Session = Depends(db_dep)):
         q = db.query(OrderItem).options(
             joinedload(OrderItem.order).joinedload(Order.customer),
-            joinedload(OrderItem.part_template),
+            joinedload(OrderItem.part_template).joinedload(PartTemplate.components).joinedload(AssemblyComponent.component),
             joinedload(OrderItem.station_logs).joinedload(PartStationLog.resource),
             joinedload(OrderItem.station_logs).joinedload(PartStationLog.user))
         if active_only: q = q.join(Order).filter(Order.status == "В работе")
@@ -1961,6 +2016,10 @@ def create_app():
         for it in q.all():
             first_res_id = get_first_op_resource_id(db, it.id)
             by_res = {}; first_res_good = 0
+            # Словари фактических данных:
+            # act_dict[(comp_id, res_id, op_type)] -> {good, rejected}
+            act_dict = {}
+            asm_good = 0; asm_rej = 0   # логи БЕЗ компонента (сборочный уровень)
             for l in (it.station_logs or []):
                 rn = l.resource.name if l.resource else "—"
                 if rn not in by_res: by_res[rn] = {"good": 0, "rejected": 0, "logs": []}
@@ -1973,49 +2032,216 @@ def create_app():
                     "user": l.user.full_name if l.user else "",
                     "note": l.note, "date": l.created_at.isoformat()})
                 if l.resource_id == first_res_id: first_res_good += l.good_qty
-            surplus = max(0, first_res_good - it.quantity) if first_res_id else it.surplus
+                act_key = (l.component_template_id, l.resource_id, l.operation_type or "")
+                if act_key not in act_dict: act_dict[act_key] = {"good": 0, "rejected": 0}
+                act_dict[act_key]["good"] += l.good_qty
+                act_dict[act_key]["rejected"] += l.rejected_qty
+                # Считаем отдельно логи сборочного уровня (без component_template_id)
+                if l.component_template_id is None:
+                    asm_good += l.good_qty
+                    asm_rej += l.rejected_qty
+            # Пересорт: для сборок — на основе сборочных логов, для деталей — на основе первого участка
+            is_asm = it.part_template.is_assembly if it.part_template else False
+            if is_asm:
+                surplus = max(0, asm_good - it.quantity)
+            else:
+                surplus = max(0, first_res_good - it.quantity) if first_res_id else max(0, it.completed_qty - it.quantity)
+            # Planned operations in sequence order
+            ops_q = db.query(ProductionOp).options(
+                joinedload(ProductionOp.resource),
+                joinedload(ProductionOp.component_template)
+            ).filter(ProductionOp.order_item_id == it.id).order_by(
+                ProductionOp.sequence, ProductionOp.sort_order
+            ).all()
+            planned_ops = []
+            for idx, op in enumerate(ops_q):
+                rn = op.resource.name if op.resource else "—"
+                act_key = (op.component_template_id, op.resource_id, op.operation_type or "")
+                actual = act_dict.get(act_key, {"good": 0, "rejected": 0})
+                planned_ops.append({
+                    "seq": idx + 1,
+                    "op_type": op.operation_type,
+                    "resource": rn,
+                    "resource_id": op.resource_id,
+                    "planned_qty": op.planned_qty,
+                    "completed_qty": actual["good"],
+                    "rejected_qty": actual["rejected"],
+                    "status": op.status,
+                    "component_name": pt_display(op.component_template) if op.component_template else None,
+                    "component_id": op.component_template_id
+                })
             result.append({
                 "item_id": it.id, "order_id": it.order_id,
                 "order_number": it.order.order_number if it.order else "",
                 "order_display": it.order.display_name if it.order else "",
                 "order_status": it.order.status if it.order else "",
                 "part_name": pt_display(it.part_template),
-                "is_assembly": it.part_template.is_assembly if it.part_template else False,
-                "components": [{"name": pt_display(ac.component), "qty": ac.quantity}
-                               for ac in (it.part_template.components or [])] if it.part_template and it.part_template.is_assembly else [],
-                "quantity": it.quantity, "completed": it.completed_qty,
-                "rejected": it.rejected_qty, "surplus": surplus,
-                "by_resource": by_res})
+                "is_assembly": is_asm,
+                "template_id": it.part_template_id,
+                "components": [{"id": ac.component_id, "name": pt_display(ac.component), "qty": ac.quantity, "sort_order": ac.sort_order}
+                               for ac in sorted(it.part_template.components or [], key=lambda x: x.sort_order)] if is_asm else [],
+                "quantity": it.quantity,
+                # completed/rejected для строки сборки — только сборочный уровень; для деталей — полные
+                "completed": asm_good if is_asm else it.completed_qty,
+                "rejected": asm_rej if is_asm else it.rejected_qty,
+                "surplus": surplus,
+                "by_resource": by_res,
+                "planned_ops": planned_ops})
         return result
 
     @app.get("/api/part-station-logs/surplus")
     def api_surplus(db: Session = Depends(db_dep)):
         items = db.query(OrderItem).options(
             joinedload(OrderItem.order).joinedload(Order.customer),
-            joinedload(OrderItem.part_template),
+            joinedload(OrderItem.part_template).joinedload(PartTemplate.components).joinedload(AssemblyComponent.component),
             joinedload(OrderItem.station_logs).joinedload(PartStationLog.resource)
         ).join(Order).filter(Order.status.notin_(["Отменён"])).all()
         result = {}
         for it in items:
-            first_res_id = get_first_op_resource_id(db, it.id)
-            if not first_res_id:
-                if it.completed_qty > it.quantity:
-                    name = pt_display(it.part_template)
-                    surplus = it.completed_qty - it.quantity
-                    if name not in result: result[name] = {"part_name": name, "total_surplus": 0, "orders": []}
-                    result[name]["total_surplus"] += surplus
-                    result[name]["orders"].append({"order": it.order.display_name if it.order else "—",
-                        "planned": it.quantity, "completed_first": it.completed_qty, "surplus": surplus})
-                continue
-            first_good = sum(l.good_qty for l in (it.station_logs or []) if l.resource_id == first_res_id)
-            surplus = first_good - it.quantity
-            if surplus <= 0: continue
+            is_asm = it.part_template.is_assembly if it.part_template else False
             name = pt_display(it.part_template)
-            if name not in result: result[name] = {"part_name": name, "total_surplus": 0, "orders": []}
+
+            if is_asm:
+                # Для сборок — считаем только сборочные логи (без component_template_id)
+                asm_good = sum(l.good_qty for l in (it.station_logs or []) if l.component_template_id is None)
+                surplus = asm_good - it.quantity
+                if surplus <= 0: continue
+                completed_first = asm_good
+            else:
+                first_res_id = get_first_op_resource_id(db, it.id)
+                if not first_res_id:
+                    if it.completed_qty > it.quantity:
+                        surplus = it.completed_qty - it.quantity
+                        completed_first = it.completed_qty
+                    else:
+                        continue
+                else:
+                    first_good = sum(l.good_qty for l in (it.station_logs or []) if l.resource_id == first_res_id)
+                    surplus = first_good - it.quantity
+                    if surplus <= 0: continue
+                    completed_first = first_good
+
+            if name not in result:
+                result[name] = {
+                    "part_name": name, "template_id": it.part_template_id,
+                    "total_surplus": 0, "orders": [],
+                    "is_assembly": is_asm,
+                    "components": [{"name": pt_display(ac.component), "qty": ac.quantity}
+                                   for ac in (it.part_template.components or [])] if it.part_template and is_asm else []}
             result[name]["total_surplus"] += surplus
             result[name]["orders"].append({"order": it.order.display_name if it.order else "—",
-                "planned": it.quantity, "completed_first": first_good, "surplus": surplus})
-        return list(result.values())
+                "order_number": it.order.order_number if it.order else "",
+                "planned": it.quantity, "completed_first": completed_first, "surplus": surplus})
+        return sorted(list(result.values()), key=lambda x: -x["total_surplus"])
+
+    # ─── Surplus Pool ────────────────────────────────
+    @app.get("/api/surplus-pool")
+    def api_surplus_pool_list(db: Session = Depends(db_dep)):
+        entries = db.query(SurplusPool).filter(SurplusPool.quantity > 0).options(
+            joinedload(SurplusPool.part_template).joinedload(PartTemplate.components).joinedload(AssemblyComponent.component)
+        ).all()
+        return [{"id": e.id, "part_template_id": e.part_template_id,
+                 "part_name": pt_display(e.part_template),
+                 "is_assembly": e.part_template.is_assembly if e.part_template else False,
+                 "components": [{"name": pt_display(ac.component), "qty": ac.quantity}
+                                for ac in (e.part_template.components or [])] if e.part_template and e.part_template.is_assembly else [],
+                 "quantity": e.quantity, "note": e.note,
+                 "updated_at": e.updated_at.isoformat()} for e in entries]
+
+    @app.get("/api/surplus-pool/check/{tid}")
+    def api_surplus_pool_check(tid: int, db: Session = Depends(db_dep)):
+        entry = db.query(SurplusPool).filter(
+            SurplusPool.part_template_id == tid, SurplusPool.quantity > 0).first()
+        if not entry:
+            return {"has_surplus": False, "quantity": 0}
+        return {"has_surplus": True, "surplus_id": entry.id,
+                "quantity": entry.quantity, "part_name": pt_display(entry.part_template)}
+
+    @app.get("/api/surplus-pool/logs/{tid}")
+    def api_surplus_pool_logs(tid: int, db: Session = Depends(db_dep)):
+        logs = db.query(SurplusLog).options(joinedload(SurplusLog.user)).filter(
+            SurplusLog.part_template_id == tid
+        ).order_by(SurplusLog.created_at.desc()).limit(50).all()
+        return [{"id": l.id, "delta": l.delta, "reason": l.reason, "note": l.note,
+                 "user": l.user.full_name if l.user else "Система",
+                 "date": l.created_at.isoformat()} for l in logs]
+
+    @app.post("/api/surplus-pool/adjust")
+    async def api_surplus_pool_adjust(request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        tid = data["part_template_id"]
+        delta = int(data["delta"])
+        note = data.get("note", "")
+        reason = data.get("reason", "Коррекция")
+        if delta == 0:
+            raise HTTPException(400, "Дельта не может быть 0")
+        entry = db.query(SurplusPool).filter(SurplusPool.part_template_id == tid).first()
+        if not entry:
+            pt = db.query(PartTemplate).get(tid)
+            if not pt: raise HTTPException(404, "Деталь не найдена")
+            entry = SurplusPool(part_template_id=tid, quantity=0)
+            db.add(entry); db.flush()
+        entry.quantity = max(0, entry.quantity + delta)
+        entry.updated_at = now_msk()
+        if note: entry.note = note
+        db.add(SurplusLog(part_template_id=tid, user_id=uid, delta=delta, reason=reason, note=note))
+        db.flush(); db.commit()
+        return {"id": entry.id, "quantity": entry.quantity}
+
+    @app.post("/api/surplus-pool/delete/{sid}")
+    async def api_surplus_pool_delete(sid: int, request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        note = data.get("note", "Удалено вручную")
+        entry = db.query(SurplusPool).get(sid)
+        if not entry: raise HTTPException(404)
+        db.add(SurplusLog(part_template_id=entry.part_template_id, user_id=uid,
+                          delta=-entry.quantity, reason="Удалён", note=note))
+        db.delete(entry)
+        db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.post("/api/surplus-pool/use")
+    async def api_surplus_pool_use(request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        tid = data["part_template_id"]
+        qty = int(data["quantity"])
+        order_id = data.get("order_id")
+        if qty <= 0: raise HTTPException(400, "Количество должно быть > 0")
+        entry = db.query(SurplusPool).filter(SurplusPool.part_template_id == tid).first()
+        if not entry or entry.quantity < qty:
+            raise HTTPException(400, f"В пересорте только {entry.quantity if entry else 0} шт.")
+        entry.quantity -= qty
+        entry.updated_at = now_msk()
+        db.add(SurplusLog(part_template_id=tid, user_id=uid, delta=-qty,
+                          reason="Использован в заказе", order_id=order_id,
+                          note=f"Использовано {qty} шт. в заказе"))
+        db.flush(); db.commit()
+        return {"status": "ok", "remaining": entry.quantity}
+
+    @app.post("/api/surplus-pool/add-from-production")
+    async def api_surplus_add_from_production(request: Request, db: Session = Depends(db_dep)):
+        """Добавить в пул пересорта конкретную деталь с указанным количеством."""
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        tid = data["part_template_id"]
+        qty = int(data["quantity"])
+        note = data.get("note", "Перенесено из производственного пересорта")
+        if qty <= 0: raise HTTPException(400, "Количество должно быть > 0")
+        pt = db.query(PartTemplate).get(tid)
+        if not pt: raise HTTPException(404, "Деталь не найдена")
+        entry = db.query(SurplusPool).filter(SurplusPool.part_template_id == tid).first()
+        if not entry:
+            entry = SurplusPool(part_template_id=tid, quantity=0, note=note)
+            db.add(entry); db.flush()
+        entry.quantity += qty
+        entry.updated_at = now_msk()
+        db.add(SurplusLog(part_template_id=tid, user_id=uid, delta=qty,
+                          reason="Добавлен из производства", note=note))
+        db.flush(); db.commit()
+        return {"id": entry.id, "quantity": entry.quantity}
 
     # ─── Writeoffs ──────────────────────────────────
     @app.get("/api/writeoffs")
@@ -2045,10 +2271,41 @@ def create_app():
 
     @app.get("/api/orders/{oid}/items-for-writeoff")
     def api_items_for_wo(oid: int, db: Session = Depends(db_dep)):
-        items = db.query(OrderItem).options(joinedload(OrderItem.part_template)).filter(OrderItem.order_id == oid).all()
+        items = db.query(OrderItem).options(
+            joinedload(OrderItem.part_template).joinedload(PartTemplate.components).joinedload(AssemblyComponent.component)
+        ).filter(OrderItem.order_id == oid).all()
         return [{"id": it.id, "part_name": pt_display(it.part_template),
                  "template_id": it.part_template_id,
+                 "is_assembly": it.part_template.is_assembly if it.part_template else False,
+                 "components": [{"id": ac.component_id, "name": pt_display(ac.component), "qty": ac.quantity}
+                                for ac in sorted(it.part_template.components or [], key=lambda x: x.sort_order)]
+                                if it.part_template and it.part_template.is_assembly else [],
                  "quantity": it.quantity, "completed": it.completed_qty} for it in items]
+
+    @app.get("/api/part-templates/{pid}/open-orders")
+    def api_part_open_orders(pid: int, db: Session = Depends(db_dep)):
+        """Заказы, где ещё нужна деталь (для перераспределения пересорта)"""
+        items = db.query(OrderItem).options(
+            joinedload(OrderItem.order).joinedload(Order.customer)
+        ).filter(
+            OrderItem.part_template_id == pid
+        ).join(Order).filter(
+            Order.status.notin_(["Отменён", "Завершён", "Отгружен"])
+        ).all()
+        result = []
+        for it in items:
+            still_needed = max(0, it.quantity - it.completed_qty)
+            if still_needed > 0:
+                result.append({
+                    "order_id": it.order_id,
+                    "item_id": it.id,
+                    "order_number": it.order.order_number if it.order else "",
+                    "order_display": it.order.display_name if it.order else "",
+                    "quantity": it.quantity,
+                    "completed_qty": it.completed_qty,
+                    "still_needed": still_needed
+                })
+        return result
 
     @app.get("/api/orders/{oid}/resources-for-writeoff")
     def api_res_for_wo(oid: int, db: Session = Depends(db_dep)):
@@ -2100,14 +2357,20 @@ def create_app():
             if good == 0 and rej == 0:
                 raise HTTPException(400, "Укажите количество годных или брак (не может быть 0)")
             wo.parts_good = good; wo.parts_rejected = rej
+            comp_tid = data.get("component_template_id")
+            wo.component_template_id = comp_tid
             is_anom, anom_note = check_sequence_anomaly(db, data["order_item_id"], data.get("resource_id"), good)
             wo.is_anomaly = is_anom; wo.anomaly_note = anom_note
             db.add(PartStationLog(order_item_id=data["order_item_id"], resource_id=data.get("resource_id"),
                                   operation_type=data.get("operation_type", ""),
+                                  component_template_id=comp_tid,
                                   good_qty=good, rejected_qty=rej, is_anomaly=is_anom, anomaly_note=anom_note,
                                   user_id=uid, note=data.get("note", "")))
-            item = db.query(OrderItem).get(data["order_item_id"])
-            if item: item.completed_qty += good; item.rejected_qty += rej
+            # Обновляем счётчики позиции ТОЛЬКО для сборочного уровня (не выбран компонент).
+            # Для компонентных операций (comp_tid не None) факт хранится только в PartStationLog.
+            if not comp_tid:
+                item = db.query(OrderItem).get(data["order_item_id"])
+                if item: item.completed_qty += good; item.rejected_qty += rej
             audit(db, uid, "Списание деталей", "writeoff", 0,
                   f"+{good} годн +{rej} брак" + (f" ⚠ {anom_note}" if is_anom else ""))
         db.add(wo); db.flush(); db.commit()
@@ -2140,16 +2403,19 @@ def create_app():
                         mat.reserved_sheets += wo.quantity_sheets
                         mat.reserved_kg += wo.quantity_kg
         elif wo.writeoff_type == "Детали":
-            item = db.query(OrderItem).get(wo.order_item_id)
-            if item:
-                item.completed_qty = max(0, item.completed_qty - wo.parts_good)
-                item.rejected_qty = max(0, item.rejected_qty - wo.parts_rejected)
+            # Откатываем счётчик только если это была сборочная операция (без компонента)
+            if not wo.component_template_id:
+                item = db.query(OrderItem).get(wo.order_item_id)
+                if item:
+                    item.completed_qty = max(0, item.completed_qty - wo.parts_good)
+                    item.rejected_qty = max(0, item.rejected_qty - wo.parts_rejected)
             logs = db.query(PartStationLog).filter(
                 PartStationLog.order_item_id == wo.order_item_id,
                 PartStationLog.resource_id == wo.resource_id,
                 PartStationLog.good_qty == wo.parts_good,
                 PartStationLog.rejected_qty == wo.parts_rejected,
-                PartStationLog.user_id == wo.user_id
+                PartStationLog.user_id == wo.user_id,
+                PartStationLog.component_template_id == wo.component_template_id
             ).order_by(PartStationLog.created_at.desc()).first()
             if logs: db.delete(logs)
         audit(db, uid, "Отмена списания", "writeoff", wid, f"Тип={wo.writeoff_type}")
@@ -2444,6 +2710,57 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .stat-card .stat-val{font-size:1.4em;font-weight:700;color:var(--accent)}
 .cf-row{display:flex;gap:8px;align-items:end;margin-bottom:6px;padding:8px;background:var(--bg);border:1px solid var(--s2);border-radius:var(--r)}
 .cf-row input,.cf-row select{padding:6px;border-radius:4px;border:1px solid var(--s2);background:var(--s1);color:var(--text);font-size:.85em}
+/* ── Учёт деталей: карточки ── */
+.part-cards{display:flex;flex-direction:column;gap:10px;padding:4px 0}
+.part-card{background:var(--s1);border:1px solid var(--s2);border-radius:var(--r);padding:12px 14px;transition:box-shadow .2s}
+.part-card:hover{box-shadow:0 4px 16px rgba(0,0,0,.25)}
+.part-card.has-surplus{border-left:4px solid var(--err);background:rgba(239,68,68,.04)}
+.part-card-hdr{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.part-card-title{font-weight:700;font-size:1em;flex:1;min-width:0}
+.surplus-label{background:var(--err);color:#fff;padding:3px 10px;border-radius:4px;font-weight:700;font-size:.85em;animation:surplusPulse 1.5s ease-in-out infinite}
+@keyframes surplusPulse{0%,100%{opacity:1}50%{opacity:.6}}
+.part-card-stats{display:flex;gap:14px;flex-wrap:wrap;font-size:.85em;margin-bottom:10px;color:var(--text2)}
+.part-card-stats span strong{font-size:1em}
+.part-card-stats .s-ok{color:var(--ok)}
+.part-card-stats .s-err{color:var(--err)}
+.op-flow{display:flex;align-items:center;flex-wrap:wrap;gap:4px;margin-top:6px}
+.op-step{display:flex;flex-direction:column;align-items:center;background:var(--bg);border:1px solid var(--s2);border-radius:6px;padding:4px 8px;min-width:80px;font-size:.78em;text-align:center;position:relative}
+.op-step.op-done{border-color:var(--ok);background:rgba(34,197,94,.08)}
+.op-step.op-active{border-color:var(--warn);background:rgba(251,191,36,.08)}
+.op-step.op-wait{opacity:.6}
+.op-step.op-partial{border-color:var(--info);background:rgba(59,130,246,.08)}
+.op-step .op-num{position:absolute;top:-8px;left:50%;transform:translateX(-50%);background:var(--s2);border-radius:50%;width:16px;height:16px;display:flex;align-items:center;justify-content:center;font-size:.7em;font-weight:700}
+.op-step .op-type{font-weight:600;color:var(--text);margin-top:6px;line-height:1.2}
+.op-step .op-res{color:var(--text3);font-size:.9em;margin-top:1px}
+.op-step .op-qty{color:var(--text2);margin-top:3px;font-size:.9em}
+.op-arrow{color:var(--text3);font-size:1.1em;padding:0 2px}
+.comp-list{font-size:.8em;color:var(--text3);margin-bottom:6px;padding-left:4px;border-left:2px solid var(--s2)}
+.surplus-banner{background:rgba(239,68,68,.15);border:2px solid var(--err);border-radius:var(--r);padding:10px 16px;margin-bottom:12px;display:flex;align-items:center;gap:12px;cursor:pointer;animation:surplusPulse 2s ease-in-out infinite}
+.surplus-banner:hover{background:rgba(239,68,68,.25)}
+.surplus-banner .sb-icon{font-size:1.5em}
+.surplus-banner .sb-text{flex:1;font-weight:600;color:var(--err)}
+.surplus-banner .sb-count{background:var(--err);color:#fff;padding:4px 14px;border-radius:20px;font-weight:700;font-size:1.1em}
+/* ── Матрица деталей ── */
+.parts-matrix{width:100%;border-collapse:collapse;table-layout:auto}
+.parts-matrix th,.parts-matrix td{border:1px solid var(--s2);padding:5px 8px;font-size:.82em;vertical-align:middle}
+.parts-matrix thead th{background:var(--bg);font-weight:700;white-space:nowrap;text-align:center;position:sticky;top:0;z-index:2}
+.parts-matrix thead th.pm-part-col{text-align:left;min-width:200px;max-width:280px;position:sticky;left:0;z-index:3}
+.pm-part-col{text-align:left;min-width:200px;max-width:280px;position:sticky;left:0;background:var(--s1);z-index:1}
+.pm-plan-col,.pm-done-col{min-width:48px;text-align:center;white-space:nowrap}
+.pm-op-col{min-width:95px;text-align:center;white-space:nowrap;font-size:.78em}
+.pm-asm-row td{background:rgba(59,130,246,.07)!important;font-weight:600}
+.pm-asm-row.has-surplus td{background:rgba(239,68,68,.09)!important}
+.pm-comp-row td{background:var(--s1)}
+.pm-comp-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
+.pm-comp-name{padding-left:22px!important;color:var(--text2);font-size:.85em}
+.pm-part-row td{background:var(--s1)}
+.pm-part-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
+.pm-op-cell{text-align:center;padding:4px 6px!important}
+.pm-no-op{color:var(--text3);text-align:center;font-size:.8em}
+.op-cell-done{background:rgba(34,197,94,.15)!important;color:var(--ok)}
+.op-cell-active{background:rgba(251,191,36,.15)!important;color:var(--warn)}
+.op-cell-partial{background:rgba(59,130,246,.13)!important;color:var(--info)}
+.op-cell-wait{background:var(--bg);color:var(--text3)}
 </style>
 </head>
 <body>
@@ -2687,9 +3004,42 @@ function modalAddItem(oid,custId){
     '<div class="form-row"><div><label>Деталь</label>'+SS('fi_pt',ptOpts,'','Поиск детали...')+'</div>'+
       '<div><label>Количество</label><input type="number" id="fi_qty" value="1" min="1"></div></div>'+
     '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveItem('+oid+')">Добавить</button></div>')})})}
-function saveItem(oid){api('/api/order-items/save','POST',{order_id:oid,part_template_id:+ssVal('fi_pt'),quantity:+document.getElementById('fi_qty').value,user_id:U.id}).then(function(r){
-  if(r.unassigned_ops>0){toast('⚠ '+r.unassigned_ops+' операций без ресурса — назначьте вручную','err')}
-  closeModal();toast('Добавлено','ok');modalOrderDetail(oid)}).catch(function(e){toast(e.message,'err')})}
+function saveItem(oid){
+  var tid=+ssVal('fi_pt');var qty=+document.getElementById('fi_qty').value;
+  if(!tid||qty<=0){toast('Заполните поля','err');return}
+  // Проверяем пересорт перед добавлением
+  api('/api/surplus-pool/check/'+tid).then(function(s){
+    if(s.has_surplus){
+      var useMax=Math.min(s.quantity,qty);
+      openModal('<h2>⚠ Деталь есть в пересорте!</h2>'+
+        '<div class="info-box" style="background:rgba(239,68,68,.1);border-color:var(--err);margin-bottom:10px">'+
+          'Деталь <strong>'+esc(s.part_name)+'</strong> есть в пересорте: <strong>'+s.quantity+' шт</strong><br>'+
+          '<div style="font-size:.85em;margin-top:4px">Вы можете сразу использовать готовые детали из пересорта, тогда их количество будет уменьшено.</div>'+
+        '</div>'+
+        '<div class="form-row"><div><label>Использовать из пересорта (0 = не использовать)</label>'+
+          '<input type="number" id="fsi_from_surplus" min="0" max="'+useMax+'" value="'+useMax+'"></div>'+
+          '<div style="padding-top:22px;font-size:.85em;color:var(--text3)">Макс: '+useMax+' шт</div></div>'+
+        '<div class="actions">'+
+          '<button class="btn" onclick="doSaveItem('+oid+','+tid+','+qty+',0)">Не использовать → Добавить</button>'+
+          '<button class="btn primary" onclick="doSaveItem('+oid+','+tid+','+qty+',+document.getElementById(\'fsi_from_surplus\').value)">Использовать и добавить</button>'+
+          '<button class="btn" onclick="closeModal()">Отмена</button></div>');
+    } else {
+      doSaveItem(oid,tid,qty,0);
+    }
+  }).catch(function(){doSaveItem(oid,tid,qty,0)})}
+
+function doSaveItem(oid,tid,qty,fromSurplus){
+  fromSurplus=+fromSurplus||0;
+  var p=fromSurplus>0
+    ?api('/api/surplus-pool/use','POST',{part_template_id:tid,quantity:fromSurplus,order_id:oid,user_id:U.id})
+    :Promise.resolve(null);
+  p.then(function(){
+    return api('/api/order-items/save','POST',{order_id:oid,part_template_id:tid,quantity:qty,user_id:U.id})
+  }).then(function(r){
+    if(r.unassigned_ops>0){toast('⚠ '+r.unassigned_ops+' операций без ресурса — назначьте вручную','err')}
+    var msg=fromSurplus>0?'Добавлено ('+fromSurplus+' шт из пересорта)':'Добавлено';
+    closeModal();toast(msg,'ok');modalOrderDetail(oid)
+  }).catch(function(e){toast(e.message,'err')})}
 function modalEditItem(oid,iid){api('/api/orders').then(function(os){var o=os.find(function(x){return x.id===oid});var it=(o.items||[]).find(function(x){return x.id===iid});if(!it)return;
   openModal('<h2>✏ '+it.part_name+'</h2><div class="form-row"><div><label>Количество</label><input type="number" id="fei_qty" value="'+it.quantity+'" min="1"></div><div></div></div>'+
   '<div class="info-box">Резервы и операции пересоздадутся</div>'+
@@ -3096,6 +3446,7 @@ var opsResFilter=0,opsTypeFilter='';
 function pgOperations(c){
   Promise.all([api('/api/resources'),api('/api/op-types')]).then(function(arr2){
   var resources=arr2[0],opTypes=arr2[1];
+  window._opsResources=resources;
   window._opTypesData={};opTypes.forEach(function(ot){window._opTypesData[ot.name]=ot});
   var url='/api/operations?active_only=1';if(opsResFilter)url+='&resource_id='+opsResFilter;
   api(url).then(function(ops){
@@ -3155,10 +3506,34 @@ function modalOpWriteoff(opid){
       if(!byComp[key])byComp[key]={name:name,items:[]};byComp[key].items.push(r)});
     var compKeys=Object.keys(byComp);var hasComponents=compKeys.length>1;
 
+    // Блок: выбор участка если не задан в заказе
+    var resBlockHtml='';
+    if(!op.resource_id){
+      var resOpts=(window._opsResources||[]).map(function(r){return'<option value="'+r.id+'">'+r.name+'</option>'}).join('');
+      resBlockHtml='<div class="form-row full" style="background:rgba(239,68,68,.07);border:1px solid var(--err);border-radius:var(--r);padding:8px 10px;margin-bottom:6px">'+
+        '<div><label style="color:var(--err);font-weight:700">🏭 Участок <span>*</span> — не задан в заказе, выберите обязательно:</label>'+
+        '<select id="fopwo_res_sel" style="border-color:var(--err)"><option value="">— выберите участок —</option>'+resOpts+'</select></div></div>';
+    }
+
+    // Блок: что именно списывается
+    var partInfoHtml='';
+    if(showParts){
+      if(op.component_template_id&&op.component_name){
+        partInfoHtml='<div class="info-box" style="background:rgba(99,102,241,.08);border-color:var(--acc);margin-bottom:6px">'+
+          '🔩 Списание для компонента: <strong>'+op.component_name+'</strong>'+
+          '<div style="font-size:.8em;color:var(--text3);margin-top:2px">Будет учтено только в строке этого компонента в «Учёт деталей» — <em>не входит в итог сборочной единицы</em></div></div>';
+      } else {
+        partInfoHtml='<div class="info-box" style="background:rgba(34,197,94,.08);border-color:var(--ok);margin-bottom:6px">'+
+          '🔧 Списание для <strong>'+(op.component_name||op.item||'готового изделия')+'</strong>'+
+          '<div style="font-size:.8em;color:var(--text3);margin-top:2px">Учитывается в итоговой строке изделия/сборки в «Учёт деталей»</div></div>';
+      }
+    }
+
     var h='<h2>📤 Списание: '+op.type+'</h2>'+
       '<div class="info-box"><strong>Заказ:</strong> '+(op.order_display||op.order_number)+
       ' | <strong>Деталь:</strong> '+(op.item||'—')+
-      ' | <strong>Участок:</strong> '+(op.resource||'—')+'</div>';
+      ' | <strong>Участок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+'</div>'+
+      resBlockHtml;
 
     if(showMat&&reservations.length){
       h+='<div class="section-hdr">📦 Материал</div>';
@@ -3173,7 +3548,7 @@ function modalOpWriteoff(opid){
       h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов</div>'
     }
     if(showParts){
-      h+='<div class="section-hdr">🔩 Детали</div>'+
+      h+='<div class="section-hdr">🔩 Детали</div>'+partInfoHtml+
         '<div class="form-row"><div><label>Годных</label><input type="number" id="fopwo_good" value="0" min="0"></div>'+
         '<div><label>Брак</label><input type="number" id="fopwo_rej" value="0" min="0"></div></div>'
     }
@@ -3201,6 +3576,15 @@ function opWoCompChg(){
 function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
   var note=(document.getElementById('fopwo_note')||{}).value||'';
+
+  // Определяем эффективный участок
+  var effResId=op.resource_id||null;
+  if(!effResId){
+    var resSel=document.getElementById('fopwo_res_sel');
+    if(resSel&&resSel.value){effResId=+resSel.value}
+    else{toast('Выберите участок — он не задан в заказе','err');return}
+  }
+
   var promises=[];
   if(showMat){
     var matSel=document.getElementById('fopwo_mat');
@@ -3209,7 +3593,7 @@ function submitOpWriteoff(opid,showMat,showParts){
       var matOpt=matSel.options[matSel.selectedIndex];
       promises.push(api('/api/writeoffs/create','POST',{
         writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
-        order_item_id:op.item_id,resource_id:op.resource_id,
+        order_item_id:op.item_id,resource_id:effResId,
         material_id:+matSel.value,reservation_id:+(matOpt.dataset.rid)||null,
         sheets:shVal,note:'['+op.type+'] '+note}))
     }
@@ -3220,8 +3604,9 @@ function submitOpWriteoff(opid,showMat,showParts){
     if(good>0||rej>0){
       promises.push(api('/api/writeoffs/create','POST',{
         writeoff_type:'Детали',user_id:U.id,order_id:op.order_id,
-        order_item_id:op.item_id,resource_id:op.resource_id,
+        order_item_id:op.item_id,resource_id:effResId,
         operation_type:op.type,parts_good:good,parts_rejected:rej,
+        component_template_id:op.component_template_id||null,
         note:'['+op.type+'] '+note}))
     }
   }
@@ -3290,29 +3675,303 @@ function cancelRes(rid){if(!confirm('Снять?'))return;api('/api/reservations
 // ═══ УЧЁТ ДЕТАЛЕЙ ═══
 var plFilter={name:'',active_only:1},plSearchTimer=null;
 function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active_only).then(function(data){
-  var filtered=data;if(plFilter.name)filtered=filtered.filter(function(d){return d.part_name.toLowerCase().indexOf(plFilter.name.toLowerCase())>=0});
-  var totalSurplus=filtered.reduce(function(s,d){return s+d.surplus},0);
-  c.innerHTML='<div class="toolbar">'+(totalSurplus>0?'<button class="btn warn" onclick="modalSurplus()">📊 Излишки (+'+totalSurplus+')</button>':'')+'</div>'+
-  '<div class="filter-bar"><label>Деталь:</label><input id="plNameInput" style="width:150px" value="'+esc(plFilter.name)+'">'+
+  var filtered=data;
+  if(plFilter.name)filtered=filtered.filter(function(d){return d.part_name.toLowerCase().indexOf(plFilter.name.toLowerCase())>=0});
+  var surplusItems=filtered.filter(function(d){return d.surplus>0});
+  var totalSurplus=surplusItems.reduce(function(s,d){return s+d.surplus},0);
+
+  // Собираем глобальный список типов операций.
+  // Компонентные операции (component_id != null) — первыми (слева),
+  // затем — сборочные/одиночные операции (без component_id).
+  var compOpSeq = {}; // op_type -> минимальный seq у компонентных операций
+  var asmOpSeq  = {}; // op_type -> минимальный seq у операций без компонента
+  filtered.forEach(function(d){
+    (d.planned_ops||[]).forEach(function(op){
+      if(!op.op_type) return;
+      if(op.component_id != null){
+        if(!(op.op_type in compOpSeq)||op.seq<compOpSeq[op.op_type]) compOpSeq[op.op_type]=op.seq;
+      } else {
+        if(!(op.op_type in asmOpSeq)||op.seq<asmOpSeq[op.op_type]) asmOpSeq[op.op_type]=op.seq;
+      }
+    });
+  });
+  // Сначала типы, встречающиеся у компонентов; потом — только у сборки/детали
+  var compTypes   = Object.keys(compOpSeq).sort(function(a,b){return compOpSeq[a]-compOpSeq[b]});
+  var asmOnlyTypes= Object.keys(asmOpSeq).filter(function(t){return !(t in compOpSeq)}).sort(function(a,b){return asmOpSeq[a]-asmOpSeq[b]});
+  var allOpTypes  = compTypes.concat(asmOnlyTypes);
+
+  var bannerHtml='';
+  if(totalSurplus>0){
+    bannerHtml='<div class="surplus-banner" onclick="modalSurplus()">'+
+      '<span class="sb-icon">🚨</span>'+
+      '<span class="sb-text">ПЕРЕСОРТ! Деталей изготовлено сверх плана: '+surplusItems.length+' позиций. Нажмите для подробностей.</span>'+
+      '<span class="sb-count">+'+totalSurplus+' шт</span></div>';
+  }
+
+  c.innerHTML='<div class="toolbar">'+
+    (totalSurplus>0?'<button class="btn" style="background:var(--err);border-color:var(--err);color:#fff" onclick="modalSurplus()">🚨 Пересорт из пр-ва (+'+totalSurplus+')</button>':'')+
+    '<button class="btn" style="background:var(--warn);border-color:var(--warn);color:#fff" onclick="modalSurplusPool()">📦 Склад пересорта</button>'+
+    '</div>'+
+    '<div class="filter-bar"><label>Деталь:</label><input id="plNameInput" style="width:180px" value="'+esc(plFilter.name)+'">'+
     '<label>Заказы:</label><select onchange="plFilter.active_only=+this.value;pgPartsLog(document.getElementById(\'mainContent\'))">'+
-    '<option value="1" '+(plFilter.active_only?'selected':'')+'>В работе</option><option value="0" '+(!plFilter.active_only?'selected':'')+'>Все</option></select></div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Заказ</th><th>Ст.</th><th>Деталь</th><th>План</th><th>Факт</th><th>Брак</th><th>Изл.(1й уч.)</th><th>По участкам</th></tr></thead>'+
-  '<tbody>'+filtered.map(function(d){var resBadges=Object.entries(d.by_resource||{}).map(function(e){var rn=e[0],rd=e[1];
-    var ac=rd.logs.some(function(l){return l.anomaly})?'anomaly':'';
-    return '<span class="badge b-info '+ac+'" title="'+rn+': '+rd.good+' / '+rd.rejected+' брак">'+rn+': '+rd.good+(rd.rejected?' ⚠'+rd.rejected:'')+'</span>'}).join(' ')||'—';
-     d.components_html=(d.components||[]).length?'<div style="font-size:.8em;color:var(--text3);margin-top:2px">'+d.components.map(function(c){return '├ '+c.name+' ×'+c.qty}).join('<br>')+'</div>':'';
-    return '<tr><td>'+d.order_display+'</td><td>'+statusBadge(d.order_status)+'</td><td><strong>'+(d.is_assembly?'🔧 ':'')+d.part_name+'</strong>'+(d.components_html||'')+'</td>'+
-    '<td>'+d.quantity+'</td><td>'+d.completed+'</td><td class="'+(d.rejected?'low':'')+'">'+d.rejected+'</td>'+
-    '<td class="'+(d.surplus>0?'low':'')+'">'+(d.surplus>0?'+'+d.surplus:'—')+'</td><td>'+resBadges+'</td></tr>'}).join('')+'</tbody></table></div>';
+    '<option value="1" '+(plFilter.active_only?'selected':'')+'>В работе</option>'+
+    '<option value="0" '+(!plFilter.active_only?'selected':'')+'>Все</option></select></div>'+
+    bannerHtml+
+    (filtered.length?renderPartsMatrix(filtered,allOpTypes):'<div class="info-box">Нет данных</div>');
+
   var inp=document.getElementById('plNameInput');
-  if(inp){inp.addEventListener('input',function(){plFilter.name=this.value;clearTimeout(plSearchTimer);plSearchTimer=setTimeout(function(){pgPartsLog(document.getElementById('mainContent'))},400)});
-    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)}
+  if(inp){
+    inp.addEventListener('input',function(){plFilter.name=this.value;clearTimeout(plSearchTimer);plSearchTimer=setTimeout(function(){pgPartsLog(document.getElementById('mainContent'))},400)});
+    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);
+  }
+})}
+
+function renderPartsMatrix(data,allOpTypes){
+  var h='<div class="tbl-wrap" style="max-height:75vh"><table class="parts-matrix"><thead><tr>'+
+    '<th class="pm-part-col">Деталь / Компонент</th>'+
+    '<th class="pm-plan-col">План</th>'+
+    '<th class="pm-done-col">Факт</th>'+
+    allOpTypes.map(function(ot){return '<th class="pm-op-col">'+ot+'</th>'}).join('')+
+    '</tr></thead><tbody>';
+
+  data.forEach(function(d){
+    var hasSurplus=d.surplus>0;
+    var surpBadge=hasSurplus?'<span class="surplus-label" style="font-size:.72em;margin-left:5px">ПС +'+d.surplus+'</span>':'';
+    var orderBadge='<span class="badge b-info" style="font-size:.72em;margin-right:4px">'+d.order_number+'</span>';
+
+    if(d.is_assembly){
+      // Группируем planned_ops по component_id
+      var byComp={}; // String(component_id)|'__asm__' -> {op_type -> op}
+      (d.planned_ops||[]).forEach(function(op){
+        var key=op.component_id!=null?String(op.component_id):'__asm__';
+        if(!byComp[key])byComp[key]={};
+        if(!byComp[key][op.op_type]||op.seq>byComp[key][op.op_type].seq)
+          byComp[key][op.op_type]=op;
+      });
+
+      // 1. Сначала — строки компонентов
+      (d.components||[]).forEach(function(comp){
+        var cid=String(comp.id);
+        var ops=byComp[cid]||{};
+        var compSurplus=Object.values(ops).some(function(op){return op.completed_qty>op.planned_qty&&op.planned_qty>0});
+        h+='<tr class="pm-comp-row'+(compSurplus?' has-surplus-row':'')+'">'+
+          '<td class="pm-part-col pm-comp-name">🔩 <strong>'+comp.name+'</strong> <span style="color:var(--text3)">×'+comp.qty+'</span></td>'+
+          '<td class="pm-plan-col" style="color:var(--text3)">—</td>'+
+          '<td class="pm-done-col" style="color:var(--text3)">—</td>'+
+          allOpTypes.map(function(ot){
+            var op=ops[ot];
+            if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
+            return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
+          }).join('')+
+        '</tr>';
+      });
+
+      // 2. В конце — строка сборки с только сборочными операциями
+      var asmOps=byComp['__asm__']||{};
+      var asmOver=d.completed>d.quantity;
+      h+='<tr class="pm-asm-row'+(hasSurplus?' has-surplus':'')+'">'+
+        '<td class="pm-part-col">'+orderBadge+statusBadge(d.order_status)+
+          ' <strong>🔧 '+d.part_name+'</strong>'+surpBadge+'</td>'+
+        '<td class="pm-plan-col"><strong>'+d.quantity+'</strong></td>'+
+        '<td class="pm-done-col">'+(asmOver
+          ?'<strong style="color:var(--err)">'+d.completed+'</strong><div style="font-size:.7em;background:var(--err);color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-top:1px;animation:surplusPulse 1.5s ease-in-out infinite">ПС +'+(d.completed-d.quantity)+'</div>'
+          :'<strong class="'+(d.completed>=d.quantity?'s-ok':d.completed>0?'':'')+'">'+d.completed+'</strong>')+
+          (d.rejected>0?'<div style="font-size:.75em;color:var(--err)">✗'+d.rejected+'</div>':'')+
+        '</td>'+
+        allOpTypes.map(function(ot){
+          var op=asmOps[ot];
+          if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
+          return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
+        }).join('')+
+      '</tr>';
+    } else {
+      // ─ Обычная деталь ─
+      var ops={};
+      (d.planned_ops||[]).forEach(function(op){
+        if(!ops[op.op_type]||op.seq>ops[op.op_type].seq)ops[op.op_type]=op;
+      });
+      var partOver=d.completed>d.quantity;
+      h+='<tr class="pm-part-row'+(hasSurplus?' has-surplus-row':'')+'">'+
+        '<td class="pm-part-col">'+orderBadge+statusBadge(d.order_status)+
+          ' <strong>🔩 '+d.part_name+'</strong>'+surpBadge+'</td>'+
+        '<td class="pm-plan-col">'+d.quantity+'</td>'+
+        '<td class="pm-done-col">'+(partOver
+          ?'<span style="color:var(--err);font-weight:700">'+d.completed+'</span><div style="font-size:.7em;background:var(--err);color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-top:1px;animation:surplusPulse 1.5s ease-in-out infinite">ПС +'+(d.completed-d.quantity)+'</div>'
+          :'<span class="'+(d.completed>=d.quantity?'s-ok':d.completed>0?'':'')+'">'+d.completed+'</span>')+
+          (d.rejected>0?'<div style="font-size:.75em;color:var(--err)">✗'+d.rejected+'</div>':'')+
+        '</td>'+
+        allOpTypes.map(function(ot){
+          var op=ops[ot];
+          if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
+          return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
+        }).join('')+
+      '</tr>';
+    }
+  });
+
+  h+='</tbody></table></div>';
+  return h;
+}
+
+function plOpClass(op){
+  if(op.status==='Завершена')return 'op-cell-done';
+  if(op.status==='В работе')return 'op-cell-active';
+  if(op.status==='Частично')return 'op-cell-partial';
+  return 'op-cell-wait';
+}
+
+function plOpCell(op){
+  var h='';
+  var isOver=op.planned_qty>0&&op.completed_qty>op.planned_qty;
+  if(op.planned_qty>0){
+    var pct=Math.round(op.completed_qty/op.planned_qty*100);
+    if(isOver){
+      h+='<div style="font-weight:700"><span style="color:var(--err)">'+op.completed_qty+'</span>'+
+         '<span style="font-weight:400;color:var(--text3)">/'+op.planned_qty+'</span></div>';
+      h+='<div style="font-size:.7em;background:var(--err);color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-top:1px;animation:surplusPulse 1.5s ease-in-out infinite">ПС +'+(op.completed_qty-op.planned_qty)+'</div>';
+    } else {
+      h+='<div style="font-weight:600">'+op.completed_qty+'<span style="font-weight:400;color:var(--text3)">/'+op.planned_qty+'</span></div>';
+      h+='<div style="font-size:.72em;color:var(--text3)">'+pct+'%</div>';
+    }
+  } else {
+    h+='<div style="font-size:.78em">'+statusBadge(op.status||'—')+'</div>';
+  }
+  if(op.rejected_qty>0)h+='<div style="font-size:.72em;color:var(--err)">✗ '+op.rejected_qty+'</div>';
+  if(op.resource&&op.resource!=='—')h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:3px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+op.resource+'">📍'+op.resource+'</div>';
+  return h;
+}
+
+function modalSurplus(){api('/api/part-station-logs/surplus').then(function(data){if(!data.length){toast('Нет пересорта');return}
+  var h='<h2 style="color:var(--err)">🚨 Пересорт — деталей сверх плана</h2>'+
+    '<div style="background:rgba(239,68,68,.1);border:1px solid var(--err);border-radius:var(--r);padding:10px 14px;margin-bottom:12px;font-size:.9em;color:var(--err)">'+
+    'Детали изготовлены сверх плана. Необходимо принять решение: перераспределить излишек на другой заказ или оприходовать как склад.</div>'+
+    '<div class="tbl-wrap"><table><thead><tr><th>Деталь</th><th style="text-align:center">Излишек</th><th>По заказам</th><th>Действия</th></tr></thead>'+
+    '<tbody>'+data.map(function(d){
+      var compTxt=(d.components||[]).length?'<div style="font-size:.78em;color:var(--text3);padding-top:3px">'+(d.components||[]).map(function(c){return '├ '+c.name+' ×'+c.qty}).join(' | ')+'</div>':'';
+      var orders=(d.orders||[]).map(function(o){return '<span class="badge b-err" style="margin:1px">'+o.order_number+': '+o.planned+'→'+o.completed_first+' <strong>(+'+o.surplus+')</strong></span>'}).join(' ');
+      var tid=d.template_id||0;
+      return '<tr style="background:rgba(239,68,68,.06)">'+
+        '<td><strong>'+(d.is_assembly?'🔧 ':'🔩 ')+d.part_name+'</strong>'+compTxt+'</td>'+
+        '<td style="text-align:center"><span class="surplus-label">+'+d.total_surplus+'</span></td>'+
+        '<td style="font-size:.85em">'+orders+'</td>'+
+        '<td>'+(tid?'<button class="btn sm" onclick="modalRedistribute('+tid+',\''+esc(d.part_name)+'\','+d.total_surplus+')" title="Найти заказы для перераспределения">🔄 Заказы</button>':'—')+'</td></tr>';
+    }).join('')+'</tbody></table></div>'+
+    '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
+  openModal(h)}).catch(function(e){toast(e.message,'err')})}
+
+function modalRedistribute(tid,partName,surplusQty){
+  api('/api/part-templates/'+tid+'/open-orders').then(function(orders){
+    var h='<h2>🔄 Перераспределение пересорта</h2>'+
+      '<div class="info-box" style="margin-bottom:10px">'+
+        '<strong>'+(surplusQty>0?'Излишек: +'+surplusQty+' шт':'')+'</strong> — '+partName+
+      '</div>'+
+      (orders.length?
+        '<div class="info-box" style="background:rgba(34,197,94,.08);border-color:var(--ok);color:var(--ok);margin-bottom:10px">'+
+        '✅ Найдено активных заказов с дефицитом этой детали: '+orders.length+'</div>'+
+        '<div class="tbl-wrap"><table><thead><tr><th>Заказ</th><th>Всего</th><th>Сделано</th><th>Ещё нужно</th></tr></thead><tbody>'+
+        orders.map(function(o){
+          return '<tr><td><strong>'+o.order_number+'</strong><div style="font-size:.8em;color:var(--text3)">'+o.order_display+'</div></td>'+
+            '<td style="text-align:center">'+o.quantity+'</td>'+
+            '<td style="text-align:center">'+o.completed_qty+'</td>'+
+            '<td style="text-align:center"><span class="badge b-warn">'+o.still_needed+'</span></td></tr>';
+        }).join('')+'</tbody></table></div>'+
+        '<div class="info-box" style="font-size:.85em;margin-top:8px">💡 Передайте излишек в один из этих заказов через оперативный учёт или создайте новое списание с правильным заказом.</div>'
+      :
+        '<div class="info-box" style="background:rgba(239,68,68,.08);border-color:var(--err);font-size:.9em">'+
+        '☑ Активных заказов с дефицитом этой детали не найдено.<br>'+
+        'Оприходуйте излишек как склад деталей или создайте внутреннее перемещение.</div>'
+      )+
+      '<div class="actions"><button class="btn" onclick="modalSurplus()">← Назад</button><button class="btn" onclick="closeModal()">Закрыть</button></div>';
+    openModal(h);
+  }).catch(function(e){toast(e.message,'err');})}
+
+// ═══ СКЛАД ПЕРЕСОРТА ═══
+function modalSurplusPool(){
+  api('/api/surplus-pool').then(function(data){
+    var h='<h2>📦 Склад пересорта</h2>'+
+      '<div class="info-box" style="margin-bottom:10px;font-size:.88em">Управляйте запасом выявленного пересорта. Вы можете добавить излишек из производства, скорректировать или снять позицию.</div>'+
+      '<div class="toolbar" style="margin-bottom:8px">'+
+        '<button class="btn primary sm" onclick="modalAddToSurplusPool()">+ Добавить</button>'+
+      '</div>';
+    if(data.length){
+      h+='<div class="tbl-wrap"><table><thead><tr><th>Деталь</th><th style="text-align:center">Кол-во</th><th>Прим.</th><th>Обновлено</th><th></th></tr></thead><tbody>'+
+        data.map(function(e){
+          var compTxt=(e.components||[]).length?'<div style="font-size:.76em;color:var(--text3)">'+e.components.map(function(c){return '├ '+c.name+' ×'+c.qty}).join(' | ')+'</div>':'';
+          return '<tr>'+
+            '<td><strong>'+(e.is_assembly?'🔧 ':'🔩 ')+e.part_name+'</strong>'+compTxt+'</td>'+
+            '<td style="text-align:center"><span class="badge b-warn" style="font-size:1em">'+e.quantity+'</span></td>'+
+            '<td style="font-size:.82em;color:var(--text3)">'+esc(e.note||'')+'</td>'+
+            '<td style="font-size:.8em;color:var(--text3)">'+fmtDT(e.updated_at)+'</td>'+
+            '<td style="white-space:nowrap">'+
+              '<button class="btn sm" title="Коррекция" onclick="modalAdjustSurplus('+e.id+','+e.part_template_id+',\''+esc(e.part_name)+'\','+e.quantity+')">✏</button> '+
+              '<button class="btn sm" style="color:var(--err)" title="Журнал" onclick="modalSurplusLogs('+e.part_template_id+',\''+esc(e.part_name)+'\')">📋</button> '+
+              '<button class="btn sm" style="color:var(--err)" title="Удалить" onclick="deleteSurplusEntry('+e.id+')">🗑</button>'+
+            '</td></tr>';
+        }).join('')+'</tbody></table></div>';
+    } else {
+      h+='<div class="info-box" style="color:var(--text3)">Склад пересорта пуст.</div>';
+    }
+    h+='<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
+    openModal(h);
+  }).catch(function(e){toast(e.message,'err')})}
+
+function modalAddToSurplusPool(){
+  Promise.all([api('/api/part-templates')]).then(function(arr){
+    var pts=arr[0];
+    var ptOpts=pts.map(function(p){return{v:String(p.id),t:p.display_name+' ['+(p.customer_name||'—')+']'}});
+    openModal('<h2>+ Добавить в пересорт</h2>'+
+      '<div class="form-row full"><div><label>Деталь</label>'+SS('fsp_pt',ptOpts,'','Поиск детали...')+'</div></div>'+
+      '<div class="form-row"><div><label>Количество</label><input type="number" id="fsp_qty" min="1" value="1"></div><div></div></div>'+
+      '<div class="form-row full"><div><label>Примечание</label><input id="fsp_note" placeholder="Причина / источник"></div></div>'+
+      '<div class="actions"><button class="btn" onclick="modalSurplusPool()">← Назад</button>'+
+        '<button class="btn primary" onclick="submitAddToSurplusPool()">Добавить</button></div>');
   })}
-function modalSurplus(){api('/api/part-station-logs/surplus').then(function(data){if(!data.length){toast('Нет излишков');return}
-  openModal('<h2>📊 Излишки (по 1-му участку)</h2><div class="tbl-wrap"><table><thead><tr><th>Деталь</th><th>Изл.</th><th>Заказы</th></tr></thead>'+
-  '<tbody>'+data.map(function(d){return '<tr><td><strong>'+(d.is_assembly?'🔧 ':'')+d.part_name+'</strong>'+((d.components||[]).length?'<div style="font-size:.8em;color:var(--text3);margin-top:2px">'+(d.components||[]).map(function(c){return '├ '+c.name+' ×'+c.qty}).join('<br>')+'</div>':'')+'</td> class="low">+'+d.total_surplus+'</td>'+
-    '<td style="font-size:.8em">'+(d.orders||[]).map(function(o){return o.order+': '+o.planned+'→'+o.completed_first+' (+'+o.surplus+')'}).join('<br>')+'</td></tr>'}).join('')+'</tbody></table></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>')}).catch(function(e){toast(e.message,'err')})}
+
+function submitAddToSurplusPool(){
+  var tid=+ssVal('fsp_pt');var qty=+document.getElementById('fsp_qty').value;var note=document.getElementById('fsp_note').value||'';
+  if(!tid||qty<=0){toast('Заполните поля','err');return}
+  api('/api/surplus-pool/add-from-production','POST',{part_template_id:tid,quantity:qty,note:note,user_id:U.id}).then(function(){
+    toast('Добавлено в пересорт','ok');modalSurplusPool()
+  }).catch(function(e){toast(e.message,'err')})}
+
+function modalAdjustSurplus(sid,tid,partName,curQty){
+  openModal('<h2>✏ Коррекция пересорта</h2>'+
+    '<div class="info-box"><strong>'+partName+'</strong> — текущий остаток: <strong>'+curQty+' шт</strong></div>'+
+    '<div class="form-row"><div><label>Изменение (+ или −)</label><input type="number" id="fadj_delta" value="0" placeholder="+5 или -3"></div><div></div></div>'+
+    '<div class="form-row full"><div><label>Комментарий (обязательно)</label><input id="fadj_note" placeholder="Причина коррекции"></div></div>'+
+    '<div class="actions"><button class="btn" onclick="modalSurplusPool()">← Назад</button>'+
+      '<button class="btn primary" onclick="submitAdjustSurplus('+sid+','+tid+')">Сохранить</button></div>');}
+
+function submitAdjustSurplus(sid,tid){
+  var delta=+document.getElementById('fadj_delta').value;var note=document.getElementById('fadj_note').value||'';
+  if(!delta){toast('Укажите изменение','err');return}
+  if(!note){toast('Укажите комментарий','err');return}
+  api('/api/surplus-pool/adjust','POST',{part_template_id:tid,delta:delta,reason:'Коррекция',note:note,user_id:U.id}).then(function(r){
+    toast('Остаток: '+r.quantity+' шт','ok');modalSurplusPool()
+  }).catch(function(e){toast(e.message,'err')})}
+
+function modalSurplusLogs(tid,partName){
+  api('/api/surplus-pool/logs/'+tid).then(function(logs){
+    var h='<h2>📋 История: '+partName+'</h2>'+
+      '<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th>Δ</th><th>Причина</th><th>Кто</th><th>Прим.</th></tr></thead><tbody>'+
+      (logs.length?logs.map(function(l){
+        var cl=l.delta>0?'color:var(--ok)':'color:var(--err)';
+        return '<tr><td style="font-size:.8em">'+fmtDT(l.date)+'</td>'+
+          '<td style="'+cl+';font-weight:700">'+(l.delta>0?'+':'')+l.delta+'</td>'+
+          '<td>'+esc(l.reason)+'</td><td>'+esc(l.user)+'</td><td style="font-size:.82em">'+esc(l.note||'')+'</td></tr>';
+      }).join(''):'<tr><td colspan="5" style="color:var(--text3);text-align:center">Нет записей</td></tr>')+
+      '</tbody></table></div>'+
+      '<div class="actions"><button class="btn" onclick="modalSurplusPool()">← Назад</button></div>';
+    openModal(h);
+  }).catch(function(e){toast(e.message,'err')})}
+
+function deleteSurplusEntry(sid){
+  var note=prompt('Причина удаления (обязательно):');
+  if(note===null)return;
+  if(!note.trim()){toast('Укажите причину','err');return}
+  api('/api/surplus-pool/delete/'+sid,'POST',{note:note,user_id:U.id}).then(function(){
+    toast('Удалено','ok');modalSurplusPool()
+  }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
 var woTab='Материал';
@@ -3345,7 +4004,8 @@ function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),a
   var ordOpts=active.map(function(o){return{v:String(o.id),t:o.display}});
   openModal('<h2>+ Списание ('+woTab+')</h2>'+
   '<div class="form-row full"><div><label>Заказ</label>'+SS('fwo_ord',ordOpts,'','Заказ...',function(v){woOrdChg2(v)})+'</div></div>'+
-  '<div class="form-row full"><div><label>Деталь</label><select id="fwo_item" onchange="woItemChg2()"><option value="">— сначала заказ —</option></select></div></div>'+
+  '<div class="form-row full"><div><label>Деталь / Изделие</label><select id="fwo_item" onchange="woItemChg2()"><option value="">— сначала заказ —</option></select></div></div>'+
+  '<div class="form-row full" id="fwo_comp_wrap" style="display:none"><div><label>Компонент сборки <span style="color:var(--text3);font-size:.85em">(необязательно — для заготовительных операций)</span></label><select id="fwo_comp_sel"><option value="">— вся сборка / сборочная операция —</option></select></div></div>'+
   '<div class="form-row"><div><label>Участок</label><div id="fwo_res_wrap"><select id="fwo_res_sel"><option value="">— сначала заказ —</option></select></div></div><div></div></div>'+
   (woTab==='Материал'?'<div class="form-row full"><div><label>Материал (из резервов)</label><select id="fwo_mat"><option value="">— сначала деталь —</option></select></div></div>'+
   '<div class="form-row"><div><label>Листов</label><input type="number" id="fwo_sheets" min="1" value="1"></div><div></div></div>'
@@ -3355,7 +4015,7 @@ function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),a
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="submitWO()">Списать</button></div>')})}
 
 function woOrdChg2(val){var ordId=+val;if(!ordId)return;
-  // Load resources for this order
+  // Загружаем участки для этого заказа
   api('/api/orders/'+ordId+'/resources-for-writeoff').then(function(res){
     var sel=document.getElementById('fwo_res_sel');
     sel.innerHTML='<option value="">—</option>'+res.map(function(r){return '<option value="'+r.id+'" data-ops=\''+JSON.stringify(r.allowed_ops||[]).replace(/'/g,"&#39;")+'\'>'+r.name+'</option>'}).join('');
@@ -3363,7 +4023,13 @@ function woOrdChg2(val){var ordId=+val;if(!ordId)return;
   });
   api('/api/orders/'+ordId+'/items-for-writeoff').then(function(items){
     document.getElementById('fwo_item').innerHTML='<option value="">— выберите —</option>'+
-      items.map(function(it){return '<option value="'+it.id+'" data-tid="'+it.template_id+'">'+it.part_name+' ('+it.quantity+'/'+it.completed+')</option>'}).join('')}).catch(function(e){toast(e.message,'err')});
+      items.map(function(it){
+        var compsJson=JSON.stringify(it.components||[]).replace(/'/g,"&#39;");
+        return '<option value="'+it.id+'" data-tid="'+it.template_id+'" data-asm="'+(it.is_assembly?'1':'0')+'" data-comps=\''+compsJson+'\'>'+
+          it.part_name+' ('+it.quantity+'/'+it.completed+')</option>'}).join('')
+  }).catch(function(e){toast(e.message,'err')});
+  // Скрыть компонент-селектор при смене заказа
+  var cw=document.getElementById('fwo_comp_wrap');if(cw)cw.style.display='none';
   if(woTab==='Материал'){var ms=document.getElementById('fwo_mat');if(ms)ms.innerHTML='<option value="">— деталь —</option>'}}
 
 function woResChg2(){
@@ -3375,9 +4041,28 @@ function woResChg2(){
   if(opSel&&ops.length>=1){opSel.innerHTML=ops.map(function(o){return '<option value="'+o+'">'+o+'</option>'}).join('')}
 }
 
-function woItemChg2(){if(woTab!=='Материал')return;var itemId=+document.getElementById('fwo_item').value;if(!itemId)return;
+function woItemChg2(){
+  var itemSel=document.getElementById('fwo_item');
+  var opt=itemSel?itemSel.options[itemSel.selectedIndex]:null;
+  var isAsm=opt&&opt.dataset.asm==='1';
+  var comps=[];try{comps=JSON.parse(opt?opt.dataset.comps||'[]':'[]')}catch(e){}
+  var cw=document.getElementById('fwo_comp_wrap');
+  var cs=document.getElementById('fwo_comp_sel');
+  if(cw&&cs){
+    if(woTab==='Детали'&&isAsm&&comps.length>0){
+      cw.style.display='';
+      cs.innerHTML='<option value="">— вся сборка / сборочная операция —</option>'+
+        comps.map(function(c){return '<option value="'+c.id+'">🔩 '+c.name+' ×'+c.qty+'</option>'}).join('');
+    } else {
+      cw.style.display='none';
+      cs.innerHTML='<option value="">—</option>';
+    }
+  }
+  if(woTab!=='Материал')return;
+  var itemId=+itemSel.value;if(!itemId)return;
   api('/api/reservations/by-item/'+itemId).then(function(rs){
     document.getElementById('fwo_mat').innerHTML=rs.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'">'+r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
+
 function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementById('fwo_item').value;
   if(!ordId){toast('Заказ','err');return}if(!itemId){toast('Деталь','err');return}
   var resId=+document.getElementById('fwo_res_sel').value||null;
@@ -3386,6 +4071,8 @@ function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementB
     b.material_id=matId;b.reservation_id=+(ms.options[ms.selectedIndex].dataset.rid)||null;b.sheets=+document.getElementById('fwo_sheets').value}
   else{var sel=document.getElementById('fwo_optype_sel');b.operation_type=sel?sel.value:'';
     b.parts_good=+document.getElementById('fwo_good').value;b.parts_rejected=+document.getElementById('fwo_rej').value;
+    // Компонент сборки (если выбран)
+    var compSel=document.getElementById('fwo_comp_sel');b.component_template_id=compSel&&+compSel.value?+compSel.value:null;
     if(b.parts_good===0&&b.parts_rejected===0){toast('Укажите количество годных или брак','err');return}}
   api('/api/writeoffs/create','POST',b).then(function(r){closeModal();if(r.is_anomaly)toast('⚠ '+r.anomaly_note,'err');else toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
