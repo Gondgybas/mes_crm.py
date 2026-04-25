@@ -1933,7 +1933,23 @@ def create_app():
         if order_id: q = q.filter(ProductionOp.order_id == order_id)
         if active_only: q = q.join(Order).filter(Order.status == "В работе")
         if resource_id: q = q.filter(ProductionOp.resource_id == resource_id)
-        return [{"id": o.id, "order_id": o.order_id,
+        ops_list = q.order_by(ProductionOp.resource_id, ProductionOp.sort_order, ProductionOp.sequence).all()
+        # Вычисляем "предыдущую операцию в цепочке" для каждой операции
+        # Группируем по (order_item_id, component_template_id) и сортируем по (sequence, sort_order)
+        op_groups = {}
+        for o in ops_list:
+            gk = (o.order_item_id, o.component_template_id)
+            if gk not in op_groups: op_groups[gk] = []
+            op_groups[gk].append(o)
+        prev_op_map = {}  # op.id -> prev_op or None
+        for gk, group in op_groups.items():
+            group_sorted = sorted(group, key=lambda x: (x.sequence or 0, x.sort_order or 0))
+            for i, o in enumerate(group_sorted):
+                prev_op_map[o.id] = group_sorted[i - 1] if i > 0 else None
+        result = []
+        for o in ops_list:
+            prev_op = prev_op_map.get(o.id)
+            result.append({"id": o.id, "order_id": o.order_id,
                  "order_number": o.order.order_number if o.order else "",
                  "order_display": o.order.display_name if o.order else "",
                  "item": pt_display(o.order_item.part_template) if o.order_item and o.order_item.part_template else "",
@@ -1951,8 +1967,12 @@ def create_app():
                  "started_at": o.started_at.isoformat() if o.started_at else None,
                  "total_pause_min": o.total_pause_minutes or 0,
                  "completed_at": o.completed_at.isoformat() if o.completed_at else None,
-                 "paused_at": o.paused_at.isoformat() if o.paused_at else None}
-                for o in q.order_by(ProductionOp.resource_id, ProductionOp.sort_order, ProductionOp.sequence).all()]
+                 "paused_at": o.paused_at.isoformat() if o.paused_at else None,
+                 # Передача деталей между операциями
+                 "available_input": prev_op.completed_qty if prev_op is not None else None,
+                 "prev_op_type": prev_op.operation_type if prev_op is not None else None,
+                 "prev_op_id": prev_op.id if prev_op is not None else None})
+        return result
 
     @app.post("/api/operations/save")
     async def api_save_op(request: Request, db: Session = Depends(db_dep)):
@@ -1977,6 +1997,21 @@ def create_app():
         data = await request.json()
         op = db.query(ProductionOp).get(opid)
         if not op: raise HTTPException(404)
+        # Проверяем: есть ли предыдущая операция в цепочке и поступили ли с неё детали
+        if op.order_item_id and op.status not in ("В работе", "Пауза"):
+            prev_ops = db.query(ProductionOp).filter(
+                ProductionOp.order_item_id == op.order_item_id,
+                ProductionOp.component_template_id == op.component_template_id
+            ).order_by(ProductionOp.sequence, ProductionOp.sort_order).all()
+            prev_ids = [o.id for o in prev_ops]
+            try: idx = prev_ids.index(opid)
+            except ValueError: idx = -1
+            if idx > 0:
+                prev_op = prev_ops[idx - 1]
+                if (prev_op.completed_qty or 0) == 0:
+                    raise HTTPException(400,
+                        f"Нельзя начать: с участка «{prev_op.operation_type}» ещё не передано ни одной детали. "
+                        f"Сначала выполните списание на предыдущем участке.")
         n = now_msk()
         if op.status == "Пауза" and op.paused_at:
             pause_dur = int((n - op.paused_at).total_seconds() / 60)
@@ -2095,6 +2130,18 @@ def create_app():
                 ProductionOp.sequence, ProductionOp.sort_order
             ).all()
 
+            # Строим карту "предыдущей операции" для цепочки передачи деталей
+            # Группируем по component_template_id
+            comp_op_groups = {}
+            for op2 in ops_q:
+                gk2 = op2.component_template_id
+                if gk2 not in comp_op_groups: comp_op_groups[gk2] = []
+                comp_op_groups[gk2].append(op2)
+            prev_op_for_id = {}
+            for gk2, grp in comp_op_groups.items():
+                for ii, op2 in enumerate(grp):
+                    prev_op_for_id[op2.id] = grp[ii - 1] if ii > 0 else None
+
             # Последняя сборочная операция (без component_template_id) — именно с неё берём «Факт»
             last_asm_op_type = None
             for op in reversed(ops_q):
@@ -2124,6 +2171,7 @@ def create_app():
                 rn = op.resource.name if op.resource else "—"
                 act_key = (op.component_template_id, op.operation_type or "")
                 actual = act_dict.get(act_key, {"good": 0, "rejected": 0})
+                prev_op2 = prev_op_for_id.get(op.id)
                 planned_ops.append({
                     "seq": idx + 1,
                     "op_type": op.operation_type,
@@ -2135,7 +2183,10 @@ def create_app():
                     "status": op.status,
                     "component_name": pt_display(op.component_template) if op.component_template else None,
                     "component_id": op.component_template_id,
-                    "actual_resources": act_res_dict.get(act_key, [])
+                    "actual_resources": act_res_dict.get(act_key, []),
+                    # Передача деталей между участками
+                    "available_input": prev_op2.completed_qty if prev_op2 is not None else None,
+                    "prev_op_type": prev_op2.operation_type if prev_op2 is not None else None
                 })
             result.append({
                 "item_id": it.id, "order_id": it.order_id,
@@ -3766,7 +3817,7 @@ function pgOperations(c){
       '</div>'+
       '<div class="tbl-wrap"><table><thead><tr>'+
         '<th>↕</th><th>Заказ</th><th>Деталь / Компонент</th><th>Станок / Участок</th>'+
-        '<th>План</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th><th>Ст.</th><th></th>'+
+        '<th>План</th><th title="Поступило с предыдущего участка">📥 Вход</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th><th>Ст.</th><th></th>'+
       '</tr></thead><tbody>'+
       data.ops.map(function(o){
         var resCell=o.resource&&o.resource!=='—'
@@ -3793,13 +3844,33 @@ function pgOperations(c){
           '</td>'+
           '<td>'+resCell+'</td>'+
           '<td>'+o.planned_qty+'</td>'+
+          (function(){
+            // Колонка "Вход" — поступило с предыдущего участка
+            if(o.available_input==null) return '<td style="color:var(--text3);font-size:.8em" title="Первый участок — источник">—</td>';
+            var inp=o.available_input;
+            var remaining=Math.max(0,inp-(o.completed_qty||0)-(o.rejected_qty||0));
+            var color=inp===0?'var(--err)':remaining>0?'var(--acc)':'var(--ok)';
+            return '<td style="font-size:.82em" title="Поступило с «'+esc(o.prev_op_type||'')+'»">'+
+              '<span style="color:'+color+';font-weight:600">'+inp+'</span>'+
+              (remaining>0?'<div style="font-size:.78em;color:var(--text3)">→'+remaining+'</div>':'')+
+            '</td>';
+          })()+
           '<td>'+o.completed_qty+'</td>'+
           '<td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td>'+
           '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(o.estimated_min)+'</td>'+
           '<td>'+actualCell+'</td>'+
           '<td>'+statusBadge(o.status)+'</td>'+
           '<td style="white-space:nowrap">'+
-            (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
+            (function(){
+              // Кнопка старта: блокируем если есть предыдущий участок и нет деталей с него
+              if(o.status==='Ожидает'||o.status==='Запланирована'){
+                var blocked=o.available_input!=null&&o.available_input===0;
+                if(blocked)return '<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+                return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
+              }
+              if(o.status==='Пауза')return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
+              return '';
+            })()+
             (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
             ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
             (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)">↩</button>':'')+
@@ -3887,9 +3958,28 @@ function modalOpWriteoff(opid){
       var partNameWO=op.component_name||op.item||'—';
       var plannedWO=op.planned_qty||0;
       var completedWO=op.completed_qty||0;
-      var remainingWO=Math.max(0,plannedWO-completedWO);
+      var rejectedWO=op.rejected_qty||0;
+      // Если есть предыдущая операция — остаток считаем от неё; иначе от плана
+      var availInput=op.available_input;
+      var remainingWO;
+      if(availInput!=null){
+        remainingWO=Math.max(0,availInput-completedWO-rejectedWO);
+      } else {
+        remainingWO=Math.max(0,plannedWO-completedWO);
+      }
       var remainColor=remainingWO>0?'var(--acc)':'var(--ok)';
+      // Блок "поступило с предыдущего участка"
+      var prevOpBlock='';
+      if(availInput!=null){
+        var prevColor=availInput===0?'var(--err)':availInput>0?'var(--ok)':'var(--text3)';
+        prevOpBlock='<div class="info-box" style="background:rgba(34,197,94,.07);border-color:var(--ok);margin-bottom:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
+          '<span style="font-size:.82em;color:var(--text3)">📥 Получено с «'+esc(op.prev_op_type||'')+'»:</span>'+
+          '<span style="font-size:1em;font-weight:700;color:'+prevColor+'">'+availInput+' шт.</span>'+
+          (availInput===0?'<span style="font-size:.8em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 8px">⚠ нет деталей на входе</span>':'')+
+        '</div>';
+      }
       h+='<div class="section-hdr">🔩 Детали</div>'+
+        prevOpBlock+
         '<div class="info-box" style="background:rgba(99,102,241,.07);border-color:var(--acc);margin-bottom:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">'+
           '<span>📋 <strong>'+partNameWO+'</strong></span>'+
           '<span style="font-size:.85em;color:var(--text3)">план: <strong>'+plannedWO+'</strong></span>'+
@@ -4167,6 +4257,12 @@ function plOpClass(op){
 function plOpCell(op){
   var h='';
   var isOver=op.planned_qty>0&&op.completed_qty>op.planned_qty;
+  // Показываем поступившее с предыдущего участка
+  if(op.available_input!=null){
+    var inpColor=op.available_input===0?'var(--err)':op.available_input>0?'var(--ok)':'var(--text3)';
+    var inpTitle=op.prev_op_type?'с «'+op.prev_op_type+'»':'с предыдущего участка';
+    h+='<div style="font-size:.7em;color:var(--text3);margin-bottom:1px" title="'+inpTitle+'">📥<span style="font-weight:700;color:'+inpColor+'">'+op.available_input+'</span></div>';
+  }
   if(op.planned_qty>0){
     var pct=Math.round(op.completed_qty/op.planned_qty*100);
     if(isOver){
