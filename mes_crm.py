@@ -481,6 +481,7 @@ class WriteOff(Base):
     component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
     operation_type = Column(String(200), default="")
     group_id = Column(String(64), default="", nullable=True)
+    production_op_id = Column(Integer, ForeignKey("production_ops.id"), nullable=True)
     is_anomaly = Column(Boolean, default=False)
     anomaly_note = Column(Text, default="")
     is_cancelled = Column(Boolean, default=False)
@@ -676,6 +677,11 @@ def init_database():
             conn.execute(text("ALTER TABLE writeoffs ADD COLUMN group_id VARCHAR(64) DEFAULT ''"))
             conn.commit()
         log.info("Migration: added group_id to writeoffs")
+    if "production_op_id" not in wo_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE writeoffs ADD COLUMN production_op_id INTEGER REFERENCES production_ops(id)"))
+            conn.commit()
+        log.info("Migration: added production_op_id to writeoffs")
 
     # Миграция: таблицы пересорта
     if not insp.has_table("surplus_pool"):
@@ -2398,6 +2404,8 @@ def create_app():
             comp_tid = data.get("component_template_id")
             wo.component_template_id = comp_tid
             wo.operation_type = op_type
+            prod_op_id = data.get("production_op_id")
+            wo.production_op_id = prod_op_id
             is_anom, anom_note = check_sequence_anomaly(db, data["order_item_id"], data.get("resource_id"), good)
             wo.is_anomaly = is_anom; wo.anomaly_note = anom_note
             db.add(PartStationLog(order_item_id=data["order_item_id"], resource_id=data.get("resource_id"),
@@ -2410,6 +2418,12 @@ def create_app():
             if not comp_tid:
                 item = db.query(OrderItem).get(data["order_item_id"])
                 if item: item.completed_qty += good; item.rejected_qty += rej
+            # Обновляем счётчик конкретной производственной операции (чтобы "остаток" в модальном окне был актуальным)
+            if prod_op_id:
+                prod_op = db.query(ProductionOp).get(prod_op_id)
+                if prod_op:
+                    prod_op.completed_qty = (prod_op.completed_qty or 0) + good
+                    prod_op.rejected_qty = (prod_op.rejected_qty or 0) + rej
             audit(db, uid, "Списание деталей", "writeoff", 0,
                   f"+{good} годн +{rej} брак" + (f" ⚠ {anom_note}" if is_anom else ""))
         db.add(wo); db.flush(); db.commit()
@@ -2448,6 +2462,12 @@ def create_app():
                 if item:
                     item.completed_qty = max(0, item.completed_qty - wo.parts_good)
                     item.rejected_qty = max(0, item.rejected_qty - wo.parts_rejected)
+            # Откатываем счётчик конкретной производственной операции
+            if wo.production_op_id:
+                prod_op = db.query(ProductionOp).get(wo.production_op_id)
+                if prod_op:
+                    prod_op.completed_qty = max(0, (prod_op.completed_qty or 0) - wo.parts_good)
+                    prod_op.rejected_qty = max(0, (prod_op.rejected_qty or 0) - wo.parts_rejected)
             logs = db.query(PartStationLog).filter(
                 PartStationLog.order_item_id == wo.order_item_id,
                 PartStationLog.resource_id == wo.resource_id,
@@ -3647,12 +3667,24 @@ function pgOperations(c){
       '</div>'+
       '<div class="tbl-wrap"><table><thead><tr>'+
         '<th>↕</th><th>Заказ</th><th>Деталь / Компонент</th><th>Станок / Участок</th>'+
-        '<th>План</th><th>Гот</th><th>Брак</th><th>Время</th><th>Ст.</th><th></th>'+
+        '<th>План</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th><th>Ст.</th><th></th>'+
       '</tr></thead><tbody>'+
       data.ops.map(function(o){
         var resCell=o.resource&&o.resource!=='—'
           ?'<span style="font-size:.82em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.12);border-radius:3px;padding:1px 6px">📍'+o.resource+'</span>'
           :'<span style="color:var(--err);font-size:.8em;background:rgba(239,68,68,.1);border-radius:3px;padding:1px 6px">⚠ не назначен</span>';
+        // Фактическое время: завершена — берём actual_min; в работе — считаем на лету из started_at
+        var actualCell='<span style="color:var(--text3);font-size:.8em">—</span>';
+        if(o.status==='Завершена'&&o.actual_min!=null){
+          var over=o.estimated_min&&o.actual_min>o.estimated_min;
+          actualCell='<span style="font-size:.82em;font-weight:600;color:'+(over?'var(--err)':'var(--ok)')+'">'+fmtMinToH(o.actual_min)+(over?' ⚠':'')+'</span>';
+        } else if((o.status==='В работе'||o.status==='Пауза')&&o.started_at){
+          var elapsedMs=Date.now()-new Date(o.started_at).getTime();
+          var elapsedMin=Math.floor(elapsedMs/60000)-(o.total_pause_min||0);
+          if(elapsedMin<0)elapsedMin=0;
+          var over2=o.estimated_min&&elapsedMin>o.estimated_min;
+          actualCell='<span style="font-size:.82em;color:'+(over2?'var(--err)':'var(--info)')+'">'+fmtMinToH(elapsedMin)+(o.status==='В работе'?' 🔄':'')+(over2?' ⚠':'')+'</span>';
+        }
         return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)">'+
           '<td style="cursor:grab">☰</td>'+
           '<td style="font-size:.85em">'+(o.order_display||o.order_number)+'</td>'+
@@ -3664,7 +3696,8 @@ function pgOperations(c){
           '<td>'+o.planned_qty+'</td>'+
           '<td>'+o.completed_qty+'</td>'+
           '<td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td>'+
-          '<td style="font-size:.82em">'+fmtMinToH(o.estimated_min)+'</td>'+
+          '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(o.estimated_min)+'</td>'+
+          '<td>'+actualCell+'</td>'+
           '<td>'+statusBadge(o.status)+'</td>'+
           '<td style="white-space:nowrap">'+
             (o.status==='Ожидает'||o.status==='Запланирована'||o.status==='Пауза'?'<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>':'')+
@@ -3752,7 +3785,18 @@ function modalOpWriteoff(opid){
       h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов для этой операции</div>';
     }
     if(showParts){
+      var partNameWO=op.component_name||op.item||'—';
+      var plannedWO=op.planned_qty||0;
+      var completedWO=op.completed_qty||0;
+      var remainingWO=Math.max(0,plannedWO-completedWO);
+      var remainColor=remainingWO>0?'var(--acc)':'var(--ok)';
       h+='<div class="section-hdr">🔩 Детали</div>'+
+        '<div class="info-box" style="background:rgba(99,102,241,.07);border-color:var(--acc);margin-bottom:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">'+
+          '<span>📋 <strong>'+partNameWO+'</strong></span>'+
+          '<span style="font-size:.85em;color:var(--text3)">план: <strong>'+plannedWO+'</strong></span>'+
+          '<span style="font-size:.85em;color:var(--text3)">готово: <strong>'+completedWO+'</strong></span>'+
+          '<span style="font-size:.9em">остаток: <strong style="color:'+remainColor+';font-size:1.1em">'+remainingWO+' шт.</strong></span>'+
+        '</div>'+
         '<div class="form-row"><div><label>Годных</label><input type="number" id="fopwo_good" value="0" min="0"></div>'+
         '<div><label>Брак</label><input type="number" id="fopwo_rej" value="0" min="0"></div></div>';
     }
@@ -3797,6 +3841,7 @@ function submitOpWriteoff(opid,showMat,showParts){
         writeoff_type:'Детали',user_id:U.id,order_id:op.order_id,
         order_item_id:op.item_id,resource_id:effResId,group_id:gid,
         operation_type:op.type,parts_good:good,parts_rejected:rej,
+        production_op_id:opid,
         component_template_id:op.component_template_id||null,
         note:'['+op.type+'] '+note}))
     }
