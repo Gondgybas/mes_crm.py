@@ -1930,9 +1930,9 @@ def create_app():
                  "rejected_qty": o.rejected_qty,
                  "estimated_min": o.estimated_minutes, "actual_min": o.actual_minutes,
                  "started_at": o.started_at.isoformat() if o.started_at else None,
+                 "total_pause_min": o.total_pause_minutes or 0,
                  "completed_at": o.completed_at.isoformat() if o.completed_at else None,
-                 "paused_at": o.paused_at.isoformat() if o.paused_at else None,
-                 "total_pause_min": o.total_pause_minutes}
+                 "paused_at": o.paused_at.isoformat() if o.paused_at else None}
                 for o in q.order_by(ProductionOp.resource_id, ProductionOp.sort_order, ProductionOp.sequence).all()]
 
     @app.post("/api/operations/save")
