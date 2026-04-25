@@ -2290,6 +2290,7 @@ def create_app():
                  "user": w.user.full_name if w.user else "",
                  "resource": w.resource.name if w.resource else "",
                  "order_display": w.order.display_name if w.order else "",
+                 "customer": w.order.customer.name if w.order and w.order.customer else "",
                  "material": w.material.name if w.material else "",
                  "material_type": w.material.material_type if w.material else "",
                  "sheets": w.quantity_sheets, "kg": w.quantity_kg, "pcs": w.quantity_pcs,
@@ -4171,7 +4172,7 @@ function deleteSurplusEntry(sid){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
-var woFilter={order:'',op_type:'',resource:'',wtype:'',user:''};
+var woFilter={order:'',op_type:'',resource:'',wtype:'',user:'',customer:'',cancelled:''};
 window._woAllData=[];
 
 function pgWriteoffs(c){
@@ -4182,22 +4183,27 @@ function pgWriteoffs(c){
     var opTypes=uniq(allWos.map(function(w){return w.op_type}));
     var resources=uniq(allWos.map(function(w){return w.resource}));
     var users=uniq(allWos.map(function(w){return w.user}));
+    var customers=uniq(allWos.map(function(w){return w.customer}));
     var ordOpts=[{v:'',t:'Все заказы'}].concat(orders.map(function(v){return{v:v,t:v}}));
     var opOpts=[{v:'',t:'Все типы операций'}].concat(opTypes.map(function(v){return{v:v,t:v}}));
     var resOpts=[{v:'',t:'Все станки'}].concat(resources.map(function(v){return{v:v,t:v}}));
     var wtOpts=[{v:'',t:'Все'},{v:'Материал',t:'📦 Материал'},{v:'Детали',t:'🔩 Детали'},{v:'Материал+Детали',t:'📦🔩 Мат+Дет'}];
     var usrOpts=[{v:'',t:'Все операторы'}].concat(users.map(function(v){return{v:v,t:v}}));
+    var custOpts=[{v:'',t:'Все заказчики'}].concat(customers.map(function(v){return{v:v,t:v}}));
+    var statusOpts=[{v:'',t:'Все'},{v:'active',t:'✅ Действующие'},{v:'cancelled',t:'↩ Отменённые'}];
     function refilter(){var el=document.getElementById('wo_table_area');if(el)woFillTable(el)}
     c.innerHTML='<div class="toolbar"><span class="spacer"></span>'+
       '<span id="wo_count_badge" style="font-size:.85em;color:var(--text2)"></span>'+
       '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
       '<div class="filter-bar" style="flex-wrap:wrap;row-gap:6px;gap:10px">'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказ:</label><div style="min-width:170px">'+SS('wf_order',ordOpts,woFilter.order,'Все заказы',function(v){woFilter.order=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип операции:</label><div style="min-width:170px">'+SS('wf_optype',opOpts,woFilter.op_type,'Все типы',function(v){woFilter.op_type=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Станок:</label><div style="min-width:160px">'+SS('wf_res',resOpts,woFilter.resource,'Все станки',function(v){woFilter.resource=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип списания:</label><div style="min-width:150px">'+SS('wf_wtype',wtOpts,woFilter.wtype,'Все',function(v){woFilter.wtype=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Оператор:</label><div style="min-width:150px">'+SS('wf_user',usrOpts,woFilter.user,'Все',function(v){woFilter.user=v;refilter()})+'</div></div>'+
-        '<button class="btn sm" onclick="woFilter={order:\'\',op_type:\'\',resource:\'\',wtype:\'\',user:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказчик:</label><div style="min-width:160px">'+SS('wf_cust',custOpts,woFilter.customer,'Все',function(v){woFilter.customer=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказ:</label><div style="min-width:160px">'+SS('wf_order',ordOpts,woFilter.order,'Все заказы',function(v){woFilter.order=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип операции:</label><div style="min-width:160px">'+SS('wf_optype',opOpts,woFilter.op_type,'Все типы',function(v){woFilter.op_type=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Станок:</label><div style="min-width:150px">'+SS('wf_res',resOpts,woFilter.resource,'Все станки',function(v){woFilter.resource=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип списания:</label><div style="min-width:140px">'+SS('wf_wtype',wtOpts,woFilter.wtype,'Все',function(v){woFilter.wtype=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Оператор:</label><div style="min-width:140px">'+SS('wf_user',usrOpts,woFilter.user,'Все',function(v){woFilter.user=v;refilter()})+'</div></div>'+
+        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Статус:</label><div style="min-width:140px">'+SS('wf_status',statusOpts,woFilter.cancelled,'Все',function(v){woFilter.cancelled=v;refilter()})+'</div></div>'+
+        '<button class="btn sm" onclick="woFilter={order:\'\',op_type:\'\',resource:\'\',wtype:\'\',user:\'\',customer:\'\',cancelled:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
       '</div>'+
       '<div id="wo_table_area"></div>';
     refilter();
@@ -4207,6 +4213,7 @@ function pgWriteoffs(c){
 function woFillTable(el){
   var allWos=window._woAllData||[];
   var wos=allWos;
+  if(woFilter.customer)wos=wos.filter(function(w){return w.customer===woFilter.customer});
   if(woFilter.order)wos=wos.filter(function(w){return w.order_display===woFilter.order});
   if(woFilter.op_type)wos=wos.filter(function(w){return w.op_type===woFilter.op_type});
   if(woFilter.resource)wos=wos.filter(function(w){return w.resource===woFilter.resource});
@@ -4217,6 +4224,8 @@ function woFillTable(el){
     return true;
   });
   if(woFilter.user)wos=wos.filter(function(w){return w.user===woFilter.user});
+  if(woFilter.cancelled==='active')wos=wos.filter(function(w){return !w.is_cancelled});
+  if(woFilter.cancelled==='cancelled')wos=wos.filter(function(w){return w.is_cancelled});
   var badge=document.getElementById('wo_count_badge');
 
   // ── Группировка строго по group_id: только пары с одинаковым непустым group_id ──
@@ -4249,7 +4258,7 @@ function woFillTable(el){
   if(!rows.length){el.innerHTML='<div class="info-box">Нет записей по выбранным фильтрам</div>';return}
 
   el.innerHTML='<div class="tbl-wrap"><table><thead><tr>'+
-    '<th>Дата</th><th>Тип</th><th>Заказ</th><th>Деталь</th>'+
+    '<th>Дата</th><th>Тип</th><th>Заказчик</th><th>Заказ</th><th>Деталь</th>'+
     '<th title="Годных">Годн.</th><th title="Брак">Брак</th><th>Тип операции</th>'+
     '<th>Материал</th><th>Л</th><th>Кг</th>'+
     '<th>Станок</th><th>Оператор</th><th>Прим.</th><th></th>'+
@@ -4279,6 +4288,7 @@ function woFillTable(el){
     return '<tr class="'+(cancelled?'cancelled-row':anomaly?'anomaly':'')+'">'+
       '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(w.date)+'</td>'+
       '<td>'+typeBadge+'</td>'+
+      '<td style="font-size:.82em;color:var(--text2)">'+(w.customer?esc(w.customer):'<span style="color:var(--text3)">—</span>')+'</td>'+
       '<td style="font-size:.85em">'+(w.order_display||'—')+'</td>'+
       '<td>'+partCell+'</td>'+
       '<td>'+(partsW&&(partsW.parts_good||partsW.parts_rejected)?partsW.parts_good:'<span style="color:var(--text3)">—</span>')+'</td>'+
