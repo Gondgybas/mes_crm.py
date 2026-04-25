@@ -321,7 +321,7 @@ class Resource(Base):
         return self.shift_hours * 60 * self.shifts_per_day
 
 
-ORDER_STATUSES = ["Черновик", "Новый", "Ожидает", "В работе", "Завершён", "Отгружен", "Отменён", "Приостановлен"]
+ORDER_STATUSES = ["Черновик", "Новый", "Ожидает", "В работе", "Завершён", "Отменён", "Приостановлен"]
 PRIORITIES = ["Низкий", "Обычный", "Высокий", "Срочный", "Критический"]
 
 
@@ -339,6 +339,7 @@ class Order(Base):
     created_at = Column(DateTime, default=now_msk)
     updated_at = Column(DateTime, default=now_msk, onupdate=now_msk)
     completed_at = Column(DateTime, nullable=True)
+    ship_status = Column(String(50), nullable=True, default=None)
     customer = relationship("Customer", back_populates="orders")
     items = relationship("OrderItem", back_populates="order", cascade="all, delete-orphan")
     operations = relationship("ProductionOp", back_populates="order", cascade="all, delete-orphan")
@@ -352,7 +353,8 @@ class Order(Base):
 
     @property
     def is_overdue(self):
-        if self.deadline and self.status not in ("Завершён", "Отменён", "Отгружен"):
+        if self.deadline and self.status not in ("Завершён", "Отменён") \
+                and self.ship_status != "Отгружен":
             return now_msk() > self.deadline
         return False
 
@@ -538,6 +540,21 @@ class SurplusLog(Base):
     user = relationship("User")
 
 
+class ShipmentLog(Base):
+    """Журнал отгрузок готовых изделий."""
+    __tablename__ = "shipment_logs"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False, index=True)
+    order_item_id = Column(Integer, ForeignKey("order_items.id"), nullable=False, index=True)
+    quantity = Column(Integer, nullable=False, default=0)
+    note = Column(Text, default="")
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=now_msk)
+    order = relationship("Order")
+    order_item = relationship("OrderItem")
+    user = relationship("User")
+
+
 engine = create_engine(DB_URL, echo=False, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
@@ -593,6 +610,7 @@ DEFAULT_PERMS = [
     ("res.view", "Просмотр станков", "Станки"), ("res.create", "Создание станков", "Станки"),
     ("res.edit", "Редактирование станков", "Станки"), ("res.delete", "Удаление станков", "Станки"),
     ("load.view", "Загруженность", "Загруженность"),
+    ("ship.view", "Просмотр отгрузок", "Отгрузка"), ("ship.create", "Создание отгрузок", "Отгрузка"),
     ("admin.users", "Пользователи", "Админ"), ("admin.roles", "Роли", "Админ"),
     ("admin.grades", "Марки металла", "Админ"), ("admin.categories", "Категории склада", "Админ"),
     ("admin.logs", "Логи", "Админ"), ("admin.op_types", "Типы операций", "Админ"),
@@ -601,7 +619,8 @@ DEFAULT_PERMS = [
 ALL_P = [p[0] for p in DEFAULT_PERMS]
 MASTER_P = [p for p in ALL_P if not p.startswith("admin.")]
 OPER_P = ["mat.view", "mat.consume", "order.view", "reserve.view", "op.view", "op.start", "op.complete",
-           "parts.view", "parts.log", "parts.files", "writeoff.material", "writeoff.parts", "res.view", "load.view"]
+           "parts.view", "parts.log", "parts.files", "writeoff.material", "writeoff.parts", "res.view", "load.view",
+           "ship.view", "ship.create"]
 VIEW_P = ["mat.view", "order.view", "op.view", "parts.view", "parts.files", "cust.view", "res.view", "load.view", "admin.logs"]
 ROLE_LABELS = {"admin": "Администратор", "master": "Мастер", "operator": "Оператор", "viewer": "Наблюдатель"}
 
@@ -683,6 +702,21 @@ def init_database():
             conn.commit()
         log.info("Migration: added production_op_id to writeoffs")
 
+    # Миграция: ship_status в orders
+    ord_cols = [c["name"] for c in insp.get_columns("orders")]
+    if "ship_status" not in ord_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE orders ADD COLUMN ship_status VARCHAR(50) DEFAULT NULL"))
+            # Переносим старые статусы отгрузки из основного статуса в ship_status
+            conn.execute(text(
+                "UPDATE orders SET ship_status='Отгружен', status='В работе' WHERE status='Отгружен'"
+            ))
+            conn.execute(text(
+                "UPDATE orders SET ship_status='Частично отгружен', status='В работе' WHERE status='Частично отгружен'"
+            ))
+            conn.commit()
+        log.info("Migration: added ship_status to orders (and migrated old ship statuses)")
+
     # Миграция: таблицы пересорта
     if not insp.has_table("surplus_pool"):
         Base.metadata.tables["surplus_pool"].create(engine)
@@ -690,6 +724,9 @@ def init_database():
     if not insp.has_table("surplus_logs"):
         Base.metadata.tables["surplus_logs"].create(engine)
         log.info("Migration: created surplus_logs table")
+    if not insp.has_table("shipment_logs"):
+        Base.metadata.tables["shipment_logs"].create(engine)
+        log.info("Migration: created shipment_logs table")
 
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
@@ -1604,7 +1641,7 @@ def create_app():
         return [{"id": o.id, "number": o.order_number,
                  "customer": o.customer.name if o.customer else "—",
                  "customer_id": o.customer_id, "display": o.display_name,
-                 "overdue": o.is_overdue, "status": o.status, "priority": o.priority,
+                 "overdue": o.is_overdue, "status": o.status, "ship_status": o.ship_status or "", "priority": o.priority,
                  "total_amount": o.total_amount, "description": o.description, "notes": o.notes,
                  "deadline": o.deadline.isoformat() if o.deadline else None,
                  "completed_at": o.completed_at.isoformat() if o.completed_at else None,
@@ -2956,6 +2993,111 @@ def create_app():
         ).order_by(func.date(PartStationLog.created_at)).all()
         return [{"day": str(r.day), "good": int(r.good or 0), "rejected": int(r.rejected or 0)} for r in rows]
 
+    # ─── Shipment / Отгрузка ────────────────────────
+    @app.get("/api/ready-to-ship")
+    def api_ready_to_ship(db: Session = Depends(db_dep)):
+        """Изделия, готовые к отгрузке: прошли все операции, ещё не отгружены полностью."""
+        items = db.query(OrderItem).options(
+            joinedload(OrderItem.order).joinedload(Order.customer),
+            joinedload(OrderItem.part_template)
+        ).join(Order).filter(
+            Order.status.notin_(["Отменён"])
+        ).all()
+        # Суммируем отгрузки по order_item_id
+        ship_rows = db.query(
+            ShipmentLog.order_item_id,
+            func.sum(ShipmentLog.quantity).label("total")
+        ).group_by(ShipmentLog.order_item_id).all()
+        ship_totals = {r.order_item_id: int(r.total or 0) for r in ship_rows}
+        result = []
+        for it in items:
+            pt = it.part_template
+            if not pt: continue
+            # Последняя сборочная операция (component_template_id IS NULL)
+            last_op = db.query(ProductionOp).filter(
+                ProductionOp.order_item_id == it.id,
+                ProductionOp.component_template_id.is_(None)
+            ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
+            if not last_op: continue  # нет операций — пропускаем
+            completed_qty = last_op.completed_qty or 0
+            shipped_qty = ship_totals.get(it.id, 0)
+            available_to_ship = max(0, completed_qty - shipped_qty)
+            remaining_to_order = max(0, it.quantity - shipped_qty)
+            if completed_qty == 0 and shipped_qty == 0: continue
+            result.append({
+                "item_id": it.id,
+                "order_id": it.order_id,
+                "order_number": it.order.order_number if it.order else "",
+                "order_display": it.order.display_name if it.order else "",
+                "order_status": it.order.status if it.order else "",
+                "order_ship_status": (it.order.ship_status or "") if it.order else "",
+                "customer": it.order.customer.name if it.order and it.order.customer else "—",
+                "part_name": pt_display(pt),
+                "is_assembly": pt.is_assembly if pt else False,
+                "quantity": it.quantity,
+                "completed_qty": completed_qty,
+                "shipped_qty": shipped_qty,
+                "available_to_ship": available_to_ship,
+                "remaining_to_order": remaining_to_order
+            })
+        result.sort(key=lambda x: (-x["available_to_ship"], x["order_number"]))
+        return result
+
+    @app.post("/api/ship")
+    async def api_do_ship(request: Request, db: Session = Depends(db_dep)):
+        """Отгрузить партию готовых изделий."""
+        data = await request.json()
+        item_id = int(data.get("order_item_id", 0))
+        qty = int(data.get("quantity", 0))
+        uid = data.get("user_id", 1)
+        note = data.get("note", "")
+        if qty <= 0: raise HTTPException(400, "Количество должно быть больше 0")
+        item = db.query(OrderItem).get(item_id)
+        if not item: raise HTTPException(404, "Позиция не найдена")
+        # Проверяем доступное количество
+        last_op = db.query(ProductionOp).filter(
+            ProductionOp.order_item_id == item_id,
+            ProductionOp.component_template_id.is_(None)
+        ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
+        completed = (last_op.completed_qty or 0) if last_op else 0
+        shipped_total = db.query(func.sum(ShipmentLog.quantity)).filter(
+            ShipmentLog.order_item_id == item_id).scalar() or 0
+        available = max(0, completed - shipped_total)
+        if qty > available:
+            raise HTTPException(400, f"Нельзя отгрузить {qty} шт. — доступно только {available} шт.")
+        # Создаём запись отгрузки
+        slog = ShipmentLog(order_id=item.order_id, order_item_id=item_id,
+                           quantity=qty, note=note, user_id=uid)
+        db.add(slog); db.flush()
+        # Обновляем статус отгрузки заказа (ship_status — независимая метка, не меняет основной статус)
+        order = db.query(Order).get(item.order_id)
+        if order:
+            all_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
+            total_ordered = sum(i.quantity or 0 for i in all_items)
+            new_shipped = (db.query(func.sum(ShipmentLog.quantity)).filter(
+                ShipmentLog.order_id == order.id).scalar() or 0)
+            if total_ordered > 0:
+                if new_shipped >= total_ordered:
+                    order.ship_status = "Отгружен"
+                elif new_shipped > 0:
+                    order.ship_status = "Частично отгружен"
+                else:
+                    order.ship_status = None
+        audit(db, uid, "Отгрузка", "order_item", item_id,
+              f"+{qty} шт. — {pt_display(item.part_template)}")
+        db.flush(); db.commit()
+        return {"status": "ok", "shipped": qty}
+
+    @app.get("/api/shipment-logs/{order_item_id}")
+    def api_shipment_logs_by_item(order_item_id: int, db: Session = Depends(db_dep)):
+        """История отгрузок по позиции заказа."""
+        logs = db.query(ShipmentLog).options(joinedload(ShipmentLog.user)).filter(
+            ShipmentLog.order_item_id == order_item_id
+        ).order_by(ShipmentLog.created_at.desc()).all()
+        return [{"id": l.id, "quantity": l.quantity, "note": l.note,
+                 "user": l.user.full_name if l.user else "—",
+                 "date": l.created_at.isoformat()} for l in logs]
+
     # ─── Logs ───────────────────────────────────────
     @app.get("/api/logs")
     def api_logs(limit: int = 300, action: str = "", user_id: int = 0, db: Session = Depends(db_dep)):
@@ -3222,9 +3364,11 @@ function fmtMoney(n){return n?Number(n).toLocaleString('ru-RU',{minimumFractionD
 function fmtMinToH(m){if(!m&&m!==0)return'—';var h=Math.floor(m/60);var mn=m%60;return h+'ч '+mn+'м'}
 function toggleTheme(){document.body.classList.toggle('light',document.getElementById('themeCtl').value==='light')}
 function refreshPage(){loadPage(curPage)}
-function statusBadge(s){var m={'Черновик':'b-gray','Новый':'b-info','Ожидает':'b-purple','В работе':'b-warn','Завершён':'b-ok','Отгружен':'b-ok','Отменён':'b-err','Приостановлен':'b-gray','Запланирована':'b-purple','Завершена':'b-ok','Частично':'b-warn','Пауза':'b-gray','Низкий':'b-gray','Обычный':'b-info','Высокий':'b-warn','Срочный':'b-err','Критический':'b-err'};return '<span class="badge '+(m[s]||'b-gray')+'">'+s+'</span>'}
+function statusBadge(s){var m={'Черновик':'b-gray','Новый':'b-info','Ожидает':'b-purple','В работе':'b-warn','Завершён':'b-ok','Отгружен':'b-ok','Частично отгружен':'b-warn','Отменён':'b-err','Приостановлен':'b-gray','Запланирована':'b-purple','Завершена':'b-ok','Частично':'b-warn','Пауза':'b-gray','Низкий':'b-gray','Обычный':'b-info','Высокий':'b-warn','Срочный':'b-err','Критический':'b-err'};return '<span class="badge '+(m[s]||'b-gray')+'">'+s+'</span>'}
+function shipBadge(s){if(!s)return '';var cls=s==='Отгружен'?'b-ok':'b-warn';return '<span class="badge '+cls+'" title="Статус отгрузки" style="margin-left:3px">🚚 '+s+'</span>';}
 function esc(s){return(s||'').replace(/'/g,"\\'").replace(/"/g,'&quot;')}
-var STATUSES=['Черновик','Новый','Ожидает','В работе','Завершён','Отгружен','Отменён','Приостановлен'];
+var STATUSES=['Черновик','Новый','Ожидает','В работе','Завершён','Отменён','Приостановлен'];
+var SHIP_STATUSES=['Частично отгружен','Отгружен'];
 var PRIORITIES=['Низкий','Обычный','Высокий','Срочный','Критический'];
 
 // ═══ Auth ═══
@@ -3239,7 +3383,8 @@ function connectWS(){try{var p=location.protocol==='https:'?'wss':'ws';ws=new We
 var PAGES=[{id:'dashboard',icon:'📊',label:'Панель',perm:null},{id:'orders',icon:'📋',label:'Заказы',perm:'order.view'},
   {id:'parts_db',icon:'🔩',label:'Детали: БД',perm:'parts.view'},{id:'warehouse',icon:'📦',label:'Склад',perm:'mat.view'},
   {id:'operations',icon:'🔧',label:'Операции',perm:'op.view'},{id:'reservations',icon:'🔒',label:'Резервы',perm:'reserve.view'},
-  {id:'parts_log',icon:'📝',label:'Учёт деталей',perm:'parts.log'},{id:'writeoffs',icon:'📤',label:'Списания',perm:'writeoff.material'},
+  {id:'parts_log',icon:'📝',label:'Учёт деталей',perm:'parts.log'},{id:'ready_to_ship',icon:'🚚',label:'Отгрузка',perm:'ship.view'},
+  {id:'writeoffs',icon:'📤',label:'Списания',perm:'writeoff.material'},
   {id:'load',icon:'📈',label:'Загруженность',perm:'load.view'},{id:'customers',icon:'🏢',label:'Клиенты',perm:'cust.view'},
   {id:'resources',icon:'🏭',label:'Станки',perm:'res.view'},{id:'logs',icon:'📜',label:'Логи',perm:'admin.logs'},
   {id:'settings',icon:'⚙',label:'Настройки',perm:'admin.users'}];
@@ -3250,6 +3395,7 @@ function loadPage(p){var c=document.getElementById('mainContent');try{switch(p){
   case'dashboard':pgDashboard(c);break;case'orders':pgOrders(c);break;case'parts_db':pgPartsDB(c);break;
   case'warehouse':pgWarehouse(c);break;case'operations':pgOperations(c);break;case'reservations':pgReservations(c);break;
   case'parts_log':pgPartsLog(c);break;case'writeoffs':pgWriteoffs(c);break;case'load':pgLoad(c);break;
+  case'ready_to_ship':pgReadyToShip(c);break;
   case'customers':pgCustomers(c);break;case'resources':pgResources(c);break;case'logs':pgLogs(c);break;
   case'settings':pgSettings(c);break;default:c.innerHTML='<p>Не найдено</p>'}}catch(e){c.innerHTML='<p style="color:var(--err)">Ошибка: '+e.message+'</p>';console.error(e)}}
 
@@ -3289,10 +3435,11 @@ function dashDetail(w){api('/api/analytics/dashboard/detail/'+w).then(function(d
   h+='</tbody></table></div><div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ЗАКАЗЫ ═══
-var ordFilter={status:'',priority:'',search:'',overdue:false};var ordSearchTimer=null;
+var ordFilter={status:'',priority:'',search:'',overdue:false,ship_status:''};var ordSearchTimer=null;
 function pgOrders(c){api('/api/orders').then(function(allOrders){
   var orders=allOrders;
   if(ordFilter.status)orders=orders.filter(function(o){return o.status===ordFilter.status});
+  if(ordFilter.ship_status)orders=orders.filter(function(o){return o.ship_status===ordFilter.ship_status});
   if(ordFilter.priority)orders=orders.filter(function(o){return o.priority===ordFilter.priority});
   if(ordFilter.overdue)orders=orders.filter(function(o){return o.overdue});
   if(ordFilter.search){var sq=ordFilter.search.toLowerCase();orders=orders.filter(function(o){return o.number.toLowerCase().indexOf(sq)>=0||(o.customer||'').toLowerCase().indexOf(sq)>=0||(o.description||'').toLowerCase().indexOf(sq)>=0})}
@@ -3306,15 +3453,17 @@ function pgOrders(c){api('/api/orders').then(function(allOrders){
     '<label>Поиск:</label><input id="ordSearchInp" style="width:200px" placeholder="№, клиент, описание..." value="'+esc(ordFilter.search)+'">'+
     '<label>Статус:</label><select onchange="ordFilter.status=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
       '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(ordFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
+    '<label>Отгрузка:</label><select onchange="ordFilter.ship_status=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
+      '<option value="">Все</option>'+SHIP_STATUSES.map(function(s){return '<option '+(ordFilter.ship_status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
     '<label>Приоритет:</label><select onchange="ordFilter.priority=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
       '<option value="">Все</option>'+PRIORITIES.map(function(p){return '<option '+(ordFilter.priority===p?'selected':'')+'>'+p+'</option>'}).join('')+'</select>'+
     (overdueCnt>0?'<button class="btn sm '+(ordFilter.overdue?'primary warn':'')+'" onclick="ordFilter.overdue=!ordFilter.overdue;pgOrders(document.getElementById(\'mainContent\'))">⚠ Просроч. ('+overdueCnt+')</button>':'')+
-    '<button class="btn sm" onclick="ordFilter={status:\'\',priority:\'\',search:\'\',overdue:false};pgOrders(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
+    '<button class="btn sm" onclick="ordFilter={status:\'\',priority:\'\',search:\'\',overdue:false,ship_status:\'\'};pgOrders(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
   '</div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>№</th><th>Клиент</th><th>Описание</th><th>Сумма</th><th>Поз.</th><th>Приор.</th><th>Статус</th><th>Дедлайн</th><th>Заверш.</th><th>📎</th><th></th></tr></thead>'+
   '<tbody>'+(orders.length?orders.map(function(o){return '<tr '+(o.overdue?'class="overdue-row"':'')+'>'+
     '<td><strong>'+o.number+'</strong></td><td>'+o.customer+'</td><td title="'+esc(o.description)+'">'+(o.description||'').substring(0,35)+'</td>'+
-    '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td><td>'+statusBadge(o.priority)+'</td><td>'+statusBadge(o.status)+'</td>'+
+    '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td><td>'+statusBadge(o.priority)+'</td><td>'+statusBadge(o.status)+shipBadge(o.ship_status)+'</td>'+
     '<td '+(o.overdue?'class="low"':'')+'>'+fmtD(o.deadline)+(o.overdue?' ⚠':'')+'</td>'+
     '<td>'+fmtD(o.completed_at)+'</td>'+
     '<td>'+((o.files||[]).length?'📎'+(o.files||[]).length:'—')+'</td>'+
@@ -3384,7 +3533,7 @@ function modalOrderDetail(oid){
     return [{v:'',t:'— не назначен —'}].concat(filtered.map(function(r){return{v:String(r.id),t:r.name}}));
   }
   openModal('<h2>📋 '+o.number+' — '+o.customer+'</h2>'+
-  '<div class="info-box">'+statusBadge(o.priority)+' '+statusBadge(o.status)+(o.overdue?' <span class="low">⚠ ПРОСРОЧЕН</span>':'')+' | Дедлайн: '+fmtD(o.deadline)+' | Сумма: '+fmtMoney(o.total_amount)+
+  '<div class="info-box">'+statusBadge(o.priority)+' '+statusBadge(o.status)+shipBadge(o.ship_status)+(o.overdue?' <span class="low">⚠ ПРОСРОЧЕН</span>':'')+' | Дедлайн: '+fmtD(o.deadline)+' | Сумма: '+fmtMoney(o.total_amount)+
     (o.completed_at?' | <strong>Завершён:</strong> '+fmtDT(o.completed_at):'')+
     '<br>'+(o.description||'')+'</div>'+
   '<div class="section-hdr">Позиции '+(hasPerm('order.edit')?'<button class="btn sm" onclick="modalAddItem('+oid+','+(o.customer_id||0)+')">+ Добавить</button>':'')+'</div>'+
@@ -4541,6 +4690,113 @@ function deleteSurplusEntry(sid){
   api('/api/surplus-pool/delete/'+sid,'POST',{note:note,user_id:U.id}).then(function(){
     toast('Удалено','ok');modalSurplusPool()
   }).catch(function(e){toast(e.message,'err')})}
+
+// ═══ ОТГРУЗКА ═══
+var shipFilter={order:'',customer:'',status:''};
+function pgReadyToShip(c){
+  api('/api/ready-to-ship').then(function(data){
+    var filtered=data;
+    if(shipFilter.order)filtered=filtered.filter(function(d){return(d.order_display||d.order_number).toLowerCase().indexOf(shipFilter.order.toLowerCase())>=0});
+    if(shipFilter.customer)filtered=filtered.filter(function(d){return(d.customer||'').toLowerCase().indexOf(shipFilter.customer.toLowerCase())>=0});
+    if(shipFilter.status)filtered=filtered.filter(function(d){return d.order_ship_status===shipFilter.status});
+
+    var totalReady=filtered.reduce(function(s,d){return s+d.available_to_ship},0);
+    var totalShipped=filtered.reduce(function(s,d){return s+d.shipped_qty},0);
+
+    c.innerHTML='<div class="toolbar">'+
+      '<div class="info-box" style="margin:0;padding:6px 14px;display:flex;gap:18px">'+
+        '<span>🚚 <strong>Готово к отгрузке:</strong> <span style="color:var(--ok);font-weight:700">'+totalReady+'</span> шт.</span>'+
+        '<span>✅ <strong>Уже отгружено:</strong> <span style="color:var(--text2)">'+totalShipped+'</span> шт.</span>'+
+      '</div><span class="spacer"></span></div>'+
+      '<div class="filter-bar">'+
+        '<label>Заказчик:</label><input id="shipFiltCust" style="width:160px" value="'+esc(shipFilter.customer||'')+'" placeholder="Фильтр...">'+
+        '<label>Заказ:</label><input id="shipFiltOrd" style="width:160px" value="'+esc(shipFilter.order||'')+'" placeholder="Фильтр...">'+
+        '<label>Статус отгрузки:</label><select id="shipFiltStatus" onchange="shipFilter.status=this.value;pgReadyToShip(document.getElementById(\'mainContent\'))">'+
+          '<option value="">Все</option>'+
+          ['Частично отгружен','Отгружен'].map(function(s){return'<option value="'+s+'" '+(shipFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+
+        '</select>'+
+      '</div>'+
+      (filtered.length===0
+        ?'<div class="info-box">Нет готовых изделий к отгрузке</div>'
+        :'<div class="tbl-wrap"><table><thead><tr>'+
+          '<th>Заказчик</th><th>Заказ</th><th>Деталь / Изделие</th>'+
+          '<th style="text-align:center">По заказу</th>'+
+          '<th style="text-align:center">Готово к отгрузке</th>'+
+          '<th style="text-align:center">Отгружено</th>'+
+          '<th style="text-align:center">Остаток отгрузить</th>'+
+          '<th>Статус</th><th></th>'+
+        '</tr></thead><tbody>'+
+        filtered.map(function(d){
+          var avail=d.available_to_ship;
+          var shipped=d.shipped_qty;
+          var remaining=d.remaining_to_order;
+          var availColor=avail>0?'var(--ok)':'var(--text3)';
+          var remColor=remaining>0?'var(--warn)':'var(--ok)';
+          var shippedColor=shipped>0?'var(--info)':'var(--text3)';
+          var completeAll=remaining<=0&&shipped>0;
+          return '<tr style="'+(completeAll?'opacity:.7':'')+'">'+
+            '<td style="font-size:.85em">'+esc(d.customer)+'</td>'+
+            '<td style="font-size:.85em"><strong>'+esc(d.order_display||d.order_number)+'</strong></td>'+
+            '<td>'+(d.is_assembly?'🔧 ':'🔩 ')+'<strong>'+esc(d.part_name)+'</strong></td>'+
+            '<td style="text-align:center">'+d.quantity+'</td>'+
+            '<td style="text-align:center"><span style="font-weight:700;font-size:1.05em;color:'+availColor+'">'+avail+'</span></td>'+
+            '<td style="text-align:center"><span style="color:'+shippedColor+';font-weight:600">'+shipped+'</span></td>'+
+            '<td style="text-align:center"><span style="color:'+remColor+';font-weight:600">'+remaining+'</span></td>'+
+            '<td>'+statusBadge(d.order_status)+shipBadge(d.order_ship_status)+'</td>'+
+            '<td style="white-space:nowrap">'+
+              (avail>0&&hasPerm('ship.create')?'<button class="btn sm ok" onclick="modalShip('+d.item_id+',\''+esc(d.part_name)+'\','+avail+','+d.quantity+','+shipped+')">🚚 Отгрузить</button>':'')+ 
+              ' <button class="btn sm" style="font-size:.72em" onclick="modalShipHistory('+d.item_id+',\''+esc(d.part_name)+'\')">📋</button>'+
+            '</td>'+
+          '</tr>';
+        }).join('')+'</tbody></table></div>'
+      );
+    // Фильтр-инпуты
+    var ci=document.getElementById('shipFiltCust');
+    if(ci){ci.addEventListener('input',function(){shipFilter.customer=this.value;clearTimeout(ci._t);ci._t=setTimeout(function(){pgReadyToShip(document.getElementById('mainContent'))},400)})}
+    var oi=document.getElementById('shipFiltOrd');
+    if(oi){oi.addEventListener('input',function(){shipFilter.order=this.value;clearTimeout(oi._t);oi._t=setTimeout(function(){pgReadyToShip(document.getElementById('mainContent'))},400)})}
+  }).catch(function(e){document.getElementById('mainContent').innerHTML='<div class="info-box" style="color:var(--err)">Ошибка: '+e.message+'</div>'})}
+
+function modalShip(itemId,partName,availQty,orderQty,shippedQty){
+  openModal('<h2>🚚 Отгрузка</h2>'+
+    '<div class="info-box" style="margin-bottom:10px">'+
+      '<div><strong>'+(partName||'—')+'</strong></div>'+
+      '<div style="font-size:.85em;margin-top:6px;display:flex;gap:16px;flex-wrap:wrap">'+
+        '<span>📋 По заказу: <strong>'+orderQty+'</strong></span>'+
+        '<span style="color:var(--ok)">✅ Готово к отгрузке: <strong>'+availQty+'</strong></span>'+
+        '<span style="color:var(--info)">📦 Уже отгружено: <strong>'+shippedQty+'</strong></span>'+
+      '</div>'+
+    '</div>'+
+    '<div class="form-row"><div><label>Количество к отгрузке</label>'+
+      '<input type="number" id="fship_qty" min="1" max="'+availQty+'" value="'+availQty+'" style="font-size:1.2em;font-weight:700;width:140px">'+
+    '</div><div><label>Макс. доступно</label><div style="font-size:1.4em;font-weight:700;color:var(--ok);padding-top:6px">'+availQty+' шт.</div></div></div>'+
+    '<div class="form-row full"><div><label>Примечание</label><input id="fship_note" placeholder="Номер накладной, перевозчик, прочее..."></div></div>'+
+    '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+      '<button class="btn primary" onclick="submitShip('+itemId+','+availQty+')">🚚 Отгрузить</button></div>')}
+
+function submitShip(itemId,maxQty){
+  var qty=+document.getElementById('fship_qty').value;
+  var note=(document.getElementById('fship_note')||{}).value||'';
+  if(!qty||qty<=0){toast('Укажите количество','err');return}
+  if(qty>maxQty){toast('Нельзя отгрузить больше '+maxQty+' шт.','err');return}
+  api('/api/ship','POST',{order_item_id:itemId,quantity:qty,note:note,user_id:U.id}).then(function(r){
+    closeModal();toast('Отгружено: '+r.shipped+' шт.','ok');refreshPage()
+  }).catch(function(e){toast(e.message,'err')})}
+
+function modalShipHistory(itemId,partName){
+  api('/api/shipment-logs/'+itemId).then(function(logs){
+    var h='<h2>📋 История отгрузок: '+esc(partName)+'</h2>'+
+      (logs.length
+        ?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th style="text-align:center">Кол-во</th><th>Кто</th><th>Прим.</th></tr></thead><tbody>'+
+          logs.map(function(l){return '<tr>'+
+            '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(l.date)+'</td>'+
+            '<td style="text-align:center;font-weight:700;color:var(--ok)">'+l.quantity+' шт.</td>'+
+            '<td style="font-size:.85em">'+esc(l.user)+'</td>'+
+            '<td style="font-size:.82em;color:var(--text3)">'+esc(l.note||'—')+'</td>'+
+          '</tr>'}).join('')+'</tbody></table></div>'
+        :'<div class="info-box" style="color:var(--text3)">Отгрузок ещё не было.</div>')+
+      '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
+    openModal(h)}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
 var woFilter={order:'',op_type:'',resource:'',wtype:'',user:'',customer:'',cancelled:''};
