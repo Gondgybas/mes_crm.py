@@ -1928,14 +1928,16 @@ def create_app():
         q = db.query(ProductionOp).options(
             joinedload(ProductionOp.order).joinedload(Order.customer),
             joinedload(ProductionOp.resource), joinedload(ProductionOp.operator),
-            joinedload(ProductionOp.order_item).joinedload(OrderItem.part_template),
+            joinedload(ProductionOp.order_item)
+                .joinedload(OrderItem.part_template)
+                .joinedload(PartTemplate.components)
+                .joinedload(AssemblyComponent.component),
             joinedload(ProductionOp.component_template))
         if order_id: q = q.filter(ProductionOp.order_id == order_id)
         if active_only: q = q.join(Order).filter(Order.status == "В работе")
         if resource_id: q = q.filter(ProductionOp.resource_id == resource_id)
         ops_list = q.order_by(ProductionOp.resource_id, ProductionOp.sort_order, ProductionOp.sequence).all()
-        # Вычисляем "предыдущую операцию в цепочке" для каждой операции
-        # Группируем по (order_item_id, component_template_id) и сортируем по (sequence, sort_order)
+        # Группируем по (order_item_id, component_template_id), сортируем по (sequence, sort_order)
         op_groups = {}
         for o in ops_list:
             gk = (o.order_item_id, o.component_template_id)
@@ -1946,6 +1948,28 @@ def create_app():
             group_sorted = sorted(group, key=lambda x: (x.sequence or 0, x.sort_order or 0))
             for i, o in enumerate(group_sorted):
                 prev_op_map[o.id] = group_sorted[i - 1] if i > 0 else None
+        # Вычисляем available_kits для первой сборочной операции (component_template_id IS NULL, нет prev_op)
+        # available_kits = min(floor(last_comp_op.completed_qty / ac.quantity)) по всем компонентам
+        available_kits_map = {}  # op.id -> int
+        for o in ops_list:
+            if o.component_template_id is not None: continue       # только сборочный уровень
+            if prev_op_map.get(o.id) is not None: continue         # только первая в цепочке
+            if not o.order_item_id: continue
+            oi = o.order_item
+            if not oi or not oi.part_template or not oi.part_template.is_assembly: continue
+            components = oi.part_template.components or []
+            if not components: continue
+            kits = None
+            for ac in components:
+                comp_grp = op_groups.get((o.order_item_id, ac.component_id), [])
+                if not comp_grp:
+                    kits = 0; break
+                last_comp = sorted(comp_grp, key=lambda x: (x.sequence or 0, x.sort_order or 0))[-1]
+                avail = last_comp.completed_qty or 0
+                qty_per = ac.quantity or 1
+                ck = avail // qty_per
+                if kits is None or ck < kits: kits = ck
+            available_kits_map[o.id] = int(kits) if kits is not None else 0
         result = []
         for o in ops_list:
             prev_op = prev_op_map.get(o.id)
@@ -1971,7 +1995,9 @@ def create_app():
                  # Передача деталей между операциями
                  "available_input": prev_op.completed_qty if prev_op is not None else None,
                  "prev_op_type": prev_op.operation_type if prev_op is not None else None,
-                 "prev_op_id": prev_op.id if prev_op is not None else None})
+                 "prev_op_id": prev_op.id if prev_op is not None else None,
+                 # Готовые комплекты для первой сборочной операции
+                 "available_kits": available_kits_map.get(o.id)})
         return result
 
     @app.post("/api/operations/save")
@@ -2006,12 +2032,46 @@ def create_app():
             prev_ids = [o.id for o in prev_ops]
             try: idx = prev_ids.index(opid)
             except ValueError: idx = -1
+            # Проверка для не-первой операции: предыдущий участок должен списать хотя бы 1 деталь
             if idx > 0:
                 prev_op = prev_ops[idx - 1]
                 if (prev_op.completed_qty or 0) == 0:
                     raise HTTPException(400,
                         f"Нельзя начать: с участка «{prev_op.operation_type}» ещё не передано ни одной детали. "
                         f"Сначала выполните списание на предыдущем участке.")
+            # Проверка для первой сборочной операции (idx==0, нет component_template_id):
+            # все компоненты должны иметь хотя бы 1 полный комплект на выходе последней операции
+            if idx == 0 and op.component_template_id is None:
+                item = db.query(OrderItem).options(
+                    joinedload(OrderItem.part_template)
+                    .joinedload(PartTemplate.components)
+                    .joinedload(AssemblyComponent.component)
+                ).get(op.order_item_id)
+                if item and item.part_template and item.part_template.is_assembly:
+                    components = item.part_template.components or []
+                    if components:
+                        # Для каждого компонента — найти последнюю операцию и проверить completed_qty
+                        all_comp_ops = db.query(ProductionOp).filter(
+                            ProductionOp.order_item_id == op.order_item_id,
+                            ProductionOp.component_template_id.isnot(None)
+                        ).order_by(ProductionOp.sequence, ProductionOp.sort_order).all()
+                        # Последняя операция для каждого component_template_id
+                        comp_last = {}
+                        for cop in all_comp_ops:
+                            comp_last[cop.component_template_id] = cop  # последняя по порядку
+                        not_ready = []
+                        for ac in components:
+                            last = comp_last.get(ac.component_id)
+                            if last is None: continue  # нет операций — пропускаем
+                            avail = last.completed_qty or 0
+                            needed = ac.quantity or 1
+                            if avail < needed:
+                                cname = pt_display(ac.component) if ac.component else f"#{ac.component_id}"
+                                not_ready.append(
+                                    f"«{cname}»: нужно {needed} шт. на комплект, прошло последний участок {avail}")
+                        if not_ready:
+                            raise HTTPException(400,
+                                "Нельзя начать сборку — неполный комплект деталей: " + "; ".join(not_ready))
         n = now_msk()
         if op.status == "Пауза" and op.paused_at:
             pause_dur = int((n - op.paused_at).total_seconds() / 60)
@@ -2172,6 +2232,22 @@ def create_app():
                 act_key = (op.component_template_id, op.operation_type or "")
                 actual = act_dict.get(act_key, {"good": 0, "rejected": 0})
                 prev_op2 = prev_op_for_id.get(op.id)
+                # available_kits — только для первой сборочной операции сборочного изделия
+                available_kits_val = None
+                if op.component_template_id is None and prev_op2 is None and is_asm:
+                    components_list = it.part_template.components or [] if it.part_template else []
+                    if components_list:
+                        kits2 = None
+                        for ac2 in components_list:
+                            comp_grp2 = comp_op_groups.get(ac2.component_id, [])
+                            if not comp_grp2:
+                                kits2 = 0; break
+                            last_c = comp_grp2[-1]  # ops_q уже отсортирован, группы в порядке
+                            av2 = last_c.completed_qty or 0
+                            qpk2 = ac2.quantity or 1
+                            ck2 = av2 // qpk2
+                            if kits2 is None or ck2 < kits2: kits2 = ck2
+                        available_kits_val = int(kits2) if kits2 is not None else 0
                 planned_ops.append({
                     "seq": idx + 1,
                     "op_type": op.operation_type,
@@ -2186,7 +2262,9 @@ def create_app():
                     "actual_resources": act_res_dict.get(act_key, []),
                     # Передача деталей между участками
                     "available_input": prev_op2.completed_qty if prev_op2 is not None else None,
-                    "prev_op_type": prev_op2.operation_type if prev_op2 is not None else None
+                    "prev_op_type": prev_op2.operation_type if prev_op2 is not None else None,
+                    # Готовые комплекты (для первой сборочной операции)
+                    "available_kits": available_kits_val
                 })
             result.append({
                 "item_id": it.id, "order_id": it.order_id,
@@ -2535,50 +2613,69 @@ def create_app():
         wo = db.query(WriteOff).get(wid)
         if not wo: raise HTTPException(404)
         if wo.is_cancelled: raise HTTPException(400, "Уже отменено")
-        wo.is_cancelled = True; wo.cancelled_by = uid; wo.cancelled_at = now_msk()
-        if wo.writeoff_type == "Материал":
-            mat = db.query(Material).get(wo.material_id)
-            if mat:
-                mat.quantity_sheets += wo.quantity_sheets
-                mat.quantity_kg += wo.quantity_kg
-                mat.quantity_pcs += wo.quantity_pcs
-                db.add(MaterialMovement(material_id=mat.id, movement_type="Возврат (отмена списания)",
-                    quantity_sheets=wo.quantity_sheets, quantity_kg=wo.quantity_kg, quantity_pcs=wo.quantity_pcs,
-                    order_id=wo.order_id, user_id=uid, note=f"Отмена списания #{wo.id}"))
-            if wo.reservation_id:
-                res = db.query(Reservation).get(wo.reservation_id)
-                if res:
-                    res.quantity_sheets += wo.quantity_sheets
-                    res.quantity_kg += wo.quantity_kg
-                    if not res.is_active: res.is_active = True
-                    if mat:
-                        mat.reserved_sheets += wo.quantity_sheets
-                        mat.reserved_kg += wo.quantity_kg
-        elif wo.writeoff_type == "Детали":
-            # Откатываем счётчик только если это была сборочная операция (без компонента)
-            if not wo.component_template_id:
-                item = db.query(OrderItem).get(wo.order_item_id)
-                if item:
-                    item.completed_qty = max(0, item.completed_qty - wo.parts_good)
-                    item.rejected_qty = max(0, item.rejected_qty - wo.parts_rejected)
-            # Откатываем счётчик конкретной производственной операции
-            if wo.production_op_id:
-                prod_op = db.query(ProductionOp).get(wo.production_op_id)
-                if prod_op:
-                    prod_op.completed_qty = max(0, (prod_op.completed_qty or 0) - wo.parts_good)
-                    prod_op.rejected_qty = max(0, (prod_op.rejected_qty or 0) - wo.parts_rejected)
-            logs = db.query(PartStationLog).filter(
-                PartStationLog.order_item_id == wo.order_item_id,
-                PartStationLog.resource_id == wo.resource_id,
-                PartStationLog.good_qty == wo.parts_good,
-                PartStationLog.rejected_qty == wo.parts_rejected,
-                PartStationLog.user_id == wo.user_id,
-                PartStationLog.component_template_id == wo.component_template_id
-            ).order_by(PartStationLog.created_at.desc()).first()
-            if logs: db.delete(logs)
-        audit(db, uid, "Отмена списания", "writeoff", wid, f"Тип={wo.writeoff_type}")
+
+        # Собираем все записи для отмены: сама запись + все записи группы (по group_id)
+        wos_to_cancel = [wo]
+        if wo.group_id:
+            members = db.query(WriteOff).filter(
+                WriteOff.group_id == wo.group_id,
+                WriteOff.is_cancelled == False,
+                WriteOff.id != wid
+            ).all()
+            wos_to_cancel.extend(members)
+
+        # Помечаем все как отменённые
+        for w in wos_to_cancel:
+            w.is_cancelled = True; w.cancelled_by = uid; w.cancelled_at = now_msk()
+
+        # Откатываем последствия каждой записи
+        for w in wos_to_cancel:
+            if w.writeoff_type == "Материал":
+                mat = db.query(Material).get(w.material_id) if w.material_id else None
+                if mat:
+                    mat.quantity_sheets += w.quantity_sheets
+                    mat.quantity_kg += w.quantity_kg
+                    mat.quantity_pcs += w.quantity_pcs
+                    db.add(MaterialMovement(material_id=mat.id, movement_type="Возврат (отмена списания)",
+                        quantity_sheets=w.quantity_sheets, quantity_kg=w.quantity_kg, quantity_pcs=w.quantity_pcs,
+                        order_id=w.order_id, user_id=uid, note=f"Отмена списания #{w.id}"))
+                # Возвращаем в резерв независимо от наличия мат-ла в БД
+                if w.reservation_id:
+                    res = db.query(Reservation).get(w.reservation_id)
+                    if res:
+                        res.quantity_sheets += w.quantity_sheets
+                        res.quantity_kg += w.quantity_kg
+                        if not res.is_active: res.is_active = True
+                        if mat:
+                            mat.reserved_sheets += w.quantity_sheets
+                            mat.reserved_kg += w.quantity_kg
+            elif w.writeoff_type == "Детали":
+                # Откатываем счётчик только если это была сборочная операция (без компонента)
+                if not w.component_template_id:
+                    item = db.query(OrderItem).get(w.order_item_id)
+                    if item:
+                        item.completed_qty = max(0, item.completed_qty - w.parts_good)
+                        item.rejected_qty = max(0, item.rejected_qty - w.parts_rejected)
+                # Откатываем счётчик конкретной производственной операции
+                if w.production_op_id:
+                    prod_op = db.query(ProductionOp).get(w.production_op_id)
+                    if prod_op:
+                        prod_op.completed_qty = max(0, (prod_op.completed_qty or 0) - w.parts_good)
+                        prod_op.rejected_qty = max(0, (prod_op.rejected_qty or 0) - w.parts_rejected)
+                logs = db.query(PartStationLog).filter(
+                    PartStationLog.order_item_id == w.order_item_id,
+                    PartStationLog.resource_id == w.resource_id,
+                    PartStationLog.good_qty == w.parts_good,
+                    PartStationLog.rejected_qty == w.parts_rejected,
+                    PartStationLog.user_id == w.user_id,
+                    PartStationLog.component_template_id == w.component_template_id
+                ).order_by(PartStationLog.created_at.desc()).first()
+                if logs: db.delete(logs)
+
+        extra = f" + группа {wo.group_id} ({len(wos_to_cancel)} записи)" if len(wos_to_cancel) > 1 else ""
+        audit(db, uid, "Отмена списания", "writeoff", wid, f"Тип={wo.writeoff_type}{extra}")
         db.flush(); db.commit()
-        return {"status": "ok"}
+        return {"status": "ok", "cancelled_count": len(wos_to_cancel)}
 
     # ─── Analytics ──────────────────────────────────
     @app.get("/api/analytics/dashboard")
@@ -3845,8 +3942,16 @@ function pgOperations(c){
           '<td>'+resCell+'</td>'+
           '<td>'+o.planned_qty+'</td>'+
           (function(){
-            // Колонка "Вход" — поступило с предыдущего участка
-            if(o.available_input==null) return '<td style="color:var(--text3);font-size:.8em" title="Первый участок — источник">—</td>';
+            // Колонка "Вход": сборочная единица → показываем комплекты; обычная деталь → детали с предыдущего участка
+            if(o.available_kits!=null){
+              // Первая сборочная операция: показываем число готовых комплектов
+              var kColor=o.available_kits===0?'var(--err)':o.available_kits>0?'var(--ok)':'var(--text3)';
+              return '<td style="font-size:.82em;text-align:center" title="Готово комплектов для сборки">'+
+                '<span style="font-weight:700;color:'+kColor+'">'+o.available_kits+'</span>'+
+                '<div style="font-size:.75em;color:var(--text3)">компл.</div>'+
+              '</td>';
+            }
+            if(o.available_input==null) return '<td style="color:var(--text3);font-size:.8em;text-align:center" title="Первый участок — источник">—</td>';
             var inp=o.available_input;
             var remaining=Math.max(0,inp-(o.completed_qty||0)-(o.rejected_qty||0));
             var color=inp===0?'var(--err)':remaining>0?'var(--acc)':'var(--ok)';
@@ -3862,10 +3967,14 @@ function pgOperations(c){
           '<td>'+statusBadge(o.status)+'</td>'+
           '<td style="white-space:nowrap">'+
             (function(){
-              // Кнопка старта: блокируем если есть предыдущий участок и нет деталей с него
+              // Кнопка старта: блокируем если нет деталей/комплектов с предыдущего участка
               if(o.status==='Ожидает'||o.status==='Запланирована'){
-                var blocked=o.available_input!=null&&o.available_input===0;
-                if(blocked)return '<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+                // Сборочная операция: проверяем готовые комплекты
+                if(o.available_kits!=null&&o.available_kits===0)
+                  return '<button class="btn sm" disabled title="Нельзя начать сборку — неполный комплект деталей. Все компоненты должны пройти свои операции" style="opacity:.45;cursor:not-allowed">▶</button>';
+                // Обычная деталь: проверяем поступившие с предыдущего участка
+                if(o.available_kits==null&&o.available_input!=null&&o.available_input===0)
+                  return '<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
                 return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
               }
               if(o.status==='Пауза')return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
@@ -3959,25 +4068,32 @@ function modalOpWriteoff(opid){
       var plannedWO=op.planned_qty||0;
       var completedWO=op.completed_qty||0;
       var rejectedWO=op.rejected_qty||0;
-      // Если есть предыдущая операция — остаток считаем от неё; иначе от плана
-      var availInput=op.available_input;
+      // Блок источника: комплекты (сборка) или детали с предыдущего участка
+      var prevOpBlock='';
       var remainingWO;
-      if(availInput!=null){
-        remainingWO=Math.max(0,availInput-completedWO-rejectedWO);
+      if(op.available_kits!=null){
+        // Первая сборочная операция: источник — готовые комплекты компонентов
+        var kColor=op.available_kits===0?'var(--err)':op.available_kits>0?'var(--ok)':'var(--text3)';
+        prevOpBlock='<div class="info-box" style="background:rgba(34,197,94,.07);border-color:var(--ok);margin-bottom:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
+          '<span style="font-size:.82em;color:var(--text3)">🔧 Готово комплектов для сборки:</span>'+
+          '<span style="font-size:1.1em;font-weight:700;color:'+kColor+'">'+op.available_kits+' компл.</span>'+
+          (op.available_kits===0?'<span style="font-size:.8em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 8px">⚠ неполный комплект — убедитесь, что все компоненты прошли операции</span>':'')+
+        '</div>';
+        // Остаток: от плана
+        remainingWO=Math.max(0,plannedWO-completedWO);
+      } else if(op.available_input!=null){
+        // Обычная деталь: источник — предыдущий участок
+        var inpColor=op.available_input===0?'var(--err)':op.available_input>0?'var(--ok)':'var(--text3)';
+        prevOpBlock='<div class="info-box" style="background:rgba(34,197,94,.07);border-color:var(--ok);margin-bottom:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
+          '<span style="font-size:.82em;color:var(--text3)">📥 Получено с «'+esc(op.prev_op_type||'')+'»:</span>'+
+          '<span style="font-size:1em;font-weight:700;color:'+inpColor+'">'+op.available_input+' шт.</span>'+
+          (op.available_input===0?'<span style="font-size:.8em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 8px">⚠ нет деталей на входе</span>':'')+
+        '</div>';
+        remainingWO=Math.max(0,op.available_input-completedWO-rejectedWO);
       } else {
         remainingWO=Math.max(0,plannedWO-completedWO);
       }
       var remainColor=remainingWO>0?'var(--acc)':'var(--ok)';
-      // Блок "поступило с предыдущего участка"
-      var prevOpBlock='';
-      if(availInput!=null){
-        var prevColor=availInput===0?'var(--err)':availInput>0?'var(--ok)':'var(--text3)';
-        prevOpBlock='<div class="info-box" style="background:rgba(34,197,94,.07);border-color:var(--ok);margin-bottom:6px;display:flex;align-items:center;gap:14px;flex-wrap:wrap">'+
-          '<span style="font-size:.82em;color:var(--text3)">📥 Получено с «'+esc(op.prev_op_type||'')+'»:</span>'+
-          '<span style="font-size:1em;font-weight:700;color:'+prevColor+'">'+availInput+' шт.</span>'+
-          (availInput===0?'<span style="font-size:.8em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 8px">⚠ нет деталей на входе</span>':'')+
-        '</div>';
-      }
       h+='<div class="section-hdr">🔩 Детали</div>'+
         prevOpBlock+
         '<div class="info-box" style="background:rgba(99,102,241,.07);border-color:var(--acc);margin-bottom:8px;display:flex;align-items:center;gap:16px;flex-wrap:wrap">'+
@@ -4257,8 +4373,13 @@ function plOpClass(op){
 function plOpCell(op){
   var h='';
   var isOver=op.planned_qty>0&&op.completed_qty>op.planned_qty;
-  // Показываем поступившее с предыдущего участка
-  if(op.available_input!=null){
+  // Строка с источником: комплекты (сборочная) или детали с предыдущего участка
+  if(op.available_kits!=null){
+    // Первая операция сборочной единицы: показываем число готовых комплектов
+    var kColor=op.available_kits===0?'var(--err)':op.available_kits>0?'var(--ok)':'var(--text3)';
+    h+='<div style="font-size:.7em;color:var(--text3);margin-bottom:1px" title="Готовых комплектов для сборки">🔧<span style="font-weight:700;color:'+kColor+'">'+op.available_kits+' компл.</span></div>';
+  } else if(op.available_input!=null){
+    // Обычная деталь: показываем поступившее с предыдущего участка
     var inpColor=op.available_input===0?'var(--err)':op.available_input>0?'var(--ok)':'var(--text3)';
     var inpTitle=op.prev_op_type?'с «'+op.prev_op_type+'»':'с предыдущего участка';
     h+='<div style="font-size:.7em;color:var(--text3);margin-bottom:1px" title="'+inpTitle+'">📥<span style="font-weight:700;color:'+inpColor+'">'+op.available_input+'</span></div>';
@@ -4280,12 +4401,10 @@ function plOpCell(op){
   // Показываем фактически использованные станки (из логов), если нет — плановый станок
   var actRes=op.actual_resources&&op.actual_resources.length?op.actual_resources:[];
   if(actRes.length){
-    // Один или несколько фактически задействованных станков
     actRes.forEach(function(r){
       h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:2px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+r+'">📍'+r+'</div>';
     });
   } else if(op.resource&&op.resource!=='—'){
-    // Плановый станок (ещё не было списаний)
     h+='<div style="font-size:.72em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.13);border-radius:3px;padding:1px 5px;margin-top:3px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="'+op.resource+'">📍'+op.resource+'</div>';
   }
   return h;
@@ -4522,7 +4641,7 @@ function woFillTable(el){
       :isMat?'<span class="badge b-info" style="font-size:.73em">📦 Матер.</span>'
       :'<span class="badge b-ok" style="font-size:.73em">🔩 Детали</span>';
     var partsW=row.parts;var matW=row.mat;
-    var cancelled=w.is_cancelled||(matW&&matW.is_cancelled);
+    var cancelled=isBoth?(partsW.is_cancelled&&matW.is_cancelled):(w.is_cancelled);
     var anomaly=partsW&&partsW.is_anomaly;
     var partCell=partsW
       ?(partsW.component_name
@@ -4534,9 +4653,10 @@ function woFillTable(el){
     var anomNote=anomaly?'<div style="font-size:.78em;color:var(--err)">⚠ '+esc(partsW.anomaly_note||'')+'</div>':'';
     var cancelNote=cancelled?'<span class="badge b-err" style="font-size:.73em">↩</span>':'';
     var noteText=w.note?esc(w.note.replace(/^\[[^\]]+\]\s*/,'')):'';
-    var cancelIds=(partsW?partsW.id+'':(matW?matW.id+'':''));
+    // Для группы Мат+Дет используем любой ID — бэкенд отменит всю группу по group_id
+    var cancelWid=isBoth?(partsW.is_cancelled?matW.id:partsW.id):w.id;
     var cancelBtn=cancelled?'':
-      '<button class="btn sm" onclick="cancelWO('+w.id+')" title="Отменить" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>';
+      '<button class="btn sm" onclick="cancelWO('+cancelWid+')" title="Отменить'+(isBoth?' всё списание (материал + детали)':'')+'" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>';
     return '<tr class="'+(cancelled?'cancelled-row':anomaly?'anomaly':'')+'">'+
       '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(w.date)+'</td>'+
       '<td>'+typeBadge+'</td>'+
@@ -4557,9 +4677,10 @@ function woFillTable(el){
   }).join('')+'</tbody></table></div>';
 }
 
-function cancelWO(wid){if(!confirm('Отменить списание? Все параметры вернутся в состояние "до списания".'))return;
-  api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(){toast('Списание отменено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
-
+function cancelWO(wid){if(!confirm('Отменить списание?\n\nВсё что было списано (материал и детали) вернётся обратно: материал на склад и в резерв, счётчики деталей на операции.'))return;
+  api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(r){
+    var msg=r.cancelled_count>1?'Отменено записей: '+r.cancelled_count+' (группа)':'Списание отменено';
+    toast(msg,'ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),api('/api/op-types')]).then(function(arr){
   var orders=arr[0],resources=arr[1],opTypes=arr[2];
   var active=orders.filter(function(o){return o.status==='В работе'});
