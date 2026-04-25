@@ -2063,23 +2063,43 @@ def create_app():
                 if act_key not in act_res_dict: act_res_dict[act_key] = []
                 if rn != "—" and rn not in act_res_dict[act_key]:
                     act_res_dict[act_key].append(rn)
-                # Считаем отдельно логи сборочного уровня (без component_template_id)
+                # Считаем отдельно логи сборочного уровня (без component_template_id) — для all-ops суммы
                 if l.component_template_id is None:
                     asm_good += l.good_qty
                     asm_rej += l.rejected_qty
-            # Пересорт: для сборок — на основе сборочных логов, для деталей — на основе первого участка
-            is_asm = it.part_template.is_assembly if it.part_template else False
-            if is_asm:
-                surplus = max(0, asm_good - it.quantity)
-            else:
-                surplus = max(0, first_res_good - it.quantity) if first_res_id else max(0, it.completed_qty - it.quantity)
-            # Planned operations in sequence order
+
+            # Planned operations in sequence order — до подсчёта surplus нам нужна последняя сборочная операция
             ops_q = db.query(ProductionOp).options(
                 joinedload(ProductionOp.resource),
                 joinedload(ProductionOp.component_template)
             ).filter(ProductionOp.order_item_id == it.id).order_by(
                 ProductionOp.sequence, ProductionOp.sort_order
             ).all()
+
+            # Последняя сборочная операция (без component_template_id) — именно с неё берём «Факт»
+            last_asm_op_type = None
+            for op in reversed(ops_q):
+                if op.component_template_id is None:
+                    last_asm_op_type = op.operation_type or ""
+                    break
+            # Факт = только логи последней сборочной операции
+            if last_asm_op_type is not None:
+                last_key = (None, last_asm_op_type)
+                last_actual = act_dict.get(last_key, {"good": 0, "rejected": 0})
+                final_good = last_actual["good"]
+                final_rej  = last_actual["rejected"]
+            else:
+                # нет операций — берём старую логику
+                final_good = asm_good
+                final_rej  = asm_rej
+
+            # Пересорт: для сборок — с последней операции; для деталей — с первого участка
+            is_asm = it.part_template.is_assembly if it.part_template else False
+            if is_asm:
+                surplus = max(0, final_good - it.quantity)
+            else:
+                surplus = max(0, first_res_good - it.quantity) if first_res_id else max(0, it.completed_qty - it.quantity)
+
             planned_ops = []
             for idx, op in enumerate(ops_q):
                 rn = op.resource.name if op.resource else "—"
@@ -2109,9 +2129,9 @@ def create_app():
                 "components": [{"id": ac.component_id, "name": pt_display(ac.component), "qty": ac.quantity, "sort_order": ac.sort_order}
                                for ac in sorted(it.part_template.components or [], key=lambda x: x.sort_order)] if is_asm else [],
                 "quantity": it.quantity,
-                # completed/rejected для строки сборки — только сборочный уровень; для деталей — полные
-                "completed": asm_good if is_asm else it.completed_qty,
-                "rejected": asm_rej if is_asm else it.rejected_qty,
+                # completed/rejected для строки: «Факт» = выход с последней операции
+                "completed": final_good if is_asm else it.completed_qty,
+                "rejected": final_rej if is_asm else it.rejected_qty,
                 "surplus": surplus,
                 "by_resource": by_res,
                 "planned_ops": planned_ops})
@@ -2130,8 +2150,17 @@ def create_app():
             name = pt_display(it.part_template)
 
             if is_asm:
-                # Для сборок — считаем только сборочные логи (без component_template_id)
-                asm_good = sum(l.good_qty for l in (it.station_logs or []) if l.component_template_id is None)
+                # Пересорт по сборке — считаем только по ПОСЛЕДНЕЙ сборочной операции
+                asm_ops = db.query(ProductionOp).filter(
+                    ProductionOp.order_item_id == it.id,
+                    ProductionOp.component_template_id == None
+                ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
+                last_op_type = asm_ops.operation_type if asm_ops else None
+                if last_op_type:
+                    asm_good = sum(l.good_qty for l in (it.station_logs or [])
+                                   if l.component_template_id is None and (l.operation_type or "") == last_op_type)
+                else:
+                    asm_good = sum(l.good_qty for l in (it.station_logs or []) if l.component_template_id is None)
                 surplus = asm_good - it.quantity
                 if surplus <= 0: continue
                 completed_first = asm_good
