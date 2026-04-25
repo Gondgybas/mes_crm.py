@@ -2586,28 +2586,79 @@ def create_app():
 
     @app.get("/api/analytics/load")
     def api_load(db: Session = Depends(db_dep)):
-        resources = db.query(Resource).filter(Resource.is_available == True).order_by(Resource.name).all()
-        pending_ops = db.query(ProductionOp).options(joinedload(ProductionOp.resource)).filter(
-            ProductionOp.status.in_(["Ожидает", "Запланирована", "В работе"]),
-            ProductionOp.resource_id.isnot(None)).order_by(ProductionOp.resource_id, ProductionOp.sort_order).all()
-        result = []
-        for res in resources:
-            daily_cap = res.daily_capacity_min
+        import math as _math
+        today = datetime.date.today()
+
+        def make_day_loads(total_min, daily_cap):
             if daily_cap <= 0: daily_cap = 480
-            res_ops = [o for o in pending_ops if o.resource_id == res.id]
-            total_min = sum(o.estimated_minutes for o in res_ops)
-            days_needed = math.ceil(total_min / daily_cap) if total_min > 0 else 0
-            day_loads = []; remaining = total_min; today = datetime.date.today()
+            days_needed = _math.ceil(total_min / daily_cap) if total_min > 0 else 0
+            day_loads = []; remaining = total_min
             for d in range(max(days_needed, 1)):
                 dt = today + datetime.timedelta(days=d)
                 day_min = min(remaining, daily_cap)
                 pct = round(day_min / daily_cap * 100) if daily_cap > 0 else 0
-                day_loads.append({"date": dt.isoformat(), "label": dt.strftime("%d.%m"), "minutes": day_min, "pct": pct})
+                day_loads.append({"date": dt.isoformat(), "label": dt.strftime("%d.%m"),
+                                   "minutes": day_min, "pct": pct})
                 remaining -= day_min
                 if remaining <= 0: break
-            result.append({"resource_id": res.id, "resource_name": res.name,
-                           "total_min": total_min, "daily_cap": daily_cap,
-                           "days_needed": days_needed, "ops_count": len(res_ops), "day_loads": day_loads})
+            return day_loads, days_needed
+
+        # Все незавершённые операции
+        pending_ops = db.query(ProductionOp).options(joinedload(ProductionOp.resource)).filter(
+            ProductionOp.status.in_(["Ожидает", "Запланирована", "В работе"])
+        ).order_by(ProductionOp.sort_order).all()
+
+        # Все доступные станки
+        resources = db.query(Resource).filter(Resource.is_available == True).order_by(Resource.name).all()
+
+        # Все типы операций
+        op_types = db.query(OperationTypeCfg).order_by(OperationTypeCfg.sort_order).all()
+
+        result = []
+        for ot in op_types:
+            # Операции этого типа
+            ops_of_type = [o for o in pending_ops if o.operation_type == ot.name]
+            if not ops_of_type: continue
+
+            # Станки, привязанные к этому типу
+            bound_res = [r for r in resources if ot.name in r.get_allowed_ops()]
+            total_capacity_day = sum(r.daily_capacity_min if r.daily_capacity_min > 0 else 480 for r in bound_res)
+            if total_capacity_day <= 0: total_capacity_day = 480
+
+            # Суммарное плановое время по типу операции
+            type_total_min = sum(o.estimated_minutes for o in ops_of_type)
+            type_unassigned_min = sum(o.estimated_minutes for o in ops_of_type if not o.resource_id)
+
+            # Дней нужно: общее_время / суммарная_мощность_всех_станков_за_день
+            type_days_needed = _math.ceil(type_total_min / total_capacity_day) if type_total_min > 0 else 0
+            type_day_loads, _ = make_day_loads(type_total_min, total_capacity_day)
+
+            # Данные по каждому станку
+            res_rows = []
+            for res in bound_res:
+                res_ops = [o for o in ops_of_type if o.resource_id == res.id]
+                if not res_ops: continue
+                daily_cap = res.daily_capacity_min if res.daily_capacity_min > 0 else 480
+                res_total_min = sum(o.estimated_minutes for o in res_ops)
+                res_day_loads, res_days_needed = make_day_loads(res_total_min, daily_cap)
+                res_rows.append({
+                    "resource_id": res.id, "resource_name": res.name,
+                    "total_min": res_total_min, "daily_cap": daily_cap,
+                    "days_needed": res_days_needed, "ops_count": len(res_ops),
+                    "day_loads": res_day_loads
+                })
+
+            result.append({
+                "op_type": ot.name,
+                "total_min": type_total_min,
+                "unassigned_min": type_unassigned_min,
+                "total_capacity_day": total_capacity_day,
+                "days_needed": type_days_needed,
+                "ops_count": len(ops_of_type),
+                "bound_stations": len(bound_res),
+                "day_loads": type_day_loads,
+                "resources": res_rows
+            })
         return result
 
     @app.get("/api/orders/{oid}/stats")
@@ -4512,19 +4563,78 @@ function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementB
   api('/api/writeoffs/create','POST',b).then(function(r){closeModal();if(r.is_anomaly)toast('⚠ '+r.anomaly_note,'err');else toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ЗАГРУЖЕННОСТЬ ═══
-function pgLoad(c){api('/api/analytics/load').then(function(data){if(!data.length){c.innerHTML='<div class="info-box">Нет данных</div>';return}
-  var allDates=new Set();data.forEach(function(r){r.day_loads.forEach(function(d){allDates.add(d.label)})});
-  var today=new Date();for(var i=0;i<14;i++){var dt=new Date(today);dt.setDate(dt.getDate()+i);allDates.add(dt.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'}))}
-  var dates=Array.from(allDates).sort(function(a,b){var da=a.split('.'),db=b.split('.');return(da[1]+da[0]).localeCompare(db[1]+db[0])});
-  var h='<div class="section-hdr">📈 Загруженность</div><div class="info-box"><span style="color:var(--err)">■</span> >80% | <span style="color:var(--warn)">■</span> 50-80% | <span style="color:var(--info)">■</span> <50%</div>'+
-  '<div class="tbl-wrap" style="max-height:75vh"><table><thead><tr><th style="min-width:180px;position:sticky;left:0;background:var(--s2);z-index:2">Участок</th>'+
-    dates.map(function(d){return '<th style="min-width:50px;text-align:center;font-size:.7em">'+d+'</th>'}).join('')+'<th>Итого</th></tr></thead><tbody>';
-  data.forEach(function(r){var loadMap={};r.day_loads.forEach(function(d){loadMap[d.label]=d});
-    h+='<tr><td style="position:sticky;left:0;background:var(--s1);z-index:1;font-weight:600">'+r.resource_name+'<div style="font-size:.75em;color:var(--text3)">'+r.ops_count+' оп | '+fmtMinToH(r.total_min)+'</div></td>';
-    dates.forEach(function(d){var dl=loadMap[d];if(dl){var cls=dl.pct>=80?'load-100':dl.pct>=50?'load-80':dl.pct>0?'load-50':'load-0';
-      h+='<td style="text-align:center" title="'+d+': '+fmtMinToH(dl.minutes)+' ('+dl.pct+'%)"><div class="load-bar '+cls+'" style="width:'+Math.max(4,dl.pct)+'%"></div><div style="font-size:.7em;color:var(--text3)">'+dl.pct+'%</div></td>'}
-    else h+='<td style="text-align:center"><div class="load-bar load-0" style="width:4px"></div></td>'});
-    h+='<td style="font-weight:600">'+r.days_needed+' дн.</td></tr>'});
+function pgLoad(c){api('/api/analytics/load').then(function(data){
+  if(!data.length){c.innerHTML='<div class="info-box">Нет операций в работе / ожидании</div>';return}
+
+  // Собираем все даты из всех строк
+  var allDates=new Set();
+  data.forEach(function(g){
+    g.day_loads.forEach(function(d){allDates.add(d.label)});
+    (g.resources||[]).forEach(function(r){r.day_loads.forEach(function(d){allDates.add(d.label)})});
+  });
+  var today=new Date();
+  for(var i=0;i<14;i++){var dt=new Date(today);dt.setDate(dt.getDate()+i);
+    allDates.add(dt.toLocaleDateString('ru-RU',{day:'2-digit',month:'2-digit'}));}
+  var dates=Array.from(allDates).sort(function(a,b){
+    var da=a.split('.'),db=b.split('.');return(da[1]+da[0]).localeCompare(db[1]+db[0])});
+
+  var h='<div class="section-hdr">📈 Загруженность участков и станков</div>'+
+    '<div class="info-box" style="margin-bottom:8px">'+
+      '<span style="color:var(--err)">■</span> >80% &nbsp;'+
+      '<span style="color:var(--warn)">■</span> 50–80% &nbsp;'+
+      '<span style="color:var(--info)">■</span> <50% &nbsp;&nbsp; '+
+      '<b>Строка участка</b> = суммарное время ÷ суммарная мощность всех привязанных станков за день</div>'+
+    '<div class="tbl-wrap" style="max-height:80vh"><table><thead><tr>'+
+      '<th style="min-width:220px;position:sticky;left:0;background:var(--s2);z-index:2">Участок / Станок</th>'+
+      '<th style="min-width:70px">Всего</th>'+
+      dates.map(function(d){return '<th style="min-width:52px;text-align:center;font-size:.7em">'+d+'</th>'}).join('')+
+      '<th>Дней</th></tr></thead><tbody>';
+
+  data.forEach(function(g){
+    // ─ Строка типа операции (участка) ─
+    var typeLoadMap={};g.day_loads.forEach(function(d){typeLoadMap[d.label]=d});
+    h+='<tr style="background:var(--s2)">';
+    h+='<td style="position:sticky;left:0;background:var(--s2);z-index:1;font-weight:700;font-size:.95em">'+
+        '🏭 '+g.op_type+
+        (g.unassigned_min>0?'<span style="font-size:.72em;color:var(--warn);margin-left:8px">⚠ '+fmtMinToH(g.unassigned_min)+' без станка</span>':'')+
+        '<div style="font-size:.72em;color:var(--text3);font-weight:400">'+g.ops_count+' оп | '+g.bound_stations+' ст. | мощность: '+fmtMinToH(g.total_capacity_day)+'/день</div></td>';
+    h+='<td style="font-weight:600;white-space:nowrap">'+fmtMinToH(g.total_min)+'</td>';
+    dates.forEach(function(d){
+      var dl=typeLoadMap[d];
+      if(dl&&dl.pct>0){
+        var cls=dl.pct>=80?'load-100':dl.pct>=50?'load-80':'load-50';
+        h+='<td style="text-align:center" title="'+d+': '+fmtMinToH(dl.minutes)+' ('+dl.pct+'%)">'+
+          '<div class="load-bar '+cls+'" style="width:'+Math.max(8,dl.pct)+'%"></div>'+
+          '<div style="font-size:.68em;font-weight:600;color:var(--text2)">'+dl.pct+'%</div></td>';
+      } else {
+        h+='<td style="text-align:center"><div class="load-bar load-0" style="width:4px"></div></td>';
+      }
+    });
+    h+='<td style="font-weight:700;color:'+(g.days_needed>3?'var(--err)':g.days_needed>1?'var(--warn)':'var(--ok)')+'">'+g.days_needed+' дн.</td></tr>';
+
+    // ─ Строки станков ─
+    (g.resources||[]).forEach(function(r){
+      var resLoadMap={};r.day_loads.forEach(function(d){resLoadMap[d.label]=d});
+      h+='<tr style="background:var(--s1)">';
+      h+='<td style="position:sticky;left:0;background:var(--s1);z-index:1;padding-left:28px;font-size:.88em">'+
+          '📍 '+r.resource_name+
+          '<div style="font-size:.72em;color:var(--text3)">'+r.ops_count+' оп | мощность: '+fmtMinToH(r.daily_cap)+'/день</div></td>';
+      h+='<td style="font-size:.88em;white-space:nowrap">'+fmtMinToH(r.total_min)+'</td>';
+      dates.forEach(function(d){
+        var dl=resLoadMap[d];
+        if(dl&&dl.pct>0){
+          var cls=dl.pct>=80?'load-100':dl.pct>=50?'load-80':'load-50';
+          h+='<td style="text-align:center" title="'+d+': '+fmtMinToH(dl.minutes)+' ('+dl.pct+'%)">'+
+            '<div class="load-bar '+cls+'" style="width:'+Math.max(6,dl.pct)+'%"></div>'+
+            '<div style="font-size:.65em;color:var(--text3)">'+dl.pct+'%</div></td>';
+        } else {
+          h+='<td style="text-align:center"><div class="load-bar load-0" style="width:4px"></div></td>';
+        }
+      });
+      h+='<td style="font-size:.88em;color:'+(r.days_needed>3?'var(--err)':r.days_needed>1?'var(--warn)':'var(--ok)')+'">'+r.days_needed+' дн.</td></tr>';
+    });
+  });
+
   h+='</tbody></table></div>';c.innerHTML=h})}
 
 // ═══ КЛИЕНТЫ ═══
