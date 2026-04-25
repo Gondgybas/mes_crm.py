@@ -887,6 +887,9 @@ def create_app():
         return [r for r in all_res if op_name in r.get_allowed_ops()]
 
     def auto_create_reservations(db, order_item, user_id=None):
+        # Резервы создаются только для заказов в статусе «В работе»
+        order = db.query(Order).get(order_item.order_id) if order_item.order_id else None
+        if not order or order.status != "В работе": return
         pt = order_item.part_template
         if not pt: return
 
@@ -992,7 +995,7 @@ def create_app():
         for recalc_id in pt_ids_to_recalc:
             items = db.query(OrderItem).join(Order).filter(
                 OrderItem.part_template_id == recalc_id,
-                Order.status.notin_(["Завершён", "Отменён", "Отгружен"])
+                Order.status == "В работе"  # пересчёт только для активных заказов
             ).all()
             for it in items:
                 remove_item_reservations(db, it.id)
@@ -1668,6 +1671,19 @@ def create_app():
                 return {"status": "warning", "message": f"Не списано {len(unconsumed)} резервов. Завершить заказ?", "unconsumed": len(unconsumed)}
         old = o.status; o.status = new_status
         if o.status == "Завершён": o.completed_at = now_msk()
+        # При переходе в «В работе» — создаём резервы и операции для всех позиций, у которых их ещё нет
+        if new_status == "В работе" and old != "В работе":
+            items = db.query(OrderItem).filter(OrderItem.order_id == oid).all()
+            for it in items:
+                existing_res = db.query(Reservation).filter(
+                    Reservation.order_item_id == it.id, Reservation.is_active == True).count()
+                if existing_res == 0:
+                    auto_create_reservations(db, it, data.get("user_id", 1))
+                existing_ops = db.query(ProductionOp).filter(
+                    ProductionOp.order_item_id == it.id).count()
+                if existing_ops == 0:
+                    auto_create_operations(db, it)
+            db.flush()
         audit(db, data.get("user_id", 1), "Смена статуса", "order", oid, f"{old} → {o.status}")
         db.flush(); db.commit()
         return {"status": "ok"}
@@ -1789,11 +1805,14 @@ def create_app():
                  "material_id": r.material_id,
                  "material_type": r.material.material_type if r.material else "",
                  "part_name": pt_display(r.part_template) if r.part_template else "",
-                 "kg": r.quantity_kg, "sheets": r.quantity_sheets,
+                 # Оригинальное кол-во резерва = текущий остаток + уже списанное
+                 "kg": r.quantity_kg + consumed_map.get(r.id, {}).get("kg", 0),
+                 "sheets": r.quantity_sheets + consumed_map.get(r.id, {}).get("sheets", 0),
                  "consumed_sheets": consumed_map.get(r.id, {}).get("sheets", 0),
                  "consumed_kg": consumed_map.get(r.id, {}).get("kg", 0),
-                 "remaining_sheets": r.quantity_sheets - consumed_map.get(r.id, {}).get("sheets", 0),
-                 "remaining_kg": round(r.quantity_kg - consumed_map.get(r.id, {}).get("kg", 0), 2),
+                 # remaining = текущее quantity_sheets (уже уменьшается при каждом списании)
+                 "remaining_sheets": r.quantity_sheets,
+                 "remaining_kg": round(r.quantity_kg, 2),
                  "active": r.is_active, "note": r.note,
                  "reserved_by": r.reserver.full_name if r.reserver else "",
                  "created": r.created_at.isoformat()} for r in rs_all]
@@ -3885,8 +3904,8 @@ function submitOpWriteoff(opid,showMat,showParts){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ РЕЗЕРВЫ ═══
-var resFilter={type:'',order:'',status:'',part:''};
-function pgReservations(c){api('/api/reservations?active_only=1').then(function(rs){
+var resFilter={type:'',order:'',status:'',part:'',active_only:1};
+function pgReservations(c){api('/api/reservations?active_only='+resFilter.active_only).then(function(rs){
   if(resFilter.type)rs=rs.filter(function(r){return r.material_type===resFilter.type});
   if(resFilter.order)rs=rs.filter(function(r){return r.order_display.toLowerCase().indexOf(resFilter.order.toLowerCase())>=0});
   if(resFilter.status)rs=rs.filter(function(r){return r.order_status===resFilter.status});
@@ -3897,14 +3916,26 @@ function pgReservations(c){api('/api/reservations?active_only=1').then(function(
     '<label>Заказ:</label><input style="width:150px" value="'+esc(resFilter.order)+'" onchange="resFilter.order=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
     '<label>Деталь:</label><input style="width:150px" value="'+esc(resFilter.part)+'" onchange="resFilter.part=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
     '<label>Статус:</label><select onchange="resFilter.status=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(resFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select></div>'+
+    '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(resFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
+    '<label>Резервы:</label><select onchange="resFilter.active_only=+this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
+    '<option value="1" '+(resFilter.active_only?'selected':'')+'>Активные</option>'+
+    '<option value="0" '+(!resFilter.active_only?'selected':'')+'>Все (вкл. списанные)</option>'+
+    '</select></div>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Заказ</th><th>Ст.</th><th>Деталь</th><th>Материал</th><th>Зарез. (л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th></tr></thead>'+
-  '<tbody>'+rs.map(function(r){return '<tr><td>'+r.order_display+'</td><td>'+statusBadge(r.order_status)+'</td><td>'+(r.part_name||'—')+'</td>'+
-    '<td>'+r.material+'</td><td>'+(r.sheets||'—')+'</td>'+
-    '<td>'+(r.consumed_sheets||0)+'</td><td class="'+(r.remaining_sheets>0?'low':'')+'">'+(r.remaining_sheets||0)+'</td>'+
-    '<td>'+(r.reserved_by||'—')+'</td>'+
-    '<td>'+(hasPerm('reserve.edit')?'<button class="btn sm" onclick="modalEditRes('+r.id+','+r.sheets+','+r.kg+',\''+esc(r.note)+'\')">✏</button>':'')+
-      (hasPerm('reserve.cancel')?'<button class="btn sm" onclick="cancelRes('+r.id+')">❌</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+  '<tbody>'+rs.map(function(r){
+    var consumed=!r.active;
+    var rowStyle=consumed?'style="opacity:.6;background:rgba(0,0,0,.03)"':'';
+    var statusCell=consumed
+      ?'<span style="font-size:.75em;background:var(--text3);color:#fff;border-radius:3px;padding:1px 6px">✓ Списан</span>'
+      :statusBadge(r.order_status);
+    return '<tr '+rowStyle+'><td>'+r.order_display+'</td><td>'+statusCell+'</td><td>'+(r.part_name||'—')+'</td>'+
+      '<td>'+r.material+'</td><td>'+(r.sheets||'—')+'</td>'+
+      '<td>'+(r.consumed_sheets||0)+'</td>'+
+      '<td class="'+(r.remaining_sheets>0&&!consumed?'low':'')+'">'+
+        (consumed?'<span style="color:var(--ok)">0</span>':(r.remaining_sheets||0))+'</td>'+
+      '<td>'+(r.reserved_by||'—')+'</td>'+
+      '<td>'+(!consumed&&hasPerm('reserve.edit')?'<button class="btn sm" onclick="modalEditRes('+r.id+','+r.sheets+','+r.kg+',\''+esc(r.note)+'\')">✏</button>':'')+
+        (!consumed&&hasPerm('reserve.cancel')?'<button class="btn sm" onclick="cancelRes('+r.id+')">❌</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
 
 function modalCreateRes(){api('/api/orders').then(function(orders){var active=orders.filter(function(o){return o.status==='В работе'});
   if(!active.length){toast('Нет заказов «В работе»','err');return}
