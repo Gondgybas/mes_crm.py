@@ -1912,16 +1912,28 @@ def create_app():
 
     @app.get("/api/reservations/by-item/{item_id}")
     def api_res_by_item(item_id: int, db: Session = Depends(db_dep)):
-        rs = db.query(Reservation).options(joinedload(Reservation.material)).filter(
-            Reservation.order_item_id == item_id, Reservation.is_active == True).all()
         rs = db.query(Reservation).options(
             joinedload(Reservation.material), joinedload(Reservation.part_template)
         ).filter(Reservation.order_item_id == item_id, Reservation.is_active == True).all()
-        return [{"id": r.id, "material_id": r.material_id,
-                 "material": r.material.name if r.material else "",
-                 "sheets": r.quantity_sheets, "kg": r.quantity_kg,
-                 "part_template_id": r.part_template_id,
-                 "part_name": pt_display(r.part_template) if r.part_template else "—"} for r in rs]
+        # Fallback: if reservation has no part_template_id, use order_item's template
+        item = db.query(OrderItem).get(item_id)
+        fallback_pt_id = item.part_template_id if item else None
+        result = []
+        for r in rs:
+            pt_id = r.part_template_id or fallback_pt_id
+            ptm = db.query(PartTemplateMaterial).filter_by(
+                part_template_id=pt_id, material_id=r.material_id
+            ).first() if (pt_id and r.material_id) else None
+            result.append({
+                "id": r.id, "material_id": r.material_id,
+                "material": r.material.name if r.material else "",
+                "sheets": r.quantity_sheets, "kg": r.quantity_kg,
+                "part_template_id": r.part_template_id,
+                "part_name": pt_display(r.part_template) if r.part_template else "—",
+                "parts_per_sheets": ptm.parts_per_sheets if ptm else None,
+                "sheets_input": ptm.sheets_input if ptm else 1,
+            })
+        return result
 
     # ─── Resources ──────────────────────────────────
     @app.get("/api/resources")
@@ -2591,6 +2603,9 @@ def create_app():
             wo.material_id = mat.id; wo.reservation_id = res_id
             sh = int(data.get("sheets", 0)); kg = float(data.get("kg", 0))
             if sh > 0:
+                # Проверка лимита по резерву
+                if reservation and reservation.is_active and sh > reservation.quantity_sheets:
+                    raise HTTPException(400, f"Превышает остаток резерва ({reservation.quantity_sheets} л). Нельзя списать больше зарезервированного.")
                 sub_kg = round(sh * (mat.sheet_weight_kg or 0), 2)
                 mat.quantity_sheets -= sh; mat.quantity_kg -= sub_kg
                 wo.quantity_sheets = sh; wo.quantity_kg = sub_kg
@@ -2609,6 +2624,16 @@ def create_app():
             else:
                 raise HTTPException(400, "Укажите количество")
             audit(db, uid, "Списание материала", "writeoff", 0, f"{mat.name}: {sh}л/{kg}кг")
+        elif wtype == "Отход":
+            # Отход: только логирование, склад и резерв не изменяются
+            mat = db.query(Material).get(data["material_id"]) if data.get("material_id") else None
+            sh = int(data.get("sheets", 0))
+            if sh <= 0: raise HTTPException(400, "Укажите количество листов")
+            wo.material_id = data.get("material_id")
+            wo.quantity_sheets = sh
+            if mat:
+                wo.quantity_kg = round(sh * (mat.sheet_weight_kg or 0), 2)
+            audit(db, uid, "Списание отхода", "writeoff", 0, f"{mat.name if mat else '—'}: {sh}л")
         elif wtype == "Детали":
             good = int(data.get("parts_good", 0)); rej = int(data.get("parts_rejected", 0))
             if good == 0 and rej == 0:
@@ -4152,6 +4177,53 @@ function pauseOp(id){api('/api/operations/'+id+'/pause','POST',{user_id:U.id}).t
 function completeOp(id){api('/api/operations/'+id+'/complete','POST',{user_id:U.id}).then(function(){toast('Завершена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function rollbackOp(id){if(!confirm('Откатить?'))return;api('/api/operations/'+id+'/rollback','POST',{user_id:U.id}).then(function(){toast('Откат','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
+function onWoMatTypeChange(){
+  var t=(document.getElementById('fopwo_mat_type')||{}).value||'normal';
+  var info=document.getElementById('fopwo_mat_info');
+  if(!info)return;
+  if(t==='scrap'){
+    info.innerHTML='<span style="color:var(--warn)">♻ Режим Отход: материал <strong>не</strong> списывается со склада и резерва, только логируется</span>';
+  } else {
+    onWoMatChange();
+  }}
+function onWoMatChange(){
+  var matSel=document.getElementById('fopwo_mat');
+  if(!matSel)return;
+  var opt=matSel.options[matSel.selectedIndex];
+  if(!opt)return;
+  var maxSh=+(opt.dataset.sh||0);
+  var typeSel=document.getElementById('fopwo_mat_type');
+  var typ=typeSel?typeSel.value:'normal';
+  var info=document.getElementById('fopwo_mat_info');
+  if(info){
+    if(typ==='scrap'){
+      info.innerHTML='<span style="color:var(--warn)">♻ Режим Отход: материал <strong>не</strong> списывается со склада и резерва, только логируется</span>';
+    } else {
+      info.innerHTML='<span style="color:var(--text3)">Максимум из резерва: <strong>'+maxSh+'</strong> л</span>';
+    }
+  }
+  onWoSheetsChange();
+}
+function onWoSheetsChange(){
+  var matSel=document.getElementById('fopwo_mat');
+  var inp=document.getElementById('fopwo_sheets');
+  if(!matSel||!inp)return;
+  var opt=matSel.options[matSel.selectedIndex];
+  if(!opt)return;
+  var pps=parseFloat(opt.dataset.pps||0);
+  var shi=parseFloat(opt.dataset.shi||1);
+  var shVal=+inp.value||0;
+  var hint=document.getElementById('fopwo_sheets_hint');
+  var goodInp=document.getElementById('fopwo_good');
+  if(pps>0&&shi>0&&shVal>0){
+    var calc=Math.floor(shVal*pps/shi);
+    if(hint)hint.textContent='→ расч. '+calc+' дет.';
+    if(goodInp)goodInp.value=calc;
+  } else {
+    if(hint)hint.textContent='';
+  }
+}
+
 function modalOpWriteoff(opid){
   var op=window._opsData[opid];if(!op){toast('Операция не найдена','err');return}
   var otCfg=window._opTypesData[op.type]||{};
@@ -4163,8 +4235,10 @@ function modalOpWriteoff(opid){
   var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
   // Если станок не назначен — подгружаем только совместимые со станком типы
   var pRes=!op.resource_id?api('/api/resources/for-operation/'+encodeURIComponent(op.type)):Promise.resolve(null);
-  Promise.all([p,pRes]).then(function(arr){
-    var reservations=arr[0];var compatResources=arr[1];
+  // Все материалы — нужны для списания отхода даже без резервов
+  var pMats=showMat?api('/api/materials'):Promise.resolve([]);
+  Promise.all([p,pRes,pMats]).then(function(arr){
+    var reservations=arr[0];var compatResources=arr[1];var allMaterials=arr[2]||[];
     // Автоматически определяем нужный компонент из операции — без выбора
     var autoCompKey=op.component_template_id?String(op.component_template_id):'0';
     // Группируем резервы по компоненту
@@ -4203,14 +4277,45 @@ function modalOpWriteoff(opid){
       resBlockHtml;
 
     if(showMat&&matchedItems.length){
+      var matOpts=matchedItems.map(function(r){
+        return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+
+               '" data-pps="'+(r.parts_per_sheets||0)+'" data-shi="'+(r.sheets_input||1)+'">'+
+               r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>';
+      }).join('');
       h+='<div class="section-hdr">📦 Материал</div>'+
-        '<div class="form-row full"><div><label>Материал</label><select id="fopwo_mat">'+
-        matchedItems.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+'">'+
-          r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>'}).join('')+
-        '</select></div></div>'+
-        '<div class="form-row"><div><label>Листов</label><input type="number" id="fopwo_sheets" min="0" value="0"></div><div></div></div>';
+        '<div class="form-row" style="align-items:flex-end"><div><label>Тип источника</label>'+
+        '<select id="fopwo_mat_type" onchange="onWoMatTypeChange()">'+
+          '<option value="normal">📦 Основное (из резерва)</option>'+
+          '<option value="scrap">♻ Отход (только лог)</option>'+
+        '</select></div><div></div></div>'+
+        '<div class="form-row full"><div><label>Материал</label>'+
+        '<select id="fopwo_mat" onchange="onWoMatChange()">'+matOpts+'</select></div></div>'+
+        '<div id="fopwo_mat_info" class="info-box" style="font-size:.85em;padding:4px 10px;margin-bottom:4px;min-height:22px"></div>'+
+        '<div class="form-row"><div><label>Листов</label>'+
+        '<input type="number" id="fopwo_sheets" min="0" value="0" oninput="onWoSheetsChange()">'+
+        '<span id="fopwo_sheets_hint" style="font-size:.8em;color:var(--acc);margin-left:8px;white-space:nowrap"></span>'+
+        '</div><div></div></div>';
     } else if(showMat){
-      h+='<div class="section-hdr">📦 Материал</div><div class="info-box" style="color:var(--text3)">Нет активных резервов для этой операции</div>';
+      // Нет активных резервов — доступно только списание отхода
+      var scrapMatOpts=allMaterials.map(function(m){
+        return '<option value="'+m.id+'" data-pps="0" data-shi="1">'+m.name+'</option>';
+      }).join('');
+      h+='<div class="section-hdr">📦 Материал</div>'+
+        '<div class="info-box" style="color:var(--warn);font-size:.85em;margin-bottom:6px">'+
+          '⚠ Нет активных резервов для этой операции — доступно только списание <strong>Отхода</strong>'+
+        '</div>'+
+        '<input type="hidden" id="fopwo_mat_type" value="scrap">'+
+        '<div class="form-row full"><div><label>Материал (отход)</label>'+
+        '<select id="fopwo_mat" onchange="onWoMatChange()">'+
+          (scrapMatOpts||'<option value="">— нет материалов —</option>')+
+        '</select></div></div>'+
+        '<div id="fopwo_mat_info" class="info-box" style="font-size:.85em;padding:4px 10px;margin-bottom:4px;color:var(--warn)">'+
+          '♻ Отход: материал не списывается со склада и резерва, только логируется'+
+        '</div>'+
+        '<div class="form-row"><div><label>Листов</label>'+
+        '<input type="number" id="fopwo_sheets" min="0" value="0" oninput="onWoSheetsChange()">'+
+        '<span id="fopwo_sheets_hint" style="font-size:.8em;color:var(--acc);margin-left:8px;white-space:nowrap"></span>'+
+        '</div><div></div></div>';
     }
     if(showParts){
       var partNameWO=op.component_name||op.item||'—';
@@ -4258,6 +4363,7 @@ function modalOpWriteoff(opid){
       '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
       '<button class="btn primary" onclick="submitOpWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
     openModal(h);
+    if(showMat&&matchedItems.length) setTimeout(onWoMatChange,10);
   }).catch(function(e){toast(e.message,'err')})}
 
 function submitOpWriteoff(opid,showMat,showParts){
@@ -4277,14 +4383,21 @@ function submitOpWriteoff(opid,showMat,showParts){
   var promises=[];
   if(showMat){
     var matSel=document.getElementById('fopwo_mat');
+    var matTypeSel=document.getElementById('fopwo_mat_type');
+    var matType=matTypeSel&&matTypeSel.value==='scrap'?'Отход':'Материал';
     var shVal=+(document.getElementById('fopwo_sheets')||{}).value||0;
     if(matSel&&shVal>0){
       var matOpt=matSel.options[matSel.selectedIndex];
-      promises.push(api('/api/writeoffs/create','POST',{
-        writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
+      // Проверка лимита только для основного списания
+      if(matType==='Материал'){
+        var maxSh=+(matOpt.dataset.sh||0);
+        if(maxSh>0&&shVal>maxSh){toast('Нельзя списать больше резерва ('+maxSh+' л)','err');return}
+      }
+      var payload={writeoff_type:matType,user_id:U.id,order_id:op.order_id,
         order_item_id:op.item_id,resource_id:effResId,group_id:gid,
-        material_id:+matSel.value,reservation_id:+(matOpt.dataset.rid)||null,
-        sheets:shVal,note:'['+op.type+'] '+note}))
+        material_id:+matSel.value,sheets:shVal,note:'['+op.type+'] '+note};
+      if(matType==='Материал') payload.reservation_id=+(matOpt.dataset.rid)||null;
+      promises.push(api('/api/writeoffs/create','POST',payload))
     }
   }
   if(showParts){
@@ -4814,7 +4927,7 @@ function pgWriteoffs(c){
     var ordOpts=[{v:'',t:'Все заказы'}].concat(orders.map(function(v){return{v:v,t:v}}));
     var opOpts=[{v:'',t:'Все типы операций'}].concat(opTypes.map(function(v){return{v:v,t:v}}));
     var resOpts=[{v:'',t:'Все станки'}].concat(resources.map(function(v){return{v:v,t:v}}));
-    var wtOpts=[{v:'',t:'Все'},{v:'Материал',t:'📦 Материал'},{v:'Детали',t:'🔩 Детали'},{v:'Материал+Детали',t:'📦🔩 Мат+Дет'}];
+    var wtOpts=[{v:'',t:'Все'},{v:'Материал',t:'📦 Материал'},{v:'Детали',t:'🔩 Детали'},{v:'Материал+Детали',t:'📦🔩 Мат+Дет'},{v:'Отход',t:'♻ Отход'}];
     var usrOpts=[{v:'',t:'Все операторы'}].concat(users.map(function(v){return{v:v,t:v}}));
     var custOpts=[{v:'',t:'Все заказчики'}].concat(customers.map(function(v){return{v:v,t:v}}));
     var statusOpts=[{v:'',t:'Все'},{v:'active',t:'✅ Действующие'},{v:'cancelled',t:'↩ Отменённые'}];
@@ -4848,6 +4961,7 @@ function woFillTable(el){
     if(woFilter.wtype==='Материал+Детали')return w._merged;
     if(woFilter.wtype==='Материал')return w.type==='Материал'&&!w._merged;
     if(woFilter.wtype==='Детали')return w.type==='Детали'&&!w._merged;
+    if(woFilter.wtype==='Отход')return w.type==='Отход';
     return true;
   });
   if(woFilter.user)wos=wos.filter(function(w){return w.user===woFilter.user});
@@ -4869,7 +4983,7 @@ function woFillTable(el){
     if(used[w.id])return;
     if(w.group_id&&byGroup[w.group_id]&&byGroup[w.group_id].length>=2){
       var grp=byGroup[w.group_id];
-      var matW=grp.find(function(x){return x.type==='Материал'});
+      var matW=grp.find(function(x){return x.type==='Материал'||x.type==='Отход'});
       var partsW=grp.find(function(x){return x.type==='Детали'});
       if(matW&&partsW){
         grp.forEach(function(x){used[x.id]=true});
@@ -4878,7 +4992,9 @@ function woFillTable(el){
       }
     }
     used[w.id]=true;
-    rows.push(w.type==='Материал'?{kind:'mat',mat:w}:{kind:'parts',parts:w});
+    if(w.type==='Материал')rows.push({kind:'mat',mat:w});
+    else if(w.type==='Отход')rows.push({kind:'scrap',mat:w});
+    else rows.push({kind:'parts',parts:w});
   });
 
   if(badge)badge.innerHTML='Показано: <strong>'+rows.length+'</strong> / '+allWos.length;
@@ -4891,10 +5007,13 @@ function woFillTable(el){
     '<th>Станок</th><th>Оператор</th><th>Прим.</th><th></th>'+
   '</tr></thead><tbody>'+rows.map(function(row){
     var w=row.parts||row.mat;
-    var isBoth=row.kind==='both';var isMat=row.kind==='mat';var isParts=row.kind==='parts';
+    var isBoth=row.kind==='both';var isMat=row.kind==='mat';var isScrap=row.kind==='scrap';var isParts=row.kind==='parts';
     var typeBadge=isBoth
-      ?'<span class="badge" style="font-size:.72em;background:rgba(139,92,246,.14);color:#7c3aed;border:1px solid rgba(139,92,246,.3)">📦🔩 Мат+Дет</span>'
+      ?(row.mat&&row.mat.type==='Отход'
+        ?'<span class="badge b-warn" style="font-size:.72em">♻🔩 Отход+Дет</span>'
+        :'<span class="badge" style="font-size:.72em;background:rgba(139,92,246,.14);color:#7c3aed;border:1px solid rgba(139,92,246,.3)">📦🔩 Мат+Дет</span>')
       :isMat?'<span class="badge b-info" style="font-size:.73em">📦 Матер.</span>'
+      :isScrap?'<span class="badge b-warn" style="font-size:.73em">♻ Отход</span>'
       :'<span class="badge b-ok" style="font-size:.73em">🔩 Детали</span>';
     var partsW=row.parts;var matW=row.mat;
     var cancelled=isBoth?(partsW.is_cancelled&&matW.is_cancelled):(w.is_cancelled);
@@ -4947,6 +5066,7 @@ function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),a
   openModal('<h2>+ Списание</h2>'+
   '<div class="form-row"><div><label>Тип списания</label><select id="fwo_wotype" onchange="woTypeChg()">'+
     (canMat?'<option value="Материал">📦 Материал</option>':'')+
+    (canMat?'<option value="Отход">♻ Отход (только лог)</option>':'')+
     (canParts?'<option value="Детали" '+(canMat?'':'selected')+'>🔩 Детали</option>':'')+
   '</select></div><div></div></div>'+
   '<div class="form-row full"><div><label>Заказ</label>'+SS('fwo_ord',ordOpts,'','Заказ...',function(v){woOrdChg2(v)})+'</div></div>'+
@@ -4954,6 +5074,7 @@ function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),a
   '<div class="form-row full" id="fwo_comp_wrap" style="display:none"><div><label>Компонент сборки <span style="color:var(--text3);font-size:.85em">(необязательно)</span></label><select id="fwo_comp_sel"><option value="">— вся сборка —</option></select></div></div>'+
   '<div class="form-row"><div><label>Станок</label><div id="fwo_res_wrap"><select id="fwo_res_sel"><option value="">— сначала заказ —</option></select></div></div><div></div></div>'+
   '<div id="fwo_mat_block">'+
+    '<div id="fwo_mat_info_wo" class="info-box" style="display:none;color:var(--warn);font-size:.85em;padding:4px 10px;margin-bottom:4px">♻ Отход: материал не списывается со склада и резерва, только логируется</div>'+
     '<div class="form-row full"><div><label>Материал (из резервов)</label><select id="fwo_mat"><option value="">— сначала деталь —</option></select></div></div>'+
     '<div class="form-row"><div><label>Листов</label><input type="number" id="fwo_sheets" min="1" value="1"></div><div></div></div>'+
   '</div>'+
@@ -4967,10 +5088,15 @@ function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),a
 function woTypeChg(){
   var sel=document.getElementById('fwo_wotype');var t=sel?sel.value:'Материал';
   var mb=document.getElementById('fwo_mat_block');var pb=document.getElementById('fwo_parts_block');
-  if(mb)mb.style.display=t==='Материал'?'':'none';
+  if(mb)mb.style.display=(t==='Материал'||t==='Отход')?'':'none';
   if(pb)pb.style.display=t==='Детали'?'':'none';
   // сбросить компонент-селектор
   var cw=document.getElementById('fwo_comp_wrap');if(cw)cw.style.display='none';
+  // Показать подсказку если Отход
+  var matInfoWo=document.getElementById('fwo_mat_info_wo');
+  if(matInfoWo){
+    matInfoWo.style.display=t==='Отход'?'':'none';
+  }
 }
 
 function woOrdChg2(val){var ordId=+val;if(!ordId)return;
@@ -5020,15 +5146,28 @@ function woItemChg2(){
   if(t!=='Материал')return;
   var itemId=+itemSel.value;if(!itemId)return;
   api('/api/reservations/by-item/'+itemId).then(function(rs){
-    document.getElementById('fwo_mat').innerHTML=rs.map(function(r){return '<option value="'+r.material_id+'" data-rid="'+r.id+'">'+r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
+    document.getElementById('fwo_mat').innerHTML=rs.map(function(r){
+      return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+
+             '" data-pps="'+(r.parts_per_sheets||0)+'" data-shi="'+(r.sheets_input||1)+'">'+
+             r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
 
 function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementById('fwo_item').value;
   if(!ordId){toast('Заказ','err');return}if(!itemId){toast('Деталь','err');return}
   var tSel=document.getElementById('fwo_wotype');var wtype=tSel?tSel.value:'Материал';
   var resId=+document.getElementById('fwo_res_sel').value||null;
   var b={writeoff_type:wtype,user_id:U.id,order_id:ordId,order_item_id:itemId,resource_id:resId,note:document.getElementById('fwo_note').value};
-  if(wtype==='Материал'){var ms=document.getElementById('fwo_mat');var matId=+ms.value;if(!matId){toast('Материал','err');return}
-    b.material_id=matId;b.reservation_id=+(ms.options[ms.selectedIndex].dataset.rid)||null;b.sheets=+document.getElementById('fwo_sheets').value}
+  if(wtype==='Материал'||wtype==='Отход'){
+    var ms=document.getElementById('fwo_mat');var matId=+ms.value;if(!matId){toast('Материал','err');return}
+    var matOpt=ms.options[ms.selectedIndex];
+    var shVal=+document.getElementById('fwo_sheets').value;
+    // Проверка лимита только для обычного списания
+    if(wtype==='Материал'){
+      var maxSh=+(matOpt.dataset.sh||0);
+      if(maxSh>0&&shVal>maxSh){toast('Нельзя списать больше резерва ('+maxSh+' л)','err');return}
+    }
+    b.material_id=matId;b.sheets=shVal;
+    if(wtype==='Материал') b.reservation_id=+(matOpt.dataset.rid)||null;
+  }
   else{var sel=document.getElementById('fwo_optype_sel');b.operation_type=sel?sel.value:'';
     b.parts_good=+document.getElementById('fwo_good').value;b.parts_rejected=+document.getElementById('fwo_rej').value;
     var compSel=document.getElementById('fwo_comp_sel');b.component_template_id=compSel&&+compSel.value?+compSel.value:null;
