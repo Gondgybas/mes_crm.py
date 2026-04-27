@@ -3028,12 +3028,18 @@ def create_app():
         ).join(Order).filter(
             Order.status.notin_(["Отменён"])
         ).all()
-        # Суммируем отгрузки по order_item_id
+        # Суммируем отгрузки строго по паре (order_id, order_item_id) —
+        # чтобы осиротевшие записи после удаления старых заказов не попадали в счётчик
+        valid_item_ids = [it.id for it in items]
         ship_rows = db.query(
+            ShipmentLog.order_id,
             ShipmentLog.order_item_id,
             func.sum(ShipmentLog.quantity).label("total")
-        ).group_by(ShipmentLog.order_item_id).all()
-        ship_totals = {r.order_item_id: int(r.total or 0) for r in ship_rows}
+        ).filter(
+            ShipmentLog.order_item_id.in_(valid_item_ids)
+        ).group_by(ShipmentLog.order_id, ShipmentLog.order_item_id).all()
+        # Ключ: (order_id, order_item_id) → отгружено
+        ship_totals = {(r.order_id, r.order_item_id): int(r.total or 0) for r in ship_rows}
         result = []
         for it in items:
             pt = it.part_template
@@ -3045,7 +3051,7 @@ def create_app():
             ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
             if not last_op: continue  # нет операций — пропускаем
             completed_qty = last_op.completed_qty or 0
-            shipped_qty = ship_totals.get(it.id, 0)
+            shipped_qty = ship_totals.get((it.order_id, it.id), 0)
             available_to_ship = max(0, completed_qty - shipped_qty)
             remaining_to_order = max(0, it.quantity - shipped_qty)
             if completed_qty == 0 and shipped_qty == 0: continue
@@ -3085,8 +3091,10 @@ def create_app():
             ProductionOp.component_template_id.is_(None)
         ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
         completed = (last_op.completed_qty or 0) if last_op else 0
+        # Фильтруем по обоим полям: order_id + order_item_id (защита от переиспользования ID)
         shipped_total = db.query(func.sum(ShipmentLog.quantity)).filter(
-            ShipmentLog.order_item_id == item_id).scalar() or 0
+            ShipmentLog.order_item_id == item_id,
+            ShipmentLog.order_id == item.order_id).scalar() or 0
         available = max(0, completed - shipped_total)
         if qty > available:
             raise HTTPException(400, f"Нельзя отгрузить {qty} шт. — доступно только {available} шт.")
@@ -3099,6 +3107,7 @@ def create_app():
         if order:
             all_items = db.query(OrderItem).filter(OrderItem.order_id == order.id).all()
             total_ordered = sum(i.quantity or 0 for i in all_items)
+            # Считаем только отгрузки данного заказа (по order_id)
             new_shipped = (db.query(func.sum(ShipmentLog.quantity)).filter(
                 ShipmentLog.order_id == order.id).scalar() or 0)
             if total_ordered > 0:
@@ -3114,11 +3123,16 @@ def create_app():
         return {"status": "ok", "shipped": qty}
 
     @app.get("/api/shipment-logs/{order_item_id}")
-    def api_shipment_logs_by_item(order_item_id: int, db: Session = Depends(db_dep)):
+    def api_shipment_logs_by_item(order_item_id: int, order_id: int = 0, db: Session = Depends(db_dep)):
         """История отгрузок по позиции заказа."""
-        logs = db.query(ShipmentLog).options(joinedload(ShipmentLog.user)).filter(
+        q = db.query(ShipmentLog).options(joinedload(ShipmentLog.user)).filter(
             ShipmentLog.order_item_id == order_item_id
-        ).order_by(ShipmentLog.created_at.desc()).all()
+        )
+        # Если передан order_id — фильтруем строго по паре (order_id, order_item_id)
+        # чтобы не показывать историю других заказов при совпадении order_item_id
+        if order_id:
+            q = q.filter(ShipmentLog.order_id == order_id)
+        logs = q.order_by(ShipmentLog.created_at.desc()).all()
         return [{"id": l.id, "quantity": l.quantity, "note": l.note,
                  "user": l.user.full_name if l.user else "—",
                  "date": l.created_at.isoformat()} for l in logs]
@@ -4858,7 +4872,7 @@ function pgReadyToShip(c){
             '<td>'+statusBadge(d.order_status)+shipBadge(d.order_ship_status)+'</td>'+
             '<td style="white-space:nowrap">'+
               (avail>0&&hasPerm('ship.create')?'<button class="btn sm ok" onclick="modalShip('+d.item_id+',\''+esc(d.part_name)+'\','+avail+','+d.quantity+','+shipped+')">🚚 Отгрузить</button>':'')+ 
-              ' <button class="btn sm" style="font-size:.72em" onclick="modalShipHistory('+d.item_id+',\''+esc(d.part_name)+'\')">📋</button>'+
+              ' <button class="btn sm" style="font-size:.72em" onclick="modalShipHistory('+d.item_id+','+d.order_id+',\''+esc(d.part_name)+'\')">📋</button>'+
             '</td>'+
           '</tr>';
         }).join('')+'</tbody></table></div>'
@@ -4896,8 +4910,8 @@ function submitShip(itemId,maxQty){
     closeModal();toast('Отгружено: '+r.shipped+' шт.','ok');refreshPage()
   }).catch(function(e){toast(e.message,'err')})}
 
-function modalShipHistory(itemId,partName){
-  api('/api/shipment-logs/'+itemId).then(function(logs){
+function modalShipHistory(itemId,orderId,partName){
+  api('/api/shipment-logs/'+itemId+'?order_id='+orderId).then(function(logs){
     var h='<h2>📋 История отгрузок: '+esc(partName)+'</h2>'+
       (logs.length
         ?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th style="text-align:center">Кол-во</th><th>Кто</th><th>Прим.</th></tr></thead><tbody>'+
