@@ -2699,15 +2699,12 @@ def create_app():
                 raise HTTPException(400, "Укажите количество")
             audit(db, uid, "Списание материала", "writeoff", 0, f"{mat.name}: {sh}л/{kg}кг")
         elif wtype == "Отход":
-            # Отход: только логирование, склад и резерв не изменяются
-            mat = db.query(Material).get(data["material_id"]) if data.get("material_id") else None
-            sh = int(data.get("sheets", 0))
-            if sh <= 0: raise HTTPException(400, "Укажите количество листов")
-            wo.material_id = data.get("material_id")
-            wo.quantity_sheets = sh
-            if mat:
-                wo.quantity_kg = round(sh * (mat.sheet_weight_kg or 0), 2)
-            audit(db, uid, "Списание отхода", "writeoff", 0, f"{mat.name if mat else '—'}: {sh}л")
+            # Отход: только логирование факта, склад и резерв не изменяются
+            # Материал и количество не требуются
+            wo.material_id = None
+            wo.quantity_sheets = 0
+            wo.quantity_kg = 0
+            audit(db, uid, "Списание отхода", "writeoff", 0, "Отход (без материала)")
         elif wtype == "Детали":
             good = int(data.get("parts_good", 0)); rej = int(data.get("parts_rejected", 0))
             if good == 0 and rej == 0:
@@ -4270,10 +4267,16 @@ function rollbackOp(id){if(!confirm('Откатить?'))return;api('/api/operat
 function onWoMatTypeChange(){
   var t=(document.getElementById('fopwo_mat_type')||{}).value||'normal';
   var info=document.getElementById('fopwo_mat_info');
-  if(!info)return;
+  var sheetsRow=document.getElementById('fopwo_sheets_row');
+  var matRow=document.getElementById('fopwo_mat_row');
   if(t==='scrap'){
-    info.innerHTML='<span style="color:var(--warn)">♻ Режим Отход: материал <strong>не</strong> списывается со склада и резерва, только логируется</span>';
+    if(info)info.innerHTML='<span style="color:var(--warn)">♻ Режим Отход: материал <strong>не</strong> указывается и <strong>не</strong> списывается, только логируется факт отхода</span>';
+    if(sheetsRow)sheetsRow.style.display='none';
+    if(matRow)matRow.style.display='none';
   } else {
+    if(sheetsRow)sheetsRow.style.display='';
+    if(matRow)matRow.style.display='';
+    if(info)info.innerHTML='';
     onWoMatChange();
   }}
 function onWoMatChange(){
@@ -4325,10 +4328,8 @@ function modalOpWriteoff(opid){
   var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
   // Если станок не назначен — подгружаем только совместимые со станком типы
   var pRes=!op.resource_id?api('/api/resources/for-operation/'+encodeURIComponent(op.type)):Promise.resolve(null);
-  // Все материалы — нужны для списания отхода даже без резервов
-  var pMats=showMat?api('/api/materials'):Promise.resolve([]);
-  Promise.all([p,pRes,pMats]).then(function(arr){
-    var reservations=arr[0];var compatResources=arr[1];var allMaterials=arr[2]||[];
+  Promise.all([p,pRes]).then(function(arr){
+    var reservations=arr[0];var compatResources=arr[1];
     // Автоматически определяем нужный компонент из операции — без выбора
     var autoCompKey=op.component_template_id?String(op.component_template_id):'0';
     // Группируем резервы по компоненту
@@ -4378,34 +4379,23 @@ function modalOpWriteoff(opid){
           '<option value="normal">📦 Основное (из резерва)</option>'+
           '<option value="scrap">♻ Отход (только лог)</option>'+
         '</select></div><div></div></div>'+
-        '<div class="form-row full"><div><label>Материал</label>'+
+        '<div id="fopwo_mat_row" class="form-row full"><div><label>Материал</label>'+
         '<select id="fopwo_mat" onchange="onWoMatChange()">'+matOpts+'</select></div></div>'+
         '<div id="fopwo_mat_info" class="info-box" style="font-size:.85em;padding:4px 10px;margin-bottom:4px;min-height:22px"></div>'+
-        '<div class="form-row"><div><label>Листов</label>'+
+        '<div id="fopwo_sheets_row" class="form-row"><div><label>Листов</label>'+
         '<input type="number" id="fopwo_sheets" min="0" value="0" oninput="onWoSheetsChange()">'+
         '<span id="fopwo_sheets_hint" style="font-size:.8em;color:var(--acc);margin-left:8px;white-space:nowrap"></span>'+
         '</div><div></div></div>';
     } else if(showMat){
-      // Нет активных резервов — доступно только списание отхода
-      var scrapMatOpts=allMaterials.map(function(m){
-        return '<option value="'+m.id+'" data-pps="0" data-shi="1">'+m.name+'</option>';
-      }).join('');
+      // Нет активных резервов — доступно только списание отхода (без материала)
       h+='<div class="section-hdr">📦 Материал</div>'+
         '<div class="info-box" style="color:var(--warn);font-size:.85em;margin-bottom:6px">'+
           '⚠ Нет активных резервов для этой операции — доступно только списание <strong>Отхода</strong>'+
         '</div>'+
         '<input type="hidden" id="fopwo_mat_type" value="scrap">'+
-        '<div class="form-row full"><div><label>Материал (отход)</label>'+
-        '<select id="fopwo_mat" onchange="onWoMatChange()">'+
-          (scrapMatOpts||'<option value="">— нет материалов —</option>')+
-        '</select></div></div>'+
-        '<div id="fopwo_mat_info" class="info-box" style="font-size:.85em;padding:4px 10px;margin-bottom:4px;color:var(--warn)">'+
-          '♻ Отход: материал не списывается со склада и резерва, только логируется'+
-        '</div>'+
-        '<div class="form-row"><div><label>Листов</label>'+
-        '<input type="number" id="fopwo_sheets" min="0" value="0" oninput="onWoSheetsChange()">'+
-        '<span id="fopwo_sheets_hint" style="font-size:.8em;color:var(--acc);margin-left:8px;white-space:nowrap"></span>'+
-        '</div><div></div></div>';
+        '<div class="info-box" style="font-size:.85em;padding:4px 10px;margin-bottom:4px;color:var(--warn)">'+
+          '♻ Отход: материал не указывается и не списывается, только логируется факт отхода'+
+        '</div>';
     }
     if(showParts){
       var partNameWO=op.component_name||op.item||'—';
@@ -4472,22 +4462,27 @@ function submitOpWriteoff(opid,showMat,showParts){
 
   var promises=[];
   if(showMat){
-    var matSel=document.getElementById('fopwo_mat');
     var matTypeSel=document.getElementById('fopwo_mat_type');
     var matType=matTypeSel&&matTypeSel.value==='scrap'?'Отход':'Материал';
-    var shVal=+(document.getElementById('fopwo_sheets')||{}).value||0;
-    if(matSel&&shVal>0){
-      var matOpt=matSel.options[matSel.selectedIndex];
-      // Проверка лимита только для основного списания
-      if(matType==='Материал'){
+    if(matType==='Отход'){
+      // Отход: материал и количество не указываются, только логируем факт
+      promises.push(api('/api/writeoffs/create','POST',{
+        writeoff_type:'Отход',user_id:U.id,order_id:op.order_id,
+        order_item_id:op.item_id,resource_id:effResId,group_id:gid,
+        note:'['+op.type+'] '+note}));
+    } else {
+      var matSel=document.getElementById('fopwo_mat');
+      var shVal=+(document.getElementById('fopwo_sheets')||{}).value||0;
+      if(matSel&&shVal>0){
+        var matOpt=matSel.options[matSel.selectedIndex];
         var maxSh=+(matOpt.dataset.sh||0);
         if(maxSh>0&&shVal>maxSh){toast('Нельзя списать больше резерва ('+maxSh+' л)','err');return}
+        var payload={writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
+          order_item_id:op.item_id,resource_id:effResId,group_id:gid,
+          material_id:+matSel.value,sheets:shVal,note:'['+op.type+'] '+note};
+        payload.reservation_id=+(matOpt.dataset.rid)||null;
+        promises.push(api('/api/writeoffs/create','POST',payload));
       }
-      var payload={writeoff_type:matType,user_id:U.id,order_id:op.order_id,
-        order_item_id:op.item_id,resource_id:effResId,group_id:gid,
-        material_id:+matSel.value,sheets:shVal,note:'['+op.type+'] '+note};
-      if(matType==='Материал') payload.reservation_id=+(matOpt.dataset.rid)||null;
-      promises.push(api('/api/writeoffs/create','POST',payload))
     }
   }
   if(showParts){
