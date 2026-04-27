@@ -1752,8 +1752,16 @@ def create_app():
                 o.deadline = datetime.datetime.fromisoformat(data["deadline"]) if data["deadline"] else None
             audit(db, uid, "Редактирование заказа", "order", o.id, o.order_number)
         else:
-            cnt = db.query(Order).count()
-            num = f"ORD-{now_msk().strftime('%y%m')}-{cnt + 1:04d}"
+            prefix = f"ORD-{now_msk().strftime('%y%m')}-"
+            # Ищем максимальный номер за текущий месяц, чтобы не конфликтовать при удалении заказов
+            existing = db.query(Order.order_number).filter(Order.order_number.like(prefix + '%')).all()
+            existing_nums = {r[0] for r in existing}
+            seq = 1
+            while True:
+                num = f"{prefix}{seq:04d}"
+                if num not in existing_nums:
+                    break
+                seq += 1
             dl = datetime.datetime.fromisoformat(data["deadline"]) if data.get("deadline") else None
             o = Order(order_number=num, customer_id=data.get("customer_id") or None,
                       description=data.get("description", ""), priority=data.get("priority", "Обычный"),
@@ -4337,9 +4345,16 @@ function modalOpWriteoff(opid){
       var key=r.part_template_id?String(r.part_template_id):'0';
       var name=r.part_name||'Общие';
       if(!byComp[key])byComp[key]={name:name,items:[]};byComp[key].items.push(r)});
-    // Выбираем резервы строго по операции: если нет точного совпадения — берём "общие" (0)
-    var matchedItems=(byComp[autoCompKey]&&byComp[autoCompKey].items)||
-                     (byComp['0']&&byComp['0'].items)||[];
+    // Для компонентного операции — фильтруем строго по компоненту.
+    // Для обычной детали (component_template_id=null) — берём ВСЕ резервы позиции,
+    // т.к. резервы хранятся с part_template_id = id детали (не null).
+    var matchedItems;
+    if(op.component_template_id){
+      matchedItems=(byComp[autoCompKey]&&byComp[autoCompKey].items)||
+                   (byComp['0']&&byComp['0'].items)||[];
+    } else {
+      matchedItems=reservations.slice();
+    }
 
     // Блок: выбор участка если не задан в заказе — только совместимые станки
     var resBlockHtml='';
