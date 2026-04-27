@@ -1058,27 +1058,101 @@ def create_app():
         db.flush()
         return recalced_items
 
-    def check_sequence_anomaly(db, order_item_id, resource_id, good_qty):
-        item = db.query(OrderItem).get(order_item_id)
+    def check_sequence_anomaly(db, order_item_id, resource_id, good_qty,
+                               comp_tid=None, prod_op_id=None):
+        """Проверяет аномалию последовательности при списании деталей.
+
+        Логика зеркалит вкладку «Операции»:
+        ─ Компонент сборки (comp_tid != None):
+            Все операции данного компонента для этой позиции заказа.
+            Если текущая операция не первая — нельзя превысить completed_qty предыдущей.
+        ─ Сборочный уровень, первая операция (comp_tid=None, is_assembly=True, нет prev_op):
+            Считаем комплекты: min(last_comp_op.completed_qty // ac.quantity) по всем компонентам.
+            Нельзя превысить кол-во доступных комплектов.
+        ─ Сборочный уровень, последующие операции / обычная деталь:
+            Нельзя превысить completed_qty предыдущей операции.
+        """
+        item = db.query(OrderItem).options(
+            joinedload(OrderItem.part_template).joinedload(PartTemplate.components)
+                .joinedload(AssemblyComponent.component)
+        ).get(order_item_id)
         if not item: return False, ""
-        ops = db.query(ProductionOp).filter(
-            ProductionOp.order_item_id == order_item_id
-        ).order_by(ProductionOp.sequence).all()
-        if len(ops) < 2: return False, ""
-        cur_idx = -1
-        for i, op in enumerate(ops):
-            if op.resource_id == resource_id:
-                cur_idx = i; break
+        pt = item.part_template
+        if not pt: return False, ""
+        is_assembly = pt.is_assembly or False
+
+        def find_cur_idx(ops_sorted):
+            """Находим индекс текущей операции: сначала по prod_op_id, потом по resource_id."""
+            if prod_op_id:
+                for i, op in enumerate(ops_sorted):
+                    if op.id == prod_op_id:
+                        return i
+            if resource_id:
+                for i, op in enumerate(ops_sorted):
+                    if op.resource_id == resource_id:
+                        return i
+            return -1
+
+        # ── Случай 1: компонентная операция ──────────────────────────────────
+        if comp_tid is not None:
+            comp_ops = db.query(ProductionOp).filter(
+                ProductionOp.order_item_id == order_item_id,
+                ProductionOp.component_template_id == comp_tid
+            ).order_by(ProductionOp.sequence, ProductionOp.sort_order).all()
+            if len(comp_ops) < 2: return False, ""
+            cur_idx = find_cur_idx(comp_ops)
+            if cur_idx <= 0: return False, ""
+            prev_op = comp_ops[cur_idx - 1]
+            cur_op  = comp_ops[cur_idx]
+            prev_done = prev_op.completed_qty or 0
+            cur_done  = cur_op.completed_qty  or 0
+            if cur_done + good_qty > prev_done:
+                comp_name = pt_display(cur_op.component_template) if cur_op.component_template else f"компонент"
+                return True, (f"[{comp_name}] На «{prev_op.operation_type}» "
+                              f"сделано {prev_done}, а на текущем будет {cur_done + good_qty}")
+            return False, ""
+
+        # ── Случай 2 и 3: сборочный уровень (операции самой сборки / обычной детали) ──
+        asm_ops = db.query(ProductionOp).filter(
+            ProductionOp.order_item_id == order_item_id,
+            ProductionOp.component_template_id.is_(None)
+        ).order_by(ProductionOp.sequence, ProductionOp.sort_order).all()
+        if not asm_ops: return False, ""
+        cur_idx = find_cur_idx(asm_ops)
+        if cur_idx < 0: return False, ""
+        cur_op = asm_ops[cur_idx]
+        cur_done = cur_op.completed_qty or 0
+
+        # ── Случай 2: первая сборочная операция сборочного изделия → проверка комплектов ──
+        if cur_idx == 0 and is_assembly:
+            components = pt.components or []
+            if not components: return False, ""
+            kits = None
+            bottleneck_name = "?"
+            for ac in components:
+                last_comp = db.query(ProductionOp).filter(
+                    ProductionOp.order_item_id == order_item_id,
+                    ProductionOp.component_template_id == ac.component_id
+                ).order_by(ProductionOp.sequence.desc(), ProductionOp.sort_order.desc()).first()
+                avail = (last_comp.completed_qty or 0) if last_comp else 0
+                qty_per = ac.quantity or 1
+                ck = avail // qty_per
+                if kits is None or ck < kits:
+                    kits = ck
+                    bottleneck_name = pt_display(ac.component) if ac.component else f"компонент #{ac.component_id}"
+            kits = kits if kits is not None else 0
+            if cur_done + good_qty > kits:
+                return True, (f"Готово комплектов: {kits} (лимит по «{bottleneck_name}»), "
+                              f"а на сборке будет {cur_done + good_qty}")
+            return False, ""
+
+        # ── Случай 3: не первая операция → сравниваем с предыдущей ─────────────
         if cur_idx <= 0: return False, ""
-        prev_op = ops[cur_idx - 1]
-        prev_logs = db.query(func.coalesce(func.sum(PartStationLog.good_qty), 0)).filter(
-            PartStationLog.order_item_id == order_item_id,
-            PartStationLog.resource_id == prev_op.resource_id).scalar()
-        cur_logs = db.query(func.coalesce(func.sum(PartStationLog.good_qty), 0)).filter(
-            PartStationLog.order_item_id == order_item_id,
-            PartStationLog.resource_id == resource_id).scalar()
-        if cur_logs + good_qty > prev_logs:
-            return True, f"На {prev_op.operation_type} сделано {prev_logs}, а на текущем будет {cur_logs + good_qty}"
+        prev_op = asm_ops[cur_idx - 1]
+        prev_done = prev_op.completed_qty or 0
+        if cur_done + good_qty > prev_done:
+            return True, (f"На «{prev_op.operation_type}» сделано {prev_done}, "
+                          f"а на текущем будет {cur_done + good_qty}")
         return False, ""
 
     def get_first_op_resource_id(db, order_item_id):
@@ -2645,7 +2719,9 @@ def create_app():
             wo.operation_type = op_type
             prod_op_id = data.get("production_op_id")
             wo.production_op_id = prod_op_id
-            is_anom, anom_note = check_sequence_anomaly(db, data["order_item_id"], data.get("resource_id"), good)
+            is_anom, anom_note = check_sequence_anomaly(
+                db, data["order_item_id"], data.get("resource_id"), good,
+                comp_tid=comp_tid, prod_op_id=prod_op_id)
             wo.is_anomaly = is_anom; wo.anomaly_note = anom_note
             db.add(PartStationLog(order_item_id=data["order_item_id"], resource_id=data.get("resource_id"),
                                   operation_type=data.get("operation_type", ""),
