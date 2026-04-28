@@ -34,6 +34,56 @@ def now_msk():
     return datetime.datetime.now(MSK_OFFSET).replace(tzinfo=None)
 
 
+# ─── Защита от брутфорса ────────────────────────────────────────────────────
+# Структура: { "ip": {"attempts": N, "blocked_until": datetime | None} }
+_login_attempts: dict = {}
+_LOGIN_MAX_ATTEMPTS = 5       # попыток до блокировки
+_LOGIN_BLOCK_MINUTES = 15     # минут блокировки
+_LOGIN_ATTEMPT_WINDOW = 600   # секунд — окно для сброса счётчика (10 мин)
+
+def _get_client_ip(request: "Request") -> str:
+    """Получаем реальный IP клиента (с учётом proxy/nginx)."""
+    forwarded = request.headers.get("X-Real-IP") or request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+def _check_brute_force(ip: str):
+    """Проверяет блокировку IP. Бросает HTTPException если заблокирован."""
+    import datetime as _dt
+    now = now_msk()
+    entry = _login_attempts.get(ip)
+    if not entry:
+        return
+    blocked_until = entry.get("blocked_until")
+    if blocked_until and now < blocked_until:
+        remaining = int((blocked_until - now).total_seconds() / 60) + 1
+        raise __import__("fastapi").HTTPException(
+            429, f"Слишком много попыток входа. Подождите {remaining} мин.")
+
+def _record_failed_login(ip: str):
+    """Записывает неудачную попытку. Блокирует после MAX_ATTEMPTS."""
+    now = now_msk()
+    if ip not in _login_attempts:
+        _login_attempts[ip] = {"attempts": 0, "blocked_until": None, "first_attempt": now}
+    entry = _login_attempts[ip]
+    # Сбрасываем счётчик если окно истекло
+    first = entry.get("first_attempt", now)
+    if (now - first).total_seconds() > _LOGIN_ATTEMPT_WINDOW:
+        entry["attempts"] = 0
+        entry["first_attempt"] = now
+        entry["blocked_until"] = None
+    entry["attempts"] += 1
+    if entry["attempts"] >= _LOGIN_MAX_ATTEMPTS:
+        entry["blocked_until"] = now + datetime.timedelta(minutes=_LOGIN_BLOCK_MINUTES)
+        log.warning(f"Brute-force: IP {ip} заблокирован на {_LOGIN_BLOCK_MINUTES} мин. "
+                    f"({entry['attempts']} попыток)")
+
+def _reset_login_attempts(ip: str):
+    """Сбрасывает счётчик после успешного входа."""
+    _login_attempts.pop(ip, None)
+
+
 class Base(DeclarativeBase):
     pass
 
@@ -1235,10 +1285,26 @@ def create_app():
     # ─── Auth ───────────────────────────────────────
     @app.post("/api/auth/login")
     async def api_login(request: Request, db: Session = Depends(db_dep)):
+        ip = _get_client_ip(request)
+        # Проверяем блокировку по IP
+        _check_brute_force(ip)
         data = await request.json()
         user = db.query(User).filter(User.username == data["username"], User.is_active == True).first()
         if not user or not user.check_pw(data["password"]):
-            raise HTTPException(401, "Неверный логин или пароль")
+            _record_failed_login(ip)
+            entry = _login_attempts.get(ip, {})
+            attempts = entry.get("attempts", 1)
+            blocked = entry.get("blocked_until")
+            if blocked:
+                remaining = int((blocked - now_msk()).total_seconds() / 60) + 1
+                raise HTTPException(429, f"Слишком много попыток. IP заблокирован на {remaining} мин.")
+            left = _LOGIN_MAX_ATTEMPTS - attempts
+            if left > 0:
+                raise HTTPException(401, f"Неверный логин или пароль (осталось попыток: {left})")
+            else:
+                raise HTTPException(429, f"Слишком много попыток. Подождите {_LOGIN_BLOCK_MINUTES} мин.")
+        # Успешный вход — сбрасываем счётчик
+        _reset_login_attempts(ip)
         rc = db.query(RoleConfig).filter(RoleConfig.role == user.role).first()
         perms = [p.code for p in rc.permissions] if rc else []
         wo_types = rc.get_wo_types() if rc else []
@@ -1753,6 +1819,16 @@ def create_app():
         if p: db.delete(p); db.commit()
         return {"status": "ok"}
 
+    @app.get("/api/part-templates/{ptid}/files")
+    def api_pt_files(ptid: int, db: Session = Depends(db_dep)):
+        pt = db.query(PartTemplate).get(ptid)
+        if not pt: raise HTTPException(404)
+        return {"id": pt.id, "name": pt.name, "part_number": pt.part_number,
+                "files": [{"id": f.id, "name": f.original_name, "type": f.file_type,
+                           "size": f.file_size, "mime": f.mime_type,
+                           "date": f.uploaded_at.isoformat() if f.uploaded_at else ""}
+                          for f in (pt.files or [])]}
+
     @app.post("/api/part-templates/{ptid}/upload")
     async def api_pt_upload(ptid: int, file: UploadFile = File(...),
                             file_type: str = Form("Чертёж"), description: str = Form(""),
@@ -1777,6 +1853,34 @@ def create_app():
         fpath = UPLOAD_DIR / f.filename
         if not fpath.exists(): raise HTTPException(404)
         return FileResponse(fpath, filename=f.original_name, media_type=f.mime_type)
+
+    @app.get("/api/part-template-files/{fid}/preview")
+    def api_pt_preview(fid: int, db: Session = Depends(db_dep)):
+        """Отдаёт файл для просмотра в браузере. TIFF конвертирует в PNG."""
+        from fastapi.responses import Response as FastResponse
+        f = db.query(PartTemplateFile).get(fid)
+        if not f: raise HTTPException(404)
+        fpath = UPLOAD_DIR / f.filename
+        if not fpath.exists(): raise HTTPException(404)
+        mime = (f.mime_type or "").lower()
+        name_lower = (f.original_name or "").lower()
+        is_tiff = "tiff" in mime or name_lower.endswith(".tiff") or name_lower.endswith(".tif")
+        if is_tiff:
+            try:
+                from PIL import Image
+                import io
+                with Image.open(fpath) as img:
+                    img = img.convert("RGBA") if img.mode in ("RGBA", "LA") else img.convert("RGB")
+                    buf = io.BytesIO()
+                    img.save(buf, format="PNG")
+                    buf.seek(0)
+                    return FastResponse(content=buf.read(), media_type="image/png")
+            except ImportError:
+                raise HTTPException(501, "Pillow не установлен. Установите: pip install Pillow")
+            except Exception as e:
+                raise HTTPException(500, f"Ошибка конвертации TIFF: {e}")
+        # Для PDF и обычных изображений — возвращаем как есть для инлайн просмотра
+        return FileResponse(fpath, media_type=mime or "application/octet-stream")
 
     @app.post("/api/part-template-files/delete")
     async def api_pt_del_file(req: IdReq, db: Session = Depends(db_dep)):
@@ -2198,6 +2302,7 @@ def create_app():
                  "order_number": o.order.order_number if o.order else "",
                  "order_display": o.order.display_name if o.order else "",
                  "item": pt_display(o.order_item.part_template) if o.order_item and o.order_item.part_template else "",
+                 "item_template_id": o.order_item.part_template_id if o.order_item else None,
                  "component_name": pt_display(o.component_template) if o.component_template else "",
                  "component_template_id": o.component_template_id,
                  "item_id": o.order_item_id,
@@ -3642,8 +3747,8 @@ tr:hover td{background:rgba(239,68,68,.04)}
 <div id="loginScreen" style="display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px">
 <div style="background:var(--s1);padding:32px;border-radius:var(--r);width:100%;max-width:360px;box-shadow:var(--shadow)">
 <h2 style="text-align:center;margin-bottom:20px">⚙ <span style="color:var(--accent)">MetalWorks</span> MES</h2>
-<div style="margin-bottom:12px"><label style="font-size:.85em;color:var(--text2)">Логин</label><input id="loginUser" class="ctl" style="width:100%;padding:12px;font-size:1em" value="admin"></div>
-<div style="margin-bottom:16px"><label style="font-size:.85em;color:var(--text2)">Пароль</label><input id="loginPass" class="ctl" type="password" style="width:100%;padding:12px;font-size:1em" value="admin" onkeydown="if(event.key==='Enter')doLogin()"></div>
+<div style="margin-bottom:12px"><label style="font-size:.85em;color:var(--text2)">Логин</label><input id="loginUser" class="ctl" style="width:100%;padding:12px;font-size:1em" placeholder="Введите логин"></div>
+<div style="margin-bottom:16px"><label style="font-size:.85em;color:var(--text2)">Пароль</label><input id="loginPass" class="ctl" type="password" style="width:100%;padding:12px;font-size:1em" placeholder="Введите пароль" onkeydown="if(event.key==='Enter')doLogin()"></div>
 <button class="btn primary" style="width:100%;padding:14px;font-size:1.05em" onclick="doLogin()">Войти</button>
 <div id="loginErr" style="color:var(--err);text-align:center;margin-top:8px;font-size:.85em"></div>
 </div></div>
@@ -4041,14 +4146,54 @@ function pgPartsDB(c){
 
 // Модальное окно просмотра файлов детали (без редактирования)
 function modalPTFiles(ptid,name){
-  api('/api/part-templates').then(function(pts){
-  var p=pts.find(function(x){return x.id===ptid});if(!p)return;
-  var h='<h2>📎 Файлы: '+name+'</h2>';
-  if(!(p.files||[]).length){h+='<div class="info-box">Нет файлов</div>'}
-  else{h+='<div>'+(p.files||[]).map(function(f){return '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--s2);font-size:.9em">'+
-    '<div><a href="/api/part-template-files/'+f.id+'/download" target="_blank" style="color:var(--info)">📄 '+f.name+'</a><span style="color:var(--text3);margin-left:8px;font-size:.8em">'+f.type+'</span></div>'+
-    '<span style="color:var(--text3);font-size:.8em">'+fmtDT(f.date)+'</span></div>'}).join('')+'</div>'}
-  h+='<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)})}
+  api('/api/part-templates/'+ptid+'/files').then(function(p){
+  var h='<h2>📎 Файлы: '+(name||p.name)+(p.part_number?' <span style="font-size:.7em;color:var(--text3);font-weight:400">['+p.part_number+']</span>':'')+'</h2>';
+  if(!(p.files||[]).length){h+='<div class="info-box">Нет прикреплённых файлов</div>'}
+  else{
+    h+='<div id="ptf_viewer" style="display:none;margin-bottom:12px;border:1px solid var(--s2);border-radius:var(--r);overflow:hidden;background:#111;text-align:center"></div>';
+    h+='<div>'+(p.files||[]).map(function(f){
+      var isImg=f.mime&&(f.mime.startsWith('image/'));
+      var isPdf=f.mime==='application/pdf'||f.name.toLowerCase().endsWith('.pdf');
+      var isTiff=f.name.toLowerCase().endsWith('.tiff')||f.name.toLowerCase().endsWith('.tif')||(f.mime&&f.mime.indexOf('tiff')>=0);
+      var canView=isImg||isPdf||isTiff;
+      var ext=(f.name.split('.').pop()||'').toLowerCase();
+      var icon=isPdf?'📄':isImg?'🖼':'📎';
+      var sz=f.size>1048576?(f.size/1048576).toFixed(1)+' МБ':f.size>1024?Math.round(f.size/1024)+' КБ':f.size+' Б';
+      return '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 4px;border-bottom:1px solid var(--s2);gap:8px">'+
+        '<div style="flex:1;min-width:0">'+
+          '<span style="font-size:.88em">'+icon+' <strong style="word-break:break-all">'+f.name+'</strong></span>'+
+          '<span style="color:var(--text3);font-size:.75em;margin-left:8px">'+f.type+'</span>'+
+          '<span style="color:var(--text3);font-size:.75em;margin-left:6px">'+sz+'</span>'+
+        '</div>'+
+        '<div style="display:flex;gap:4px;flex-shrink:0">'+
+          (canView?'<button class="btn sm ok" onclick="viewPTFile('+f.id+',\''+f.mime+'\',\''+encodeURIComponent(f.name)+'\')">👁 Просмотр</button>':'')+
+          '<a class="btn sm" href="/api/part-template-files/'+f.id+'/download" target="_blank">⬇</a>'+
+        '</div>'+
+      '</div>';
+    }).join('')+'</div>';
+  }
+  h+='<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
+  openModal(h)})}
+
+function viewPTFile(fid,mime,fname){
+  var vw=document.getElementById('ptf_viewer');if(!vw)return;
+  var previewUrl='/api/part-template-files/'+fid+'/preview';
+  var downloadUrl='/api/part-template-files/'+fid+'/download';
+  var decodedName=decodeURIComponent(fname);
+  var nameLower=decodedName.toLowerCase();
+  var isImg=mime&&mime.startsWith('image/');
+  var isPdf=mime==='application/pdf'||nameLower.endsWith('.pdf');
+  var isTiff=nameLower.endsWith('.tiff')||nameLower.endsWith('.tif')||(mime&&mime.indexOf('tiff')>=0);
+  vw.style.display='block';
+  if(isPdf){
+    vw.innerHTML='<iframe src="'+previewUrl+'" style="width:100%;height:70vh;border:none"></iframe>';
+  } else if(isImg||isTiff){
+    vw.innerHTML='<div style="padding:8px;text-align:center;color:var(--text3);font-size:.8em">'+(isTiff?'⏳ Конвертация TIFF...':'')+'</div>'+
+      '<img src="'+previewUrl+'" style="max-width:100%;max-height:70vh;object-fit:contain;display:block;margin:auto" '+
+      'onload="this.previousSibling.style.display=\'none\'" '+
+      'onerror="this.previousSibling.innerHTML=\'❌ Не удалось отобразить файл. <a href=&quot;'+downloadUrl+'&quot; target=&quot;_blank&quot;>Скачать</a>\'">';
+  }
+  vw.scrollIntoView({behavior:'smooth',block:'nearest'});}
 
 var ptMaterials=[],ptComponents=[],ptOpTimes=[];
 function modalPartTpl(pid){
@@ -4447,8 +4592,13 @@ function pgOperations(c){
           '<td style="cursor:grab">☰</td>'+
           '<td style="font-size:.85em">'+(o.order_display||o.order_number)+'</td>'+
           '<td>'+(o.component_name
-            ?'<div><strong style="font-size:.88em">🔩 '+o.component_name+'</strong><div style="font-size:.73em;color:var(--text3)">сб: '+(o.item||'—')+'</div></div>'
-            :(o.item||'—'))+
+            ?'<div>'+
+                '<strong style="font-size:.88em;cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.component_template_id+',\''+o.component_name.replace(/'/g,"\\'")+'\')" title="Просмотр файлов детали">🔩 '+o.component_name+'</strong>'+
+                '<div style="font-size:.73em;color:var(--text3)">сб: '+
+                  (o.item_template_id?'<span style="cursor:pointer;color:var(--acc)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))+
+                '</div>'+
+              '</div>'
+            :(o.item_template_id?'<span style="cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—')))+
           '</td>'+
           '<td>'+resCell+'</td>'+
           '<td>'+o.planned_qty+'</td>'+
