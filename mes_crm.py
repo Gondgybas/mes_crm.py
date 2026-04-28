@@ -371,6 +371,7 @@ class OrderItem(Base):
     order = relationship("Order", back_populates="items")
     part_template = relationship("PartTemplate", lazy="joined")
     station_logs = relationship("PartStationLog", back_populates="order_item", cascade="all, delete-orphan")
+    shipment_logs = relationship("ShipmentLog", back_populates="order_item", cascade="all, delete-orphan")
 
     @property
     def surplus(self):
@@ -551,7 +552,7 @@ class ShipmentLog(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     created_at = Column(DateTime, default=now_msk)
     order = relationship("Order")
-    order_item = relationship("OrderItem")
+    order_item = relationship("OrderItem", back_populates="shipment_logs")
     user = relationship("User")
 
 
@@ -727,6 +728,76 @@ def init_database():
     if not insp.has_table("shipment_logs"):
         Base.metadata.tables["shipment_logs"].create(engine)
         log.info("Migration: created shipment_logs table")
+
+    # Миграция: пересоздаём orders и order_items с AUTOINCREMENT (SQLite не переиспользует ID)
+    # Проверяем по sqlite_master — наличие слова AUTOINCREMENT в CREATE TABLE
+    try:
+        with engine.connect() as conn:
+            orders_sql = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='orders'")).scalar() or ""
+            items_sql = conn.execute(text("SELECT sql FROM sqlite_master WHERE type='table' AND name='order_items'")).scalar() or ""
+            need_orders_ai = "AUTOINCREMENT" not in orders_sql.upper()
+            need_items_ai = "AUTOINCREMENT" not in items_sql.upper()
+
+            if need_orders_ai:
+                log.info("Migration: recreating 'orders' table with AUTOINCREMENT to prevent ID reuse")
+                conn.execute(text("PRAGMA foreign_keys = OFF"))
+                # Определяем текущие колонки orders
+                ord_cols_now = [c["name"] for c in insp.get_columns("orders")]
+                ship_col = ", ship_status VARCHAR(50) DEFAULT NULL" if "ship_status" in ord_cols_now else ""
+                conn.execute(text(f"""
+                    CREATE TABLE IF NOT EXISTS orders_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_number VARCHAR(50) UNIQUE NOT NULL,
+                        customer_id INTEGER REFERENCES customers(id),
+                        status VARCHAR(50) NOT NULL DEFAULT 'Черновик',
+                        priority VARCHAR(50) NOT NULL DEFAULT 'Обычный',
+                        total_amount FLOAT DEFAULT 0.0,
+                        description TEXT DEFAULT '',
+                        notes TEXT DEFAULT '',
+                        deadline DATETIME,
+                        created_at DATETIME,
+                        updated_at DATETIME,
+                        completed_at DATETIME
+                        {ship_col}
+                    )"""))
+                # Копируем данные
+                shared_cols = ["id", "order_number", "customer_id", "status", "priority",
+                               "total_amount", "description", "notes", "deadline",
+                               "created_at", "updated_at", "completed_at"]
+                if "ship_status" in ord_cols_now:
+                    shared_cols.append("ship_status")
+                cols_str = ", ".join(shared_cols)
+                conn.execute(text(f"INSERT INTO orders_new ({cols_str}) SELECT {cols_str} FROM orders"))
+                conn.execute(text("DROP TABLE orders"))
+                conn.execute(text("ALTER TABLE orders_new RENAME TO orders"))
+                conn.execute(text("PRAGMA foreign_keys = ON"))
+                conn.commit()
+                log.info("Migration: orders table recreated with AUTOINCREMENT")
+
+            if need_items_ai:
+                log.info("Migration: recreating 'order_items' table with AUTOINCREMENT to prevent ID reuse")
+                conn.execute(text("PRAGMA foreign_keys = OFF"))
+                conn.execute(text("""
+                    CREATE TABLE IF NOT EXISTS order_items_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        order_id INTEGER NOT NULL REFERENCES orders(id),
+                        part_template_id INTEGER NOT NULL REFERENCES part_templates(id),
+                        quantity INTEGER NOT NULL DEFAULT 1,
+                        completed_qty INTEGER DEFAULT 0,
+                        rejected_qty INTEGER DEFAULT 0,
+                        description TEXT DEFAULT ''
+                    )"""))
+                conn.execute(text("""INSERT INTO order_items_new (id, order_id, part_template_id, quantity,
+                    completed_qty, rejected_qty, description)
+                    SELECT id, order_id, part_template_id, quantity, completed_qty, rejected_qty, description
+                    FROM order_items"""))
+                conn.execute(text("DROP TABLE order_items"))
+                conn.execute(text("ALTER TABLE order_items_new RENAME TO order_items"))
+                conn.execute(text("PRAGMA foreign_keys = ON"))
+                conn.commit()
+                log.info("Migration: order_items table recreated with AUTOINCREMENT")
+    except Exception as ex:
+        log.warning(f"Migration AUTOINCREMENT failed (non-critical): {ex}")
 
     with get_db() as db:
         if db.query(OperationTypeCfg).count() == 0:
@@ -1634,6 +1705,19 @@ def create_app():
     async def api_save_pt(request: Request, db: Session = Depends(db_dep)):
         data = await request.json()
         pid = data.get("id")
+        # Проверка уникальности: нельзя создавать 2 детали с одинаковым названием и №чертежа
+        chk_name = (data.get("name") or "").strip()
+        chk_num = (data.get("part_number") or "").strip()
+        if chk_name:
+            dup_q = db.query(PartTemplate).filter(
+                PartTemplate.name == chk_name,
+                PartTemplate.part_number == chk_num)
+            if pid: dup_q = dup_q.filter(PartTemplate.id != int(pid))
+            if dup_q.first():
+                raise HTTPException(400, f"Деталь с названием «{chk_name}» и №чертежа «{chk_num or '—'}» уже существует")
+        # Лимит: только 1 материал на деталь
+        if "materials" in data and len(data["materials"]) > 1:
+            raise HTTPException(400, "Можно назначить только один материал на деталь")
         if pid: p = db.query(PartTemplate).get(pid)
         else: p = PartTemplate(); db.add(p)
         p.name = data.get("name", p.name or "")
@@ -1753,15 +1837,17 @@ def create_app():
             audit(db, uid, "Редактирование заказа", "order", o.id, o.order_number)
         else:
             prefix = f"ORD-{now_msk().strftime('%y%m')}-"
-            # Ищем максимальный номер за текущий месяц, чтобы не конфликтовать при удалении заказов
+            # Используем max+1 (а не первый пробел), чтобы номер никогда не повторялся после удаления
             existing = db.query(Order.order_number).filter(Order.order_number.like(prefix + '%')).all()
-            existing_nums = {r[0] for r in existing}
-            seq = 1
-            while True:
-                num = f"{prefix}{seq:04d}"
-                if num not in existing_nums:
-                    break
-                seq += 1
+            max_seq = 0
+            for r in existing:
+                try:
+                    seq_part = int(r[0][len(prefix):])
+                    if seq_part > max_seq:
+                        max_seq = seq_part
+                except (ValueError, IndexError):
+                    pass
+            num = f"{prefix}{max_seq + 1:04d}"
             dl = datetime.datetime.fromisoformat(data["deadline"]) if data.get("deadline") else None
             o = Order(order_number=num, customer_id=data.get("customer_id") or None,
                       description=data.get("description", ""), priority=data.get("priority", "Обычный"),
@@ -1826,6 +1912,10 @@ def create_app():
                                         order_id=oid, user_id=uid,
                                         note=f"Удаление заказа {o.order_number}"))
             r.is_active = False
+        # Явно удаляем записи отгрузки (ShipmentLog) — иначе при переиспользовании ID они «прилипнут» к новому заказу
+        for sl in db.query(ShipmentLog).filter(ShipmentLog.order_id == oid).all():
+            db.delete(sl)
+        db.flush()
         # Удаляем файлы с диска
         for f in db.query(OrderFile).filter(OrderFile.order_id == oid).all():
             fp = UPLOAD_DIR / f.filename
@@ -3218,6 +3308,46 @@ def create_app():
                  "user": l.user.full_name if l.user else "—",
                  "date": l.created_at.isoformat()} for l in logs]
 
+    @app.post("/api/shipment-logs/delete")
+    async def api_delete_shipment_log(request: Request, db: Session = Depends(db_dep)):
+        """Удаление ошибочной записи об отгрузке (только admin/master)."""
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        log_id = int(data.get("id", 0))
+        reason = data.get("reason", "").strip()
+        if not log_id:
+            raise HTTPException(400, "Не указан ID записи")
+        if not reason:
+            raise HTTPException(400, "Укажите причину удаления")
+        sl = db.query(ShipmentLog).get(log_id)
+        if not sl:
+            raise HTTPException(404, "Запись не найдена")
+        order_id = sl.order_id
+        qty_deleted = sl.quantity
+        item_id = sl.order_item_id
+        audit(db, uid, "Удаление отгрузки", "shipment_log", log_id,
+              f"Удалено {qty_deleted} шт. item_id={item_id}. Причина: {reason}")
+        db.delete(sl)
+        db.flush()
+        # Пересчитываем ship_status заказа
+        order = db.query(Order).get(order_id)
+        if order:
+            all_items = db.query(OrderItem).filter(OrderItem.order_id == order_id).all()
+            total_ordered = sum(i.quantity or 0 for i in all_items)
+            new_shipped = (db.query(func.sum(ShipmentLog.quantity)).filter(
+                ShipmentLog.order_id == order_id).scalar() or 0)
+            if total_ordered > 0:
+                if new_shipped >= total_ordered:
+                    order.ship_status = "Отгружен"
+                elif new_shipped > 0:
+                    order.ship_status = "Частично отгружен"
+                else:
+                    order.ship_status = None
+            else:
+                order.ship_status = None
+        db.flush(); db.commit()
+        return {"status": "ok", "deleted_qty": qty_deleted}
+
     # ─── Logs ───────────────────────────────────────
     @app.get("/api/logs")
     def api_logs(limit: int = 300, action: str = "", user_id: int = 0, db: Session = Depends(db_dep)):
@@ -3784,7 +3914,7 @@ function pgPartsDB(c){
     '<span class="spacer"></span>'+
     '<input class="ctl" id="ptSearchInput" style="width:280px" placeholder="🔍 Поиск..." value="'+esc(ptSearch)+'"></div>'+
   subTabsHtml+
-  '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th><th>Чертёж</th><th>Заказчик</th><th>Материалы</th><th>Операции</th><th>📎</th><th></th></tr></thead>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th><th>Чертёж</th><th>Заказчик</th><th>Материал</th><th>Операции</th><th>📎</th><th></th></tr></thead>'+
   '<tbody>'+(tabData.length?tabData.map(function(p){
     var mats=(p.materials||[]).map(function(m){return m.material_name+': '+m.sheets_input+'л→'+m.parts_per_sheets+'шт'}).join('<br>')||'—';
     var opT=p.operation_times||{};var opStr=Object.entries(opT).map(function(e){return e[0]+': '+(typeof e[1]==='object'?fmtMinToH(Math.round(e[1].per_one)):e[1])}).join(', ')||'—';
@@ -3833,7 +3963,7 @@ function modalPartTpl(pid){
 '<div style="margin-bottom:12px;padding:8px;background:var(--bg);border:1px solid var(--s2);border-radius:var(--r)"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.9em"><input type="checkbox" id="fp_is_asm" '+(p&&p.is_assembly?'checked':'')+' onchange="toggleAsmUI()" style="width:18px;height:18px;accent-color:var(--accent)"> Это сборка (состоит из нескольких деталей)</label></div>'+
   '<div id="fp_asm_section" style="display:'+(p&&p.is_assembly?'block':'none')+'">'+
     '<div class="section-hdr">Компоненты сборки <button class="btn sm" onclick="addPTComp()">+</button></div><div id="fp_comps_list"></div></div>'+
-  '<div class="section-hdr">Материалы <button class="btn sm" onclick="addPTMat()">+</button></div><div id="fp_mats_list"></div>'+
+  '<div class="section-hdr">Материал <button id="fp_mat_add_btn" class="btn sm" onclick="addPTMat()">+</button></div><div id="fp_mats_list"></div>'+
   '<div class="section-hdr">Операции <button class="btn sm" onclick="addPTOp()">+</button></div>'+
   '<div class="info-box" style="font-size:.8em;margin-bottom:6px">Партия + общее время → мин/шт автоматически</div>'+
   '<div id="fp_ops_list"></div>'+
@@ -3885,8 +4015,14 @@ function renderPTMats(allMats){var el=document.getElementById('fp_mats_list');if
     '<div><label>Листов</label><input type="number" value="'+m.sheets_input+'" min="1" style="width:60px" onchange="ptMaterials['+i+'].sheets_input=+this.value"></div>'+
     '<div><label>Штук</label><input type="number" value="'+m.parts_per_sheets+'" min="1" style="width:60px" onchange="ptMaterials['+i+'].parts_per_sheets=+this.value"></div>'+
     '<button class="btn sm" onclick="ptMaterials.splice('+i+',1);renderPTMats(window._allMats)">🗑</button></div>'
-  }).join('');window._allMats=allMats}
-function addPTMat(){if(!window._allMats||!window._allMats.length){toast('Нет материалов','err');return}
+  }).join('');
+  // Скрываем кнопку "+" если материал уже добавлен (ограничение: 1 материал)
+  var addBtn=document.getElementById('fp_mat_add_btn');
+  if(addBtn)addBtn.style.display=ptMaterials.length>=1?'none':'';
+  window._allMats=allMats}
+function addPTMat(){
+  if(ptMaterials.length>=1){toast('Можно назначить только один материал на деталь','err');return}
+  if(!window._allMats||!window._allMats.length){toast('Нет материалов','err');return}
   ptMaterials.push({material_id:window._allMats[0].id,sheets_input:1,parts_per_sheets:1});renderPTMats(window._allMats)}
 
 function toggleAsmUI(){var ch=document.getElementById('fp_is_asm');
@@ -4998,18 +5134,35 @@ function submitShip(itemId,maxQty){
 
 function modalShipHistory(itemId,orderId,partName){
   api('/api/shipment-logs/'+itemId+'?order_id='+orderId).then(function(logs){
+    var canDelete=U&&(U.role==='admin'||U.role==='master');
     var h='<h2>📋 История отгрузок: '+esc(partName)+'</h2>'+
       (logs.length
-        ?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th style="text-align:center">Кол-во</th><th>Кто</th><th>Прим.</th></tr></thead><tbody>'+
+        ?'<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th style="text-align:center">Кол-во</th><th>Кто</th><th>Прим.</th>'+(canDelete?'<th></th>':'')+'</tr></thead><tbody>'+
           logs.map(function(l){return '<tr>'+
             '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(l.date)+'</td>'+
             '<td style="text-align:center;font-weight:700;color:var(--ok)">'+l.quantity+' шт.</td>'+
             '<td style="font-size:.85em">'+esc(l.user)+'</td>'+
             '<td style="font-size:.82em;color:var(--text3)">'+esc(l.note||'—')+'</td>'+
+            (canDelete?'<td><button class="btn sm err" title="Удалить запись об отгрузке" onclick="deleteShipmentLog('+l.id+','+itemId+','+orderId+',\''+esc(partName)+'\')">🗑</button></td>':'')+
           '</tr>'}).join('')+'</tbody></table></div>'
         :'<div class="info-box" style="color:var(--text3)">Отгрузок ещё не было.</div>')+
       '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
     openModal(h)}).catch(function(e){toast(e.message,'err')})}
+
+function deleteShipmentLog(logId,itemId,orderId,partName){
+  var reason=prompt('Причина удаления записи об отгрузке (обязательно):');
+  if(reason===null)return;
+  reason=reason.trim();
+  if(!reason){toast('Укажите причину','err');return}
+  if(!confirm('Удалить запись об отгрузке? Это скорректирует счётчик отгруженных деталей.'))return;
+  api('/api/shipment-logs/delete','POST',{id:logId,reason:reason,user_id:U.id}).then(function(r){
+    toast('Запись удалена (−'+r.deleted_qty+' шт.)','ok');
+    // Обновляем историю
+    modalShipHistory(itemId,orderId,partName);
+    // Обновляем страницу отгрузки в фоне
+    var mc=document.getElementById('mainContent');
+    if(mc&&window._currentPage==='ship')pgReadyToShip(mc);
+  }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
 var woFilter={order:'',op_type:'',resource:'',wtype:'',user:'',customer:'',cancelled:''};
