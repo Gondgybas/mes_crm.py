@@ -3530,22 +3530,128 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .op-cell-active{background:rgba(251,191,36,.15)!important;color:var(--warn)}
 .op-cell-partial{background:rgba(59,130,246,.13)!important;color:var(--info)}
 .op-cell-wait{background:var(--bg);color:var(--text3)}
+
+/* ═══════════════════════════════════════════
+   МОБИЛЬНАЯ АДАПТАЦИЯ (≤ 900px)
+   Десктоп не затрагивается
+   ═══════════════════════════════════════════ */
+@media (max-width:900px){
+  /* --- Шапка --- */
+  .header{padding:8px 12px}
+  .header h1{font-size:1em}
+  .hdr-r{gap:6px;font-size:.8em}
+  .hdr-r .ws-dot{display:none}
+
+  /* --- Навигация: большие кнопки с удобным нажатием --- */
+  .nav{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .nav::-webkit-scrollbar{display:none}
+  .nav button{padding:12px 14px;font-size:.82em;min-height:44px;white-space:nowrap;flex-shrink:0}
+
+  /* --- Основной контент --- */
+  main{padding:10px 8px}
+
+  /* --- Карточки дашборда --- */
+  .cards{grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:8px;margin-bottom:14px}
+  .card{padding:12px}
+  .card .val{font-size:1.4em}
+
+  /* --- Таблицы --- */
+  .tbl-wrap{max-height:none;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  table{font-size:.82em}
+  th{padding:7px 8px;font-size:.72em}
+  td{padding:6px 8px}
+
+  /* --- Тулбар --- */
+  .toolbar{gap:6px;margin-bottom:8px}
+  .toolbar .btn{min-height:40px;padding:8px 12px;font-size:.85em}
+
+  /* --- Кнопки --- */
+  .btn{min-height:38px;padding:7px 12px;font-size:.85em}
+  .btn.sm{min-height:34px;padding:5px 10px;font-size:.8em}
+
+  /* --- Модальное окно --- */
+  .modal-bg{padding-top:0;align-items:flex-end}
+  .modal{width:100%;max-width:100%;max-height:92vh;border-radius:var(--r) var(--r) 0 0;padding:20px 16px;border-bottom:none}
+  .modal .form-row{grid-template-columns:1fr;gap:8px}
+  .modal .form-row.triple{grid-template-columns:1fr 1fr}
+  .modal .actions{flex-wrap:wrap;gap:8px}
+  .modal .actions .btn{flex:1;min-width:120px;justify-content:center}
+  .modal input,.modal select,.modal textarea{padding:10px 12px;font-size:1em}
+  .modal label{font-size:.9em}
+
+  /* --- Фильтр-бар --- */
+  .filter-bar{flex-direction:column;align-items:stretch;gap:8px;padding:10px}
+  .filter-bar label{font-size:.85em}
+  .filter-bar select,.filter-bar input{padding:8px 10px;font-size:.9em;width:100%}
+  /* flex-контейнеры внутри filter-bar */
+  .filter-bar > div[style*="display:flex"]{flex-direction:column!important;align-items:stretch!important;gap:4px!important}
+  .filter-bar > div[style*="display:flex"] label{white-space:normal!important}
+
+  /* --- Строки материалов/операций в редакторе --- */
+  .mat-row{flex-wrap:wrap;gap:8px}
+  .mat-row > div{min-width:120px;flex:1}
+  .mat-row select,.mat-row input{font-size:.9em;padding:8px}
+  .cf-row{flex-wrap:wrap;gap:8px}
+  .cf-row > *{flex:1;min-width:120px}
+
+  /* --- SubTabs --- */
+  .sub-tabs{gap:4px;overflow-x:auto;flex-wrap:nowrap;-webkit-overflow-scrolling:touch;scrollbar-width:none;padding-bottom:2px}
+  .sub-tabs::-webkit-scrollbar{display:none}
+  .sub-tabs button{white-space:nowrap;flex-shrink:0;min-height:40px;padding:8px 14px;font-size:.85em}
+
+  /* --- Info-box --- */
+  .info-box{padding:10px;font-size:.88em}
+
+  /* --- Операционный флоу в карточках деталей --- */
+  .op-flow{gap:3px}
+  .op-step{min-width:70px;padding:4px 6px;font-size:.75em}
+
+  /* --- Поисковый select (SS) --- */
+  .ss-input{padding:10px 30px 10px 10px;font-size:.95em}
+  .ss-opt{padding:10px 12px;font-size:.9em}
+
+  /* --- Бейджи --- */
+  .badge{font-size:.72em;padding:3px 7px}
+
+  /* --- Кнопки logout/refresh в шапке --- */
+  .hdr-r #themeCtl{display:none}
+}
+
+/* ═══ Очень маленькие экраны (< 480px) ═══ */
+@media (max-width:480px){
+  .header h1 .hdr-title{display:none}
+  .nav button{padding:10px 10px;font-size:.78em}
+  main{padding:8px 6px}
+  .cards{grid-template-columns:1fr 1fr}
+  .card{padding:10px}
+  .card .val{font-size:1.25em}
+  .card h4{font-size:.65em}
+  table{font-size:.78em}
+  th{padding:6px 6px;font-size:.68em}
+  td{padding:5px 6px}
+  .modal{padding:16px 12px;max-height:95vh}
+  .modal .form-row.triple{grid-template-columns:1fr}
+  .btn{padding:8px 10px;font-size:.82em}
+  .hdr-r .btn{padding:6px 8px;font-size:.78em}
+  /* Скрываем текст кнопок "↻ Выход" — оставляем только иконки */
+  .hdr-r #logoutBtn .btn-label{display:none}
+}
 </style>
 </head>
 <body>
-<div id="loginScreen" style="display:flex;justify-content:center;align-items:center;min-height:100vh">
-<div style="background:var(--s1);padding:32px;border-radius:var(--r);width:360px;box-shadow:var(--shadow)">
+<div id="loginScreen" style="display:flex;justify-content:center;align-items:center;min-height:100vh;padding:16px">
+<div style="background:var(--s1);padding:32px;border-radius:var(--r);width:100%;max-width:360px;box-shadow:var(--shadow)">
 <h2 style="text-align:center;margin-bottom:20px">⚙ <span style="color:var(--accent)">MetalWorks</span> MES</h2>
-<div style="margin-bottom:12px"><label style="font-size:.85em;color:var(--text2)">Логин</label><input id="loginUser" class="ctl" style="width:100%;padding:10px" value="admin"></div>
-<div style="margin-bottom:16px"><label style="font-size:.85em;color:var(--text2)">Пароль</label><input id="loginPass" class="ctl" type="password" style="width:100%;padding:10px" value="admin"></div>
-<button class="btn primary" style="width:100%;padding:12px;font-size:1em" onclick="doLogin()">Войти</button>
+<div style="margin-bottom:12px"><label style="font-size:.85em;color:var(--text2)">Логин</label><input id="loginUser" class="ctl" style="width:100%;padding:12px;font-size:1em" value="admin"></div>
+<div style="margin-bottom:16px"><label style="font-size:.85em;color:var(--text2)">Пароль</label><input id="loginPass" class="ctl" type="password" style="width:100%;padding:12px;font-size:1em" value="admin" onkeydown="if(event.key==='Enter')doLogin()"></div>
+<button class="btn primary" style="width:100%;padding:14px;font-size:1.05em" onclick="doLogin()">Войти</button>
 <div id="loginErr" style="color:var(--err);text-align:center;margin-top:8px;font-size:.85em"></div>
 </div></div>
 <div id="appShell" style="display:none">
-<div class="header"><h1>⚙ <span>MetalWorks</span> MES</h1>
+<div class="header"><h1>⚙ <span>MetalWorks</span> <span class="hdr-title">MES</span></h1>
 <div class="hdr-r"><span class="ws-dot" id="wsDot"></span><span id="userInfo"></span>
 <select class="ctl" id="themeCtl" onchange="toggleTheme()"><option value="dark">🌙</option><option value="light">☀</option></select>
-<button class="btn" onclick="refreshPage()">↻</button><button class="btn" onclick="doLogout()">Выход</button></div></div>
+<button class="btn" onclick="refreshPage()">↻</button><button class="btn" id="logoutBtn" onclick="doLogout()"><span class="btn-label">Выход</span></button></div></div>
 <div class="nav" id="mainNav"></div>
 <main id="mainContent"></main></div>
 <div id="toast"></div>
