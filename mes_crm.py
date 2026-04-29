@@ -3908,35 +3908,53 @@ function dashDetail(w){api('/api/analytics/dashboard/detail/'+w).then(function(d
   h+='</tbody></table></div><div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';openModal(h)}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ЗАКАЗЫ ═══
-var ordFilter={status:'',priority:'',search:'',overdue:false,ship_status:''};var ordSearchTimer=null;
+var _ordItems=[],_ordFilters={};
+window._ordFilters=_ordFilters;
+window._ordGetVal=function(o,col){
+  if(col==='number')return o.number||'';
+  if(col==='customer')return o.customer||'';
+  if(col==='priority')return o.priority||'';
+  if(col==='status')return o.status||'';
+  if(col==='ship_status')return o.ship_status||'';
+  return '';};
+window._ordRender=function(){_ordRenderTable();};
+
 function pgOrders(c){api('/api/orders').then(function(allOrders){
-  var orders=allOrders;
-  if(ordFilter.status)orders=orders.filter(function(o){return o.status===ordFilter.status});
-  if(ordFilter.ship_status)orders=orders.filter(function(o){return o.ship_status===ordFilter.ship_status});
-  if(ordFilter.priority)orders=orders.filter(function(o){return o.priority===ordFilter.priority});
-  if(ordFilter.overdue)orders=orders.filter(function(o){return o.overdue});
-  if(ordFilter.search){var sq=ordFilter.search.toLowerCase();orders=orders.filter(function(o){return o.number.toLowerCase().indexOf(sq)>=0||(o.customer||'').toLowerCase().indexOf(sq)>=0||(o.description||'').toLowerCase().indexOf(sq)>=0})}
+  _ordItems=allOrders;window['_ordItems']=allOrders;window['_ordFilters']=_ordFilters;
   var activeCnt=allOrders.filter(function(o){return['Новый','Ожидает','В работе'].indexOf(o.status)>=0}).length;
   var overdueCnt=allOrders.filter(function(o){return o.overdue}).length;
-  c.innerHTML='<div class="toolbar">'+(hasPerm('order.create')?'<button class="btn primary" onclick="modalOrder()">+ Новый заказ</button>':'')+
+  c.innerHTML='<div class="toolbar">'+
+    (hasPerm('order.create')?'<button class="btn primary" onclick="modalOrder()">+ Новый заказ</button>':'')+
     (hasPerm('order.reports')?'<button class="btn" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalReports()">📊 Отчёты</button>':'')+
-    '<span class="spacer"></span><span style="font-size:.85em;color:var(--text2)">Показано: <strong>'+orders.length+'</strong> / '+allOrders.length+'</span>'+
-    '<a href="/api/export/orders'+(ordFilter.status?'?status='+encodeURIComponent(ordFilter.status):'')+'" class="btn sm" title="Экспорт в CSV" download>📥 CSV</a></div>'+
-  '<div class="filter-bar">'+
-    '<label>Поиск:</label><input id="ordSearchInp" style="width:200px" placeholder="№, клиент, описание..." value="'+esc(ordFilter.search)+'">'+
-    '<label>Статус:</label><select onchange="ordFilter.status=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
-      '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(ordFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
-    '<label>Отгрузка:</label><select onchange="ordFilter.ship_status=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
-      '<option value="">Все</option>'+SHIP_STATUSES.map(function(s){return '<option '+(ordFilter.ship_status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
-    '<label>Приоритет:</label><select onchange="ordFilter.priority=this.value;pgOrders(document.getElementById(\'mainContent\'))">'+
-      '<option value="">Все</option>'+PRIORITIES.map(function(p){return '<option '+(ordFilter.priority===p?'selected':'')+'>'+p+'</option>'}).join('')+'</select>'+
-    (overdueCnt>0?'<button class="btn sm '+(ordFilter.overdue?'primary warn':'')+'" onclick="ordFilter.overdue=!ordFilter.overdue;pgOrders(document.getElementById(\'mainContent\'))">⚠ Просроч. ('+overdueCnt+')</button>':'')+
-    '<button class="btn sm" onclick="ordFilter={status:\'\',priority:\'\',search:\'\',overdue:false,ship_status:\'\'};pgOrders(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
-  '</div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>№</th><th>Клиент</th><th>Описание</th><th>Сумма</th><th>Поз.</th><th>Приор.</th><th>Статус</th><th>Дедлайн</th><th>Заверш.</th><th>📎</th><th></th></tr></thead>'+
-  '<tbody>'+(orders.length?orders.map(function(o){return '<tr '+(o.overdue?'class="overdue-row"':'')+'>'+
-    '<td><strong>'+o.number+'</strong></td><td>'+o.customer+'</td><td title="'+esc(o.description)+'">'+(o.description||'').substring(0,35)+'</td>'+
-    '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td><td>'+statusBadge(o.priority)+'</td><td>'+statusBadge(o.status)+shipBadge(o.ship_status)+'</td>'+
+    (overdueCnt>0?'<button class="btn warn" onclick="tblFpResetAll(\'ord\')">⚠ Просроч. ('+overdueCnt+')</button>':'')+
+    '<span class="spacer"></span>'+
+    '<span id="ord_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'ord\')">✕ Сброс фильтров</button>'+
+    '<a href="/api/export/orders" class="btn sm" title="Экспорт в CSV" download>📥 CSV</a></div>'+
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    tblFTh('№','ord','number')+
+    tblFTh('Клиент','ord','customer')+
+    '<th>Описание</th>'+
+    '<th>Сумма</th><th>Поз.</th>'+
+    tblFTh('Приор.','ord','priority')+
+    tblFTh('Статус','ord','status')+
+    tblFTh('Отгрузка','ord','ship_status')+
+    '<th>Дедлайн</th><th>Заверш.</th><th>📎</th><th></th>'+
+  '</tr></thead><tbody id="ordTbody"></tbody></table></div>';
+  _ordRenderTable();})}
+
+function _ordRenderTable(){
+  var orders=tblGetFiltered('ord');
+  var tbody=document.getElementById('ordTbody');if(!tbody)return;
+  var cnt=document.getElementById('ord_count');
+  if(cnt)cnt.innerHTML='Показано: <strong>'+orders.length+'</strong> / '+(_ordItems.length);
+  tbody.innerHTML=orders.length?orders.map(function(o){return '<tr '+(o.overdue?'class="overdue-row"':'')+'>'+
+    '<td><strong>'+o.number+'</strong></td><td>'+o.customer+'</td>'+
+    '<td title="'+esc(o.description)+'">'+(o.description||'').substring(0,35)+'</td>'+
+    '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td>'+
+    '<td>'+statusBadge(o.priority)+'</td>'+
+    '<td>'+statusBadge(o.status)+shipBadge(o.ship_status)+'</td>'+
+    '<td>'+shipBadge(o.ship_status)+'</td>'+
     '<td '+(o.overdue?'class="low"':'')+'>'+fmtD(o.deadline)+(o.overdue?' ⚠':'')+'</td>'+
     '<td>'+fmtD(o.completed_at)+'</td>'+
     '<td>'+((o.files||[]).length?'📎'+(o.files||[]).length:'—')+'</td>'+
@@ -3946,11 +3964,9 @@ function pgOrders(c){api('/api/orders').then(function(allOrders){
       (hasPerm('order.edit')?'<button class="btn sm" onclick="modalOrder('+o.id+')">✏</button>':'')+
       (hasPerm('order.delete')?'<button class="btn sm" onclick="delOrder('+o.id+',\''+esc(o.number)+'\')" style="color:var(--err)" title="Удалить заказ">🗑</button>':'')+
       (hasPerm('order.status')?'<select class="ctl" style="padding:3px;font-size:.8em" onchange="chgStatus('+o.id+',this.value)">'+STATUSES.map(function(s){return '<option '+(s===o.status?'selected':'')+'>'+s+'</option>'}).join('')+'</select>':'')+
-    '</td></tr>'}).join(''):'<tr><td colspan="11" style="text-align:center;color:var(--text3);padding:20px">Нет заказов по выбранным фильтрам</td></tr>')+'</tbody></table></div>';
-  var inp=document.getElementById('ordSearchInp');
-  if(inp){inp.addEventListener('input',function(){ordFilter.search=this.value;clearTimeout(ordSearchTimer);ordSearchTimer=setTimeout(function(){pgOrders(document.getElementById('mainContent'))},350)});
-    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);}
-})}
+    '</td></tr>';}).join('')
+    :'<tr><td colspan="12" style="text-align:center;color:var(--text3);padding:20px">Нет заказов по выбранным фильтрам</td></tr>';
+  tblUpdateBtns('ord');}
 function chgStatus(oid,s){
   api('/api/orders/'+oid+'/status','POST',{status:s,user_id:U.id}).then(function(r){
     if(r.status==='warning'){if(confirm(r.message)){api('/api/orders/'+oid+'/status','POST',{status:s,user_id:U.id,force:true}).then(function(){toast('Обновлён','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}else{refreshPage()}}
@@ -4117,44 +4133,59 @@ function loadReport(){var f=document.getElementById('rpt_from').value;var t=docu
   document.getElementById('rptResult').innerHTML=h}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ДЕТАЛИ БД ═══
-var ptSearch='',ptSearchTimer=null,ptSubTab='parts';
-function pgPartsDB(c){
-  api('/api/part-templates?search='+encodeURIComponent(ptSearch)).then(function(pts){
+var ptSubTab='parts';
+var _ptItems=[],_ptFilters={};
+window._ptFilters=_ptFilters;
+window._ptGetVal=function(p,col){
+  if(col==='display_name')return p.display_name||'';
+  if(col==='part_number')return p.part_number||'';
+  if(col==='customer_name')return p.customer_name||'';
+  return '';};
+window._ptRender=function(){_ptRenderTable();};
 
-  // Под-табы
+function pgPartsDB(c){
+  api('/api/part-templates').then(function(pts){
   var parts=pts.filter(function(p){return !p.is_assembly});
   var assemblies=pts.filter(function(p){return p.is_assembly});
   var tabData=ptSubTab==='assemblies'?assemblies:parts;
-
+  _ptItems=tabData;window['_ptItems']=tabData;window['_ptFilters']=_ptFilters;
   var subTabsHtml='<div style="display:flex;gap:6px;padding:0 0 12px">'+
     '<button class="btn'+(ptSubTab==='parts'?' primary':'')+'" onclick="ptSubTab=\'parts\';pgPartsDB(document.getElementById(\'mainContent\'))">'+
       '🔩 Детали ('+parts.length+')</button>'+
     '<button class="btn'+(ptSubTab==='assemblies'?' primary':'')+'" onclick="ptSubTab=\'assemblies\';pgPartsDB(document.getElementById(\'mainContent\'))">'+
       '🔧 Сборочные единицы ('+assemblies.length+')</button>'+
   '</div>';
-
-  c.innerHTML='<div class="toolbar">'+(hasPerm('parts.create')?'<button class="btn primary" onclick="modalPartTpl()">+ Новая деталь</button>':'')+
+  c.innerHTML='<div class="toolbar">'+
+    (hasPerm('parts.create')?'<button class="btn primary" onclick="modalPartTpl()">+ Новая деталь</button>':'')+
     '<span class="spacer"></span>'+
-    '<input class="ctl" id="ptSearchInput" style="width:280px" placeholder="🔍 Поиск..." value="'+esc(ptSearch)+'"></div>'+
+    '<span id="pt_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'pt\')">✕ Сброс</button></div>'+
   subTabsHtml+
-  '<div class="tbl-wrap"><table><thead><tr><th>Наименование</th><th>Чертёж</th><th>Заказчик</th><th>Материал</th><th>Операции</th><th>📎</th><th></th></tr></thead>'+
-  '<tbody>'+(tabData.length?tabData.map(function(p){
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    tblFTh('Наименование','pt','display_name')+
+    tblFTh('Чертёж','pt','part_number')+
+    tblFTh('Заказчик','pt','customer_name')+
+    '<th>Материал</th><th>Операции</th><th>📎</th><th></th>'+
+  '</tr></thead><tbody id="ptTbody"></tbody></table></div>';
+  _ptRenderTable();})}
+
+function _ptRenderTable(){
+  var items=tblGetFiltered('pt');
+  var tbody=document.getElementById('ptTbody');if(!tbody)return;
+  var cnt=document.getElementById('pt_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
+  tbody.innerHTML=items.length?items.map(function(p){
     var mats=(p.materials||[]).map(function(m){return m.material_name+': '+m.sheets_input+'л→'+m.parts_per_sheets+'шт'}).join('<br>')||'—';
     var opT=p.operation_times||{};var opStr=Object.entries(opT).map(function(e){return e[0]+': '+(typeof e[1]==='object'?fmtMinToH(Math.round(e[1].per_one)):e[1])}).join(', ')||'—';
     var filesHtml='';
-    if((p.files||[]).length&&hasPerm('parts.files')){
-      filesHtml='<button class="btn sm" onclick="modalPTFiles('+p.id+',\''+esc(p.display_name)+'\')">📎'+p.files.length+'</button>';
-    } else if((p.files||[]).length){filesHtml='📎'+p.files.length}else{filesHtml='—'}
-    return '<tr><td><strong>'+(p.is_assembly?'🔧 ':'🔩 ')+p.display_name+'</strong></td><td>'+(p.part_number||'—')+'</td><td>'+p.customer_name+'</td>'+
-    '<td style="font-size:.8em">'+mats+'</td><td style="font-size:.8em">'+opStr+'</td>'+
-    '<td>'+filesHtml+'</td>'+
-    '<td>'+(hasPerm('parts.edit')?'<button class="btn sm" onclick="modalPartTpl('+p.id+')">✏</button><button class="btn sm" onclick="delPT('+p.id+')">🗑</button>':'')+'</td></tr>';
-  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text3)">Нет данных</td></tr>')+'</tbody></table></div>';
-
-  var inp=document.getElementById('ptSearchInput');
-  if(inp){inp.addEventListener('input',function(){ptSearch=this.value;clearTimeout(ptSearchTimer);ptSearchTimer=setTimeout(function(){pgPartsDB(document.getElementById('mainContent'))},400)});
-    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)}
-  })}
+    if((p.files||[]).length&&hasPerm('parts.files'))filesHtml='<button class="btn sm" onclick="modalPTFiles('+p.id+',\''+esc(p.display_name)+'\')">📎'+p.files.length+'</button>';
+    else if((p.files||[]).length)filesHtml='📎'+p.files.length;else filesHtml='—';
+    return '<tr><td><strong>'+(p.is_assembly?'🔧 ':'🔩 ')+p.display_name+'</strong></td>'+
+      '<td>'+(p.part_number||'—')+'</td><td>'+p.customer_name+'</td>'+
+      '<td style="font-size:.8em">'+mats+'</td><td style="font-size:.8em">'+opStr+'</td>'+
+      '<td>'+filesHtml+'</td>'+
+      '<td>'+(hasPerm('parts.edit')?'<button class="btn sm" onclick="modalPartTpl('+p.id+')">✏</button><button class="btn sm" onclick="delPT('+p.id+')">🗑</button>':'')+'</td></tr>';
+  }).join(''):'<tr><td colspan="7" style="text-align:center;color:var(--text3)">Нет данных</td></tr>';
+  tblUpdateBtns('pt');}
 
 // Модальное окно просмотра файлов детали (без редактирования)
 function modalPTFiles(ptid,name){
@@ -4437,7 +4468,9 @@ function whShowFilter(colKey,btnEl){
 function whFpSearch(inp){
   var q=inp.value.toLowerCase();
   document.querySelectorAll('#whFpList .wh-fp-item').forEach(function(lbl){
-    lbl.style.display=lbl.textContent.toLowerCase().includes(q)?'':'none';});
+    var visible=lbl.textContent.toLowerCase().includes(q);
+    lbl.style.display=visible?'':'none';
+    if(!visible){var cb=lbl.querySelector('input');if(cb)cb.checked=false;}});
   whFpUpdateSelAll();}
 
 function whFpUpdateSelAll(){
@@ -4464,6 +4497,94 @@ function whFpReset(colKey){
   var p=document.getElementById('whFilterPopup');if(p)p.remove();
   _whRenderTable();}
 
+// ═══════════════════════════════════════════════
+// UNIVERSAL EXCEL-FILTER ENGINE (namespace based)
+// Usage: register ns via window._NS_Items, _NS_Filters, _NS_GetVal, _NS_Render
+// ═══════════════════════════════════════════════
+function tblGetFiltered(ns){
+  var items=window['_'+ns+'Items']||[];
+  var filters=window['_'+ns+'Filters']||{};
+  var getVal=window['_'+ns+'GetVal'];if(!getVal)return items;
+  return items.filter(function(row){return Object.keys(filters).every(function(col){
+    var s=filters[col];if(!s||s.size===0)return true;
+    return s.has(getVal(row,col));});});}
+
+function tblShowFilter(ns,colKey,btnEl){
+  var ex=document.getElementById('whFilterPopup');
+  if(ex){if(ex.dataset.col===colKey&&ex.dataset.ns===ns){ex.remove();return;}ex.remove();}
+  var allItems=window['_'+ns+'Items']||[];
+  var filters=window['_'+ns+'Filters']||{};
+  var getVal=window['_'+ns+'GetVal'];if(!getVal)return;
+  var baseItems=allItems.filter(function(row){return Object.keys(filters).every(function(col){
+    if(col===colKey)return true;
+    var s=filters[col];if(!s||s.size===0)return true;
+    return s.has(getVal(row,col));});});
+  var vals={};baseItems.forEach(function(row){var v=getVal(row,colKey);vals[v]=(vals[v]||0)+1;});
+  var sortedVals=Object.keys(vals).sort();
+  var activeSet=filters[colKey]||null;
+  var popup=document.createElement('div');
+  popup.id='whFilterPopup';popup.dataset.col=colKey;popup.dataset.ns=ns;popup.className='wh-filter-popup';
+  popup.innerHTML=
+    '<div class="wh-fp-search"><input type="text" placeholder="🔍 Быстрый поиск..." oninput="tblFpSearch(this)" id="whFpSearchInput" autocomplete="off"></div>'+
+    '<div class="wh-fp-selall"><label><input type="checkbox" id="whFpSelAll" onchange="tblFpToggleAll(this)"> <strong>Выбрать все</strong></label></div>'+
+    '<div class="wh-fp-list" id="whFpList">'+
+    sortedVals.map(function(v){var chk=(activeSet===null||activeSet.has(v))?'checked':'';
+      return '<label class="wh-fp-item"><input type="checkbox" value="'+esc(v)+'" '+chk+' onchange="whFpUpdateSelAll()"> '+(v||'<em>(пусто)</em>')+'<span class="wh-fp-count">('+vals[v]+')</span></label>';
+    }).join('')+
+    '</div>'+
+    '<div class="wh-fp-actions">'+
+      '<button class="btn sm primary" onclick="tblFpApply(\''+ns+'\',\''+colKey+'\')">✔ Применить</button>'+
+      '<button class="btn sm" onclick="tblFpReset(\''+ns+'\',\''+colKey+'\')">✖ Сбросить</button>'+
+      '<button class="btn sm" onclick="document.getElementById(\'whFilterPopup\').remove()">Закрыть</button>'+
+    '</div>';
+  var rect=btnEl.getBoundingClientRect();
+  popup.style.top=(rect.bottom+4)+'px';
+  popup.style.left=Math.min(rect.left,window.innerWidth-310)+'px';
+  document.body.appendChild(popup);
+  whFpUpdateSelAll();
+  document.getElementById('whFpSearchInput').focus();
+  setTimeout(function(){document.addEventListener('click',function h(e){if(!popup.contains(e.target)&&e.target!==btnEl){popup.remove();document.removeEventListener('click',h);}});},0);}
+
+function tblFpSearch(inp){
+  var q=inp.value.toLowerCase();
+  document.querySelectorAll('#whFpList .wh-fp-item').forEach(function(lbl){
+    var visible=lbl.textContent.toLowerCase().includes(q);
+    lbl.style.display=visible?'':'none';
+    if(!visible){var cb=lbl.querySelector('input');if(cb)cb.checked=false;}});
+  whFpUpdateSelAll();}
+
+function tblFpToggleAll(selCb){
+  document.querySelectorAll('#whFpList .wh-fp-item').forEach(function(lbl){
+    if(lbl.style.display!=='none'){var cb=lbl.querySelector('input');if(cb)cb.checked=selCb.checked;}});}
+
+function tblFpApply(ns,colKey){
+  if(!window['_'+ns+'Filters'])window['_'+ns+'Filters']={};
+  var cbs=document.querySelectorAll('#whFpList input[type=checkbox]');
+  var sel=new Set(),all=true;
+  cbs.forEach(function(cb){if(cb.checked)sel.add(cb.value);else all=false;});
+  if(all||sel.size===0)delete window['_'+ns+'Filters'][colKey];else window['_'+ns+'Filters'][colKey]=sel;
+  var p=document.getElementById('whFilterPopup');if(p)p.remove();
+  if(window['_'+ns+'Render'])window['_'+ns+'Render']();}
+
+function tblFpReset(ns,colKey){
+  if(window['_'+ns+'Filters'])delete window['_'+ns+'Filters'][colKey];
+  var p=document.getElementById('whFilterPopup');if(p)p.remove();
+  if(window['_'+ns+'Render'])window['_'+ns+'Render']();}
+
+function tblFpResetAll(ns){
+  window['_'+ns+'Filters']={};
+  var p=document.getElementById('whFilterPopup');if(p)p.remove();
+  if(window['_'+ns+'Render'])window['_'+ns+'Render']();}
+
+function tblFTh(label,ns,col){
+  return '<th class="wh-filter-col">'+label+' <span class="col-filter-btn" id="cfb_'+ns+'_'+col+'" onclick="tblShowFilter(\''+ns+'\',\''+col+'\',this)">▼</span></th>';}
+
+function tblUpdateBtns(ns){
+  var filters=window['_'+ns+'Filters']||{};
+  document.querySelectorAll('[id^="cfb_'+ns+'_"]').forEach(function(btn){
+    var col=btn.id.slice(('cfb_'+ns+'_').length);
+    var act=!!(filters[col]&&filters[col].size>0);
+    btn.classList.toggle('filter-active',act);btn.textContent=act?'🔽':'▼';});}
 
 function modalNeedMat(){api('/api/materials/need-for-orders').then(function(need){
   openModal('<h2>⚠ Дефицит</h2><table><thead><tr><th>Название</th><th>Дефицит</th></tr></thead>'+
@@ -5021,38 +5142,61 @@ function submitOpWriteoff(opid,showMat,showParts){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ РЕЗЕРВЫ ═══
-var resFilter={type:'',order:'',status:'',part:'',active_only:1};
-function pgReservations(c){api('/api/reservations?active_only='+resFilter.active_only).then(function(rs){
-  if(resFilter.type)rs=rs.filter(function(r){return r.material_type===resFilter.type});
-  if(resFilter.order)rs=rs.filter(function(r){return r.order_display.toLowerCase().indexOf(resFilter.order.toLowerCase())>=0});
-  if(resFilter.status)rs=rs.filter(function(r){return r.order_status===resFilter.status});
-  if(resFilter.part)rs=rs.filter(function(r){return r.part_name.toLowerCase().indexOf(resFilter.part.toLowerCase())>=0});
-  c.innerHTML='<div class="toolbar">'+(hasPerm('reserve.create')?'<button class="btn primary" onclick="modalCreateRes()">+ Резерв</button>':'')+'</div>'+
-  '<div class="filter-bar"><label>Тип:</label><select onchange="resFilter.type=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<option value="">Все</option>'+['Лист','Труба','Пруток','Метиз','Краска','Прочее'].map(function(t){return '<option '+(resFilter.type===t?'selected':'')+'>'+t+'</option>'}).join('')+'</select>'+
-    '<label>Заказ:</label><input style="width:150px" value="'+esc(resFilter.order)+'" onchange="resFilter.order=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<label>Деталь:</label><input style="width:150px" value="'+esc(resFilter.part)+'" onchange="resFilter.part=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<label>Статус:</label><select onchange="resFilter.status=this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<option value="">Все</option>'+STATUSES.map(function(s){return '<option '+(resFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+'</select>'+
-    '<label>Резервы:</label><select onchange="resFilter.active_only=+this.value;pgReservations(document.getElementById(\'mainContent\'))">'+
-    '<option value="1" '+(resFilter.active_only?'selected':'')+'>Активные</option>'+
-    '<option value="0" '+(!resFilter.active_only?'selected':'')+'>Все (вкл. списанные)</option>'+
-    '</select></div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Заказ</th><th>Ст.</th><th>Деталь</th><th>Материал</th><th>Зарез. (л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th></tr></thead>'+
-  '<tbody>'+rs.map(function(r){
+var _resItems=[],_resFilters={},_resActiveOnly=1;
+window._resFilters=_resFilters;
+window._resGetVal=function(r,col){
+  if(col==='order')return r.order_display||'';
+  if(col==='part')return r.part_name||'';
+  if(col==='material')return r.material||'';
+  if(col==='type')return r.material_type||'';
+  if(col==='status')return r.order_status||'';
+  if(col==='active')return r.active?'Активный':'Списан';
+  return '';};
+window._resRender=function(){_resRenderTable();};
+
+function pgReservations(c){api('/api/reservations?active_only='+_resActiveOnly).then(function(rs){
+  _resItems=rs;window['_resItems']=rs;window['_resFilters']=_resFilters;
+  c.innerHTML='<div class="toolbar">'+
+    (hasPerm('reserve.create')?'<button class="btn primary" onclick="modalCreateRes()">+ Резерв</button>':'')+
+    '<label style="margin-left:8px;font-size:.85em">Резервы:</label>'+
+    '<select class="ctl" style="padding:3px;font-size:.85em" onchange="_resActiveOnly=+this.value;_resFilters={};pgReservations(document.getElementById(\'mainContent\'))">'+
+      '<option value="1" '+(_resActiveOnly?'selected':'')+'>Активные</option>'+
+      '<option value="0" '+(!_resActiveOnly?'selected':'')+'>Все (вкл. списанные)</option>'+
+    '</select>'+
+    '<span class="spacer"></span>'+
+    '<span id="res_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'res\')">✕ Сброс</button></div>'+
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    tblFTh('Заказ','res','order')+
+    tblFTh('Ст.','res','status')+
+    tblFTh('Деталь','res','part')+
+    tblFTh('Материал','res','material')+
+    tblFTh('Тип','res','type')+
+    tblFTh('Статус','res','active')+
+    '<th>Зарез.(л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th>'+
+  '</tr></thead><tbody id="resTbody"></tbody></table></div>';
+  _resRenderTable();})}
+
+function _resRenderTable(){
+  var rs=tblGetFiltered('res');
+  var tbody=document.getElementById('resTbody');if(!tbody)return;
+  var cnt=document.getElementById('res_count');if(cnt)cnt.innerHTML='Показано: <strong>'+rs.length+'</strong>';
+  tbody.innerHTML=rs.map(function(r){
     var consumed=!r.active;
-    var rowStyle=consumed?'style="opacity:.6;background:rgba(0,0,0,.03)"':'';
+    var rowStyle=consumed?'style="opacity:.6"':'';
     var statusCell=consumed
       ?'<span style="font-size:.75em;background:var(--text3);color:#fff;border-radius:3px;padding:1px 6px">✓ Списан</span>'
       :statusBadge(r.order_status);
     return '<tr '+rowStyle+'><td>'+r.order_display+'</td><td>'+statusCell+'</td><td>'+(r.part_name||'—')+'</td>'+
-      '<td>'+r.material+'</td><td>'+(r.sheets||'—')+'</td>'+
-      '<td>'+(r.consumed_sheets||0)+'</td>'+
-      '<td class="'+(r.remaining_sheets>0&&!consumed?'low':'')+'">'+
-        (consumed?'<span style="color:var(--ok)">0</span>':(r.remaining_sheets||0))+'</td>'+
+      '<td>'+r.material+'</td><td>'+(r.material_type||'—')+'</td>'+
+      '<td>'+(consumed?'<span class="badge b-gray">Списан</span>':'<span class="badge b-ok">Активный</span>')+'</td>'+
+      '<td>'+(r.sheets||'—')+'</td><td>'+(r.consumed_sheets||0)+'</td>'+
+      '<td class="'+(r.remaining_sheets>0&&!consumed?'low':'')+'">'+(consumed?'<span style="color:var(--ok)">0</span>':(r.remaining_sheets||0))+'</td>'+
       '<td>'+(r.reserved_by||'—')+'</td>'+
-      '<td>'+(!consumed&&hasPerm('reserve.edit')?'<button class="btn sm" onclick="modalEditRes('+r.id+','+r.sheets+','+r.kg+',\''+esc(r.note)+'\')">✏</button>':'')+
-        (!consumed&&hasPerm('reserve.cancel')?'<button class="btn sm" onclick="cancelRes('+r.id+')">❌</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+      '<td>'+(!consumed&&hasPerm('reserve.edit')?'<button class="btn sm" onclick="modalEditRes('+r.id+','+r.sheets+','+r.kg+',\''+esc(r.note||'')+'\')">✏</button>':'')+
+        (!consumed&&hasPerm('reserve.cancel')?'<button class="btn sm" onclick="cancelRes('+r.id+')">❌</button>':'')+'</td></tr>';
+  }).join('');
+  tblUpdateBtns('res');}
 
 function modalCreateRes(){api('/api/orders').then(function(orders){var active=orders.filter(function(o){return o.status==='В работе'});
   if(!active.length){toast('Нет заказов «В работе»','err');return}
@@ -5403,70 +5547,71 @@ function deleteSurplusEntry(sid){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ ОТГРУЗКА ═══
-var shipFilter={order:'',customer:'',status:''};
+var _shipItems=[],_shipFilters={};
+window._shipFilters=_shipFilters;
+window._shipGetVal=function(d,col){
+  if(col==='customer')return d.customer||'';
+  if(col==='order')return d.order_display||d.order_number||'';
+  if(col==='part')return d.part_name||'';
+  if(col==='ship_status')return d.order_ship_status||'';
+  if(col==='status')return d.order_status||'';
+  return '';};
+window._shipRender=function(){_shipRenderTable();};
+
 function pgReadyToShip(c){
   api('/api/ready-to-ship').then(function(data){
-    var filtered=data;
-    if(shipFilter.order)filtered=filtered.filter(function(d){return(d.order_display||d.order_number).toLowerCase().indexOf(shipFilter.order.toLowerCase())>=0});
-    if(shipFilter.customer)filtered=filtered.filter(function(d){return(d.customer||'').toLowerCase().indexOf(shipFilter.customer.toLowerCase())>=0});
-    if(shipFilter.status)filtered=filtered.filter(function(d){return d.order_ship_status===shipFilter.status});
-
-    var totalReady=filtered.reduce(function(s,d){return s+d.available_to_ship},0);
-    var totalShipped=filtered.reduce(function(s,d){return s+d.shipped_qty},0);
-
+    _shipItems=data;window['_shipItems']=data;window['_shipFilters']=_shipFilters;
+    var totalReady=data.reduce(function(s,d){return s+d.available_to_ship},0);
+    var totalShipped=data.reduce(function(s,d){return s+d.shipped_qty},0);
     c.innerHTML='<div class="toolbar">'+
       '<div class="info-box" style="margin:0;padding:6px 14px;display:flex;gap:18px">'+
         '<span>🚚 <strong>Готово к отгрузке:</strong> <span style="color:var(--ok);font-weight:700">'+totalReady+'</span> шт.</span>'+
         '<span>✅ <strong>Уже отгружено:</strong> <span style="color:var(--text2)">'+totalShipped+'</span> шт.</span>'+
-      '</div><span class="spacer"></span></div>'+
-      '<div class="filter-bar">'+
-        '<label>Заказчик:</label><input id="shipFiltCust" style="width:160px" value="'+esc(shipFilter.customer||'')+'" placeholder="Фильтр...">'+
-        '<label>Заказ:</label><input id="shipFiltOrd" style="width:160px" value="'+esc(shipFilter.order||'')+'" placeholder="Фильтр...">'+
-        '<label>Статус отгрузки:</label><select id="shipFiltStatus" onchange="shipFilter.status=this.value;pgReadyToShip(document.getElementById(\'mainContent\'))">'+
-          '<option value="">Все</option>'+
-          ['Частично отгружен','Отгружен'].map(function(s){return'<option value="'+s+'" '+(shipFilter.status===s?'selected':'')+'>'+s+'</option>'}).join('')+
-        '</select>'+
-      '</div>'+
-      (filtered.length===0
-        ?'<div class="info-box">Нет готовых изделий к отгрузке</div>'
-        :'<div class="tbl-wrap"><table><thead><tr>'+
-          '<th>Заказчик</th><th>Заказ</th><th>Деталь / Изделие</th>'+
-          '<th style="text-align:center">По заказу</th>'+
-          '<th style="text-align:center">Готово к отгрузке</th>'+
-          '<th style="text-align:center">Отгружено</th>'+
-          '<th style="text-align:center">Остаток отгрузить</th>'+
-          '<th>Статус</th><th></th>'+
-        '</tr></thead><tbody>'+
-        filtered.map(function(d){
-          var avail=d.available_to_ship;
-          var shipped=d.shipped_qty;
-          var remaining=d.remaining_to_order;
-          var availColor=avail>0?'var(--ok)':'var(--text3)';
-          var remColor=remaining>0?'var(--warn)':'var(--ok)';
-          var shippedColor=shipped>0?'var(--info)':'var(--text3)';
-          var completeAll=remaining<=0&&shipped>0;
-          return '<tr style="'+(completeAll?'opacity:.7':'')+'">'+
-            '<td style="font-size:.85em">'+esc(d.customer)+'</td>'+
-            '<td style="font-size:.85em"><strong>'+esc(d.order_display||d.order_number)+'</strong></td>'+
-            '<td>'+(d.is_assembly?'🔧 ':'🔩 ')+'<strong>'+esc(d.part_name)+'</strong></td>'+
-            '<td style="text-align:center">'+d.quantity+'</td>'+
-            '<td style="text-align:center"><span style="font-weight:700;font-size:1.05em;color:'+availColor+'">'+avail+'</span></td>'+
-            '<td style="text-align:center"><span style="color:'+shippedColor+';font-weight:600">'+shipped+'</span></td>'+
-            '<td style="text-align:center"><span style="color:'+remColor+';font-weight:600">'+remaining+'</span></td>'+
-            '<td>'+statusBadge(d.order_status)+shipBadge(d.order_ship_status)+'</td>'+
-            '<td style="white-space:nowrap">'+
-              (avail>0&&hasPerm('ship.create')?'<button class="btn sm ok" onclick="modalShip('+d.item_id+',\''+esc(d.part_name)+'\','+avail+','+d.quantity+','+shipped+')">🚚 Отгрузить</button>':'')+ 
-              ' <button class="btn sm" style="font-size:.72em" onclick="modalShipHistory('+d.item_id+','+d.order_id+',\''+esc(d.part_name)+'\')">📋</button>'+
-            '</td>'+
-          '</tr>';
-        }).join('')+'</tbody></table></div>'
-      );
-    // Фильтр-инпуты
-    var ci=document.getElementById('shipFiltCust');
-    if(ci){ci.addEventListener('input',function(){shipFilter.customer=this.value;clearTimeout(ci._t);ci._t=setTimeout(function(){pgReadyToShip(document.getElementById('mainContent'))},400)})}
-    var oi=document.getElementById('shipFiltOrd');
-    if(oi){oi.addEventListener('input',function(){shipFilter.order=this.value;clearTimeout(oi._t);oi._t=setTimeout(function(){pgReadyToShip(document.getElementById('mainContent'))},400)})}
-  }).catch(function(e){document.getElementById('mainContent').innerHTML='<div class="info-box" style="color:var(--err)">Ошибка: '+e.message+'</div>'})}
+      '</div><span class="spacer"></span>'+
+      '<span id="ship_count" style="font-size:.85em;color:var(--text2)"></span>'+
+      '<button class="btn sm" onclick="tblFpResetAll(\'ship\')">✕ Сброс</button></div>'+
+    '<div class="tbl-wrap"><table><thead><tr>'+
+      tblFTh('Заказчик','ship','customer')+
+      tblFTh('Заказ','ship','order')+
+      tblFTh('Деталь / Изделие','ship','part')+
+      '<th style="text-align:center">По заказу</th>'+
+      '<th style="text-align:center">Готово к отгрузке</th>'+
+      '<th style="text-align:center">Отгружено</th>'+
+      '<th style="text-align:center">Остаток</th>'+
+      tblFTh('Статус заказа','ship','status')+
+      tblFTh('Статус отгрузки','ship','ship_status')+
+      '<th></th>'+
+    '</tr></thead><tbody id="shipTbody"></tbody></table></div>';
+    _shipRenderTable();
+  }).catch(function(e){c.innerHTML='<div class="info-box" style="color:var(--err)">Ошибка: '+e.message+'</div>';})}
+
+function _shipRenderTable(){
+  var items=tblGetFiltered('ship');
+  var tbody=document.getElementById('shipTbody');if(!tbody)return;
+  var cnt=document.getElementById('ship_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
+  if(!items.length){tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--text3);padding:20px">Нет готовых изделий к отгрузке</td></tr>';tblUpdateBtns('ship');return;}
+  tbody.innerHTML=items.map(function(d){
+    var avail=d.available_to_ship,shipped=d.shipped_qty,remaining=d.remaining_to_order;
+    var availColor=avail>0?'var(--ok)':'var(--text3)';
+    var remColor=remaining>0?'var(--warn)':'var(--ok)';
+    var shippedColor=shipped>0?'var(--info)':'var(--text3)';
+    var completeAll=remaining<=0&&shipped>0;
+    return '<tr style="'+(completeAll?'opacity:.7':'')+'">'+
+      '<td style="font-size:.85em">'+esc(d.customer)+'</td>'+
+      '<td style="font-size:.85em"><strong>'+esc(d.order_display||d.order_number)+'</strong></td>'+
+      '<td>'+(d.is_assembly?'🔧 ':'🔩 ')+'<strong>'+esc(d.part_name)+'</strong></td>'+
+      '<td style="text-align:center">'+d.quantity+'</td>'+
+      '<td style="text-align:center"><span style="font-weight:700;font-size:1.05em;color:'+availColor+'">'+avail+'</span></td>'+
+      '<td style="text-align:center"><span style="color:'+shippedColor+';font-weight:600">'+shipped+'</span></td>'+
+      '<td style="text-align:center"><span style="color:'+remColor+';font-weight:600">'+remaining+'</span></td>'+
+      '<td>'+statusBadge(d.order_status)+'</td>'+
+      '<td>'+shipBadge(d.order_ship_status)+'</td>'+
+      '<td style="white-space:nowrap">'+
+        (avail>0&&hasPerm('ship.create')?'<button class="btn sm ok" onclick="modalShip('+d.item_id+',\''+esc(d.part_name)+'\','+avail+','+d.quantity+','+shipped+')">🚚 Отгрузить</button>':'')+
+        ' <button class="btn sm" style="font-size:.72em" onclick="modalShipHistory('+d.item_id+','+d.order_id+',\''+esc(d.part_name)+'\')">📋</button>'+
+      '</td></tr>';
+  }).join('');
+  tblUpdateBtns('ship');}
 
 function modalShip(itemId,partName,availQty,orderQty,shippedQty){
   openModal('<h2>🚚 Отгрузка</h2>'+
@@ -5527,61 +5672,44 @@ function deleteShipmentLog(logId,itemId,orderId,partName){
   }).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СПИСАНИЯ ═══
-var woFilter={order:'',op_type:'',resource:'',wtype:'',user:'',customer:'',cancelled:''};
+var _woAllData=[],_woItems=[],_woFilters={};
 window._woAllData=[];
+window._woFilters=_woFilters;
+window._woGetVal=function(w,col){
+  if(col==='customer')return w.customer||'';
+  if(col==='order')return w.order_display||'';
+  if(col==='op_type')return w.op_type||'';
+  if(col==='resource')return w.resource||'';
+  if(col==='user')return w.user||'';
+  return '';};
+window._woRender=function(){woFillTable(null);};
 
 function pgWriteoffs(c){
   api('/api/writeoffs').then(function(allWos){
-    window._woAllData=allWos;
-    var uniq=function(arr){return arr.filter(function(v,i,a){return v&&a.indexOf(v)===i}).sort()};
-    var orders=uniq(allWos.map(function(w){return w.order_display}));
-    var opTypes=uniq(allWos.map(function(w){return w.op_type}));
-    var resources=uniq(allWos.map(function(w){return w.resource}));
-    var users=uniq(allWos.map(function(w){return w.user}));
-    var customers=uniq(allWos.map(function(w){return w.customer}));
-    var ordOpts=[{v:'',t:'Все заказы'}].concat(orders.map(function(v){return{v:v,t:v}}));
-    var opOpts=[{v:'',t:'Все типы операций'}].concat(opTypes.map(function(v){return{v:v,t:v}}));
-    var resOpts=[{v:'',t:'Все станки'}].concat(resources.map(function(v){return{v:v,t:v}}));
-    var wtOpts=[{v:'',t:'Все'},{v:'Материал',t:'📦 Материал'},{v:'Детали',t:'🔩 Детали'},{v:'Материал+Детали',t:'📦🔩 Мат+Дет'},{v:'Отход',t:'♻ Отход'}];
-    var usrOpts=[{v:'',t:'Все операторы'}].concat(users.map(function(v){return{v:v,t:v}}));
-    var custOpts=[{v:'',t:'Все заказчики'}].concat(customers.map(function(v){return{v:v,t:v}}));
-    var statusOpts=[{v:'',t:'Все'},{v:'active',t:'✅ Действующие'},{v:'cancelled',t:'↩ Отменённые'}];
-    function refilter(){var el=document.getElementById('wo_table_area');if(el)woFillTable(el)}
+    window._woAllData=allWos;_woAllData=allWos;_woItems=allWos;window['_woItems']=allWos;window['_woFilters']=_woFilters;
     c.innerHTML='<div class="toolbar"><span class="spacer"></span>'+
       '<span id="wo_count_badge" style="font-size:.85em;color:var(--text2)"></span>'+
+      '<button class="btn sm" onclick="tblFpResetAll(\'wo\')">✕ Сброс</button>'+
       '<button class="btn primary" onclick="modalWriteoff()">+ Списание</button></div>'+
-      '<div class="filter-bar" style="flex-wrap:wrap;row-gap:6px;gap:10px">'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказчик:</label><div style="min-width:160px">'+SS('wf_cust',custOpts,woFilter.customer,'Все',function(v){woFilter.customer=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Заказ:</label><div style="min-width:160px">'+SS('wf_order',ordOpts,woFilter.order,'Все заказы',function(v){woFilter.order=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип операции:</label><div style="min-width:160px">'+SS('wf_optype',opOpts,woFilter.op_type,'Все типы',function(v){woFilter.op_type=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Станок:</label><div style="min-width:150px">'+SS('wf_res',resOpts,woFilter.resource,'Все станки',function(v){woFilter.resource=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Тип списания:</label><div style="min-width:140px">'+SS('wf_wtype',wtOpts,woFilter.wtype,'Все',function(v){woFilter.wtype=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Оператор:</label><div style="min-width:140px">'+SS('wf_user',usrOpts,woFilter.user,'Все',function(v){woFilter.user=v;refilter()})+'</div></div>'+
-        '<div style="display:flex;align-items:center;gap:4px;flex:0 0 auto"><label style="white-space:nowrap;margin:0">Статус:</label><div style="min-width:140px">'+SS('wf_status',statusOpts,woFilter.cancelled,'Все',function(v){woFilter.cancelled=v;refilter()})+'</div></div>'+
-        '<button class="btn sm" onclick="woFilter={order:\'\',op_type:\'\',resource:\'\',wtype:\'\',user:\'\',customer:\'\',cancelled:\'\'};pgWriteoffs(document.getElementById(\'mainContent\'))">✕ Сброс</button>'+
-      '</div>'+
-      '<div id="wo_table_area"></div>';
-    refilter();
+    '<div class="tbl-wrap"><table id="wo_main_table"><thead><tr>'+
+      '<th>Дата</th><th>Тип</th>'+
+      tblFTh('Заказчик','wo','customer')+
+      tblFTh('Заказ','wo','order')+
+      '<th>Деталь</th>'+
+      '<th title="Годных">Годн.</th><th title="Брак">Брак</th>'+
+      tblFTh('Тип операции','wo','op_type')+
+      '<th>Материал</th><th>Л</th><th>Кг</th>'+
+      tblFTh('Станок','wo','resource')+
+      tblFTh('Оператор','wo','user')+
+      '<th>Прим.</th><th></th>'+
+    '</tr></thead><tbody id="wo_table_body"></tbody></table></div>';
+    woFillTable(null);
   });
 }
 
 function woFillTable(el){
   var allWos=window._woAllData||[];
-  var wos=allWos;
-  if(woFilter.customer)wos=wos.filter(function(w){return w.customer===woFilter.customer});
-  if(woFilter.order)wos=wos.filter(function(w){return w.order_display===woFilter.order});
-  if(woFilter.op_type)wos=wos.filter(function(w){return w.op_type===woFilter.op_type});
-  if(woFilter.resource)wos=wos.filter(function(w){return w.resource===woFilter.resource});
-  if(woFilter.wtype)wos=wos.filter(function(w){
-    if(woFilter.wtype==='Материал+Детали')return w._merged;
-    if(woFilter.wtype==='Материал')return w.type==='Материал'&&!w._merged;
-    if(woFilter.wtype==='Детали')return w.type==='Детали'&&!w._merged;
-    if(woFilter.wtype==='Отход')return w.type==='Отход';
-    return true;
-  });
-  if(woFilter.user)wos=wos.filter(function(w){return w.user===woFilter.user});
-  if(woFilter.cancelled==='active')wos=wos.filter(function(w){return !w.is_cancelled});
-  if(woFilter.cancelled==='cancelled')wos=wos.filter(function(w){return w.is_cancelled});
+  var wos=tblGetFiltered('wo');
   var badge=document.getElementById('wo_count_badge');
 
   // ── Группировка строго по group_id: только пары с одинаковым непустым group_id ──
@@ -5613,14 +5741,11 @@ function woFillTable(el){
   });
 
   if(badge)badge.innerHTML='Показано: <strong>'+rows.length+'</strong> / '+allWos.length;
-  if(!rows.length){el.innerHTML='<div class="info-box">Нет записей по выбранным фильтрам</div>';return}
+  var tbody=document.getElementById('wo_table_body');
+  if(!tbody)return;
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="15" style="text-align:center;color:var(--text3);padding:20px">Нет записей по выбранным фильтрам</td></tr>';tblUpdateBtns('wo');return;}
 
-  el.innerHTML='<div class="tbl-wrap"><table><thead><tr>'+
-    '<th>Дата</th><th>Тип</th><th>Заказчик</th><th>Заказ</th><th>Деталь</th>'+
-    '<th title="Годных">Годн.</th><th title="Брак">Брак</th><th>Тип операции</th>'+
-    '<th>Материал</th><th>Л</th><th>Кг</th>'+
-    '<th>Станок</th><th>Оператор</th><th>Прим.</th><th></th>'+
-  '</tr></thead><tbody>'+rows.map(function(row){
+  tbody.innerHTML=rows.map(function(row){
     var w=row.parts||row.mat;
     var isBoth=row.kind==='both';var isMat=row.kind==='mat';var isScrap=row.kind==='scrap';var isParts=row.kind==='parts';
     var typeBadge=isBoth
@@ -5664,8 +5789,8 @@ function woFillTable(el){
       '<td style="font-size:.82em">'+noteText+anomNote+cancelNote+'</td>'+
       '<td>'+cancelBtn+'</td>'+
     '</tr>';
-  }).join('')+'</tbody></table></div>';
-}
+  }).join('');
+  tblUpdateBtns('wo');}
 
 function cancelWO(wid){if(!confirm('Отменить списание?\n\nВсё что было списано (материал и детали) вернётся обратно: материал на склад и в резерв, счётчики деталей на операции.'))return;
   api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(r){
@@ -5865,19 +5990,46 @@ function pgLoad(c){api('/api/analytics/load').then(function(data){
   h+='</tbody></table></div>';c.innerHTML=h})}
 
 // ═══ КЛИЕНТЫ ═══
-var custSearch='',custSearchTimer=null;
-function pgCustomers(c){api('/api/customers?search='+encodeURIComponent(custSearch)).then(function(custs){
-  c.innerHTML='<div class="toolbar">'+(hasPerm('cust.create')?'<button class="btn primary" onclick="modalCust()">+ Клиент</button>':'')+
+var _custItems=[],_custFilters={};
+window._custFilters=_custFilters;
+window._custGetVal=function(cu,col){
+  if(col==='name')return cu.name||'';
+  if(col==='short_name')return cu.short_name||'';
+  if(col==='inn')return cu.inn||'';
+  if(col==='contact')return cu.contact_person||'';
+  if(col==='phone')return cu.phone||'';
+  if(col==='email')return cu.email||'';
+  return '';};
+window._custRender=function(){_custRenderTable();};
+
+function pgCustomers(c){api('/api/customers').then(function(custs){
+  _custItems=custs;window['_custItems']=custs;window['_custFilters']=_custFilters;
+  c.innerHTML='<div class="toolbar">'+
+    (hasPerm('cust.create')?'<button class="btn primary" onclick="modalCust()">+ Клиент</button>':'')+
     '<span class="spacer"></span>'+
-    '<input class="ctl" id="custSearchInput" style="width:280px" placeholder="🔍 Поиск по названию..." value="'+esc(custSearch)+'"></div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Сокр.</th><th>ИНН</th><th>Контакт</th><th>Тел.</th><th>Email</th><th></th></tr></thead>'+
-  '<tbody>'+custs.map(function(cu){return '<tr><td><strong>'+cu.name+'</strong></td><td>'+(cu.short_name||'—')+'</td><td>'+(cu.inn||'—')+'</td>'+
+    '<span id="cust_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'cust\')">✕ Сброс</button></div>'+
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    tblFTh('Название','cust','name')+
+    tblFTh('Сокр.','cust','short_name')+
+    tblFTh('ИНН','cust','inn')+
+    tblFTh('Контакт','cust','contact')+
+    tblFTh('Тел.','cust','phone')+
+    tblFTh('Email','cust','email')+
+    '<th></th>'+
+  '</tr></thead><tbody id="custTbody"></tbody></table></div>';
+  _custRenderTable();})}
+
+function _custRenderTable(){
+  var items=tblGetFiltered('cust');
+  var tbody=document.getElementById('custTbody');if(!tbody)return;
+  var cnt=document.getElementById('cust_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
+  tbody.innerHTML=items.map(function(cu){return '<tr>'+
+    '<td><strong>'+cu.name+'</strong></td><td>'+(cu.short_name||'—')+'</td><td>'+(cu.inn||'—')+'</td>'+
     '<td>'+(cu.contact_person||'—')+'</td><td>'+(cu.phone||'—')+'</td><td>'+(cu.email||'—')+'</td>'+
-    '<td>'+(hasPerm('cust.edit')?'<button class="btn sm" onclick="modalCust('+cu.id+')">✏</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>';
-  var inp=document.getElementById('custSearchInput');
-  if(inp){inp.addEventListener('input',function(){custSearch=this.value;clearTimeout(custSearchTimer);custSearchTimer=setTimeout(function(){pgCustomers(document.getElementById('mainContent'))},400)});
-    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length)}
-  })}
+    '<td>'+(hasPerm('cust.edit')?'<button class="btn sm" onclick="modalCust('+cu.id+')">✏</button>':'')+'</td></tr>';
+  }).join('');
+  tblUpdateBtns('cust');}
 function modalCust(cid){var p1=cid?api('/api/customers'):Promise.resolve(null);p1.then(function(cs){var cu=cs?cs.find(function(x){return x.id===cid}):null;
   openModal('<h2>'+(cu?'✏':'+')+' Клиент</h2>'+
   '<div class="form-row"><div><label>Название</label><input id="fcu_name" value="'+(cu?cu.name:'')+'"></div><div><label>Сокр.</label><input id="fcu_short" value="'+(cu?cu.short_name:'')+'"></div></div>'+
@@ -5890,19 +6042,47 @@ function saveCust(cid){var b={name:document.getElementById('fcu_name').value,sho
   phone:document.getElementById('fcu_ph').value,email:document.getElementById('fcu_em').value,address:document.getElementById('fcu_addr').value};
   if(cid)b.id=cid;api('/api/customers/save','POST',b).then(function(){closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
-// ═══ СТАНКИ (+ фильтр по типу + удаление) ═══
-var resTypeFilter='';
+// ═══ СТАНКИ ═══
+var _resrcItems=[],_resrcFilters={};
+window._resrcFilters=_resrcFilters;
+window._resrcGetVal=function(r,col){
+  if(col==='name')return r.name||'';
+  if(col==='type')return r.type||'';
+  if(col==='code')return r.code||'';
+  if(col==='available')return r.available?'Доступен':'Недоступен';
+  return '';};
+window._resrcRender=function(){_resrcRenderTable();};
+
 function pgResources(c){api('/api/resources').then(function(rs){
-  var types=[];rs.forEach(function(r){if(types.indexOf(r.type)<0)types.push(r.type)});types.sort();
-  var filtered=resTypeFilter?rs.filter(function(r){return r.type===resTypeFilter}):rs;
-  c.innerHTML='<div class="toolbar">'+(hasPerm('res.create')?'<button class="btn primary" onclick="modalRes()">+ Станок</button>':'')+'</div>'+
-  '<div class="filter-bar"><label>Тип:</label><select onchange="resTypeFilter=this.value;pgResources(document.getElementById(\'mainContent\'))">'+
-    '<option value="">Все</option>'+types.map(function(t){return '<option '+(resTypeFilter===t?'selected':'')+'>'+t+'</option>'}).join('')+'</select></div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Название</th><th>Тип</th><th>Код</th><th>Операции</th><th>Смена</th><th>Дост.</th><th></th></tr></thead>'+
-  '<tbody>'+filtered.map(function(r){return '<tr><td><strong>'+r.name+'</strong></td><td>'+r.type+'</td><td>'+(r.code||'—')+'</td>'+
-    '<td style="font-size:.8em">'+((r.allowed_ops||[]).join(', ')||'—')+'</td><td>'+r.shift_hours+'ч × '+r.shifts_per_day+'см</td><td>'+(r.available?'✅':'❌')+'</td>'+
+  _resrcItems=rs;window['_resrcItems']=rs;window['_resrcFilters']=_resrcFilters;
+  c.innerHTML='<div class="toolbar">'+
+    (hasPerm('res.create')?'<button class="btn primary" onclick="modalRes()">+ Станок</button>':'')+
+    '<span class="spacer"></span>'+
+    '<span id="resrc_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'resrc\')">✕ Сброс</button></div>'+
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    tblFTh('Название','resrc','name')+
+    tblFTh('Тип','resrc','type')+
+    tblFTh('Код','resrc','code')+
+    '<th>Операции</th><th>Смена</th>'+
+    tblFTh('Доступен','resrc','available')+
+    '<th></th>'+
+  '</tr></thead><tbody id="resrcTbody"></tbody></table></div>';
+  _resrcRenderTable();})}
+
+function _resrcRenderTable(){
+  var items=tblGetFiltered('resrc');
+  var tbody=document.getElementById('resrcTbody');if(!tbody)return;
+  var cnt=document.getElementById('resrc_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
+  tbody.innerHTML=items.map(function(r){return '<tr>'+
+    '<td><strong>'+r.name+'</strong></td><td>'+r.type+'</td><td>'+(r.code||'—')+'</td>'+
+    '<td style="font-size:.8em">'+((r.allowed_ops||[]).join(', ')||'—')+'</td>'+
+    '<td>'+r.shift_hours+'ч × '+r.shifts_per_day+'см</td>'+
+    '<td>'+(r.available?'✅':'❌')+'</td>'+
     '<td>'+(hasPerm('res.edit')?'<button class="btn sm" onclick="modalRes('+r.id+')">✏</button>':'')+
-    (hasPerm('res.delete')?'<button class="btn sm" onclick="delRes('+r.id+')" style="color:var(--err)">🗑</button>':'')+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+    (hasPerm('res.delete')?'<button class="btn sm" onclick="delRes('+r.id+')" style="color:var(--err)">🗑</button>':'')+'</td></tr>';
+  }).join('');
+  tblUpdateBtns('resrc');}
 function delRes(rid){if(!confirm('Удалить станок?'))return;api('/api/resources/delete','POST',{id:rid}).then(function(){toast('Удалено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function modalRes(rid){api('/api/op-types').then(function(opTypes){
   var p1=rid?api('/api/resources'):Promise.resolve(null);p1.then(function(rs){var r=rs?rs.find(function(x){return x.id===rid}):null;
@@ -5930,18 +6110,44 @@ function saveRes(rid){var ops=Array.from(document.querySelectorAll('.frs_op:chec
     description:document.getElementById('frs_desc').value,allowed_ops:ops};if(rid)b.id=rid;
   api('/api/resources/save','POST',b).then(function(){closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
-// ═══ ЛОГИ (многоуровневая фильтрация) ═══
-var logAction='',logUserId=0;
-function pgLogs(c){Promise.all([api('/api/logs?limit=300&action='+encodeURIComponent(logAction)+'&user_id='+logUserId),api('/api/logs/actions'),api('/api/users')]).then(function(arr){
-  var logs=arr[0],actions=arr[1],users=arr[2];
-  var actOpts=[{v:'',t:'Все'}].concat(actions.map(function(a){return{v:a,t:a}}));
-  var userOpts=[{v:'0',t:'Все'}].concat(users.map(function(u){return{v:String(u.id),t:u.full_name}}));
-  c.innerHTML='<div class="filter-bar"><label>Действие:</label><div style="min-width:200px">'+SS('log_act',actOpts,logAction,'Все',function(v){logAction=v;pgLogs(document.getElementById('mainContent'))})+'</div>'+
-    '<label>Кто:</label><div style="min-width:200px">'+SS('log_user',userOpts,String(logUserId),'Все',function(v){logUserId=+v;pgLogs(document.getElementById('mainContent'))})+'</div></div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Дата</th><th>Кто</th><th>Действие</th><th>Объект</th><th>ID</th><th>Детали</th></tr></thead>'+
-  '<tbody>'+logs.map(function(l){return '<tr><td style="font-family:monospace;font-size:.8em;white-space:nowrap">'+fmtDT(l.date)+'</td><td>'+l.user+'</td>'+
-    '<td><strong style="color:var(--accent)">'+l.action+'</strong></td><td>'+(l.entity||'—')+'</td><td>'+(l.entity_id||'—')+'</td>'+
-    '<td style="font-size:.85em;max-width:400px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.details)+'">'+l.details+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+// ═══ ЛОГИ ═══
+var _logItems=[],_logFilters={};
+window._logFilters=_logFilters;
+window._logGetVal=function(l,col){
+  if(col==='user')return l.user||'';
+  if(col==='action')return l.action||'';
+  if(col==='entity')return l.entity||'';
+  return '';};
+window._logRender=function(){_logRenderTable();};
+
+function pgLogs(c){api('/api/logs?limit=5000').then(function(logs){
+  _logItems=logs;window['_logItems']=logs;window['_logFilters']=_logFilters;
+  c.innerHTML='<div class="toolbar">'+
+    '<span class="spacer"></span>'+
+    '<span id="log_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'log\')">✕ Сброс</button></div>'+
+  '<div class="tbl-wrap"><table><thead><tr>'+
+    '<th>Дата</th>'+
+    tblFTh('Кто','log','user')+
+    tblFTh('Действие','log','action')+
+    tblFTh('Объект','log','entity')+
+    '<th>ID</th><th>Детали</th>'+
+  '</tr></thead><tbody id="logTbody"></tbody></table></div>';
+  _logRenderTable();})}
+
+function _logRenderTable(){
+  var items=tblGetFiltered('log');
+  var tbody=document.getElementById('logTbody');if(!tbody)return;
+  var cnt=document.getElementById('log_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
+  tbody.innerHTML=items.map(function(l){return '<tr>'+
+    '<td style="font-family:monospace;font-size:.8em;white-space:nowrap">'+fmtDT(l.date)+'</td>'+
+    '<td>'+l.user+'</td>'+
+    '<td><strong style="color:var(--accent)">'+l.action+'</strong></td>'+
+    '<td>'+(l.entity||'—')+'</td>'+
+    '<td>'+(l.entity_id||'—')+'</td>'+
+    '<td style="font-size:.85em;max-width:400px;overflow:hidden;text-overflow:ellipsis" title="'+esc(l.details)+'">'+l.details+'</td></tr>';
+  }).join('');
+  tblUpdateBtns('log');}
 
 // ═══ НАСТРОЙКИ ═══
 var setTab='users';
