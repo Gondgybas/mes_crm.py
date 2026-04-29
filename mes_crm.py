@@ -649,7 +649,8 @@ DEFAULT_PERMS = [
     ("reserve.edit", "Редактирование резервов", "Резервы"), ("reserve.cancel", "Отмена резервов", "Резервы"),
     ("op.view", "Просмотр операций", "Операции"), ("op.create", "Создание операций", "Операции"),
     ("op.edit", "Редактирование операций", "Операции"), ("op.start", "Запуск операций", "Операции"),
-    ("op.complete", "Завершение операций", "Операции"), ("op.rollback", "Откат операций", "Операции"),
+    ("op.complete", "Завершение операций", "Операции"), ("op.reopen", "Дополнение завершённых операций", "Операции"),
+    ("op.rollback", "Откат операций", "Операции"),
     ("op.reorder", "Порядок операций", "Операции"),
     ("parts.view", "Просмотр деталей", "Детали"), ("parts.create", "Создание деталей", "Детали"),
     ("parts.edit", "Редактирование деталей", "Детали"), ("parts.log", "Учёт деталей", "Детали"),
@@ -2431,6 +2432,48 @@ def create_app():
             total_elapsed = int((n - op.started_at).total_seconds() / 60)
             op.actual_minutes = total_elapsed - (op.total_pause_minutes or 0)
         audit(db, data.get("user_id", 1), "Завершение операции", "op", opid, op.operation_type)
+        db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.get("/api/operations/{opid}/check-before-complete")
+    def api_check_before_complete(opid: int, db: Session = Depends(db_dep)):
+        op = db.query(ProductionOp).get(opid)
+        if not op: raise HTTPException(404)
+        warnings = []
+        if op.order_item_id:
+            # Проверяем несписанные активные резервы
+            active_res = db.query(Reservation).filter(
+                Reservation.order_item_id == op.order_item_id,
+                Reservation.is_active == True
+            ).all()
+            for r in active_res:
+                mat = db.query(Material).get(r.material_id)
+                mat_name = mat.name if mat else f"Материал #{r.material_id}"
+                sheets = r.quantity_sheets or 0
+                warnings.append(f"Несписанный резерв: {mat_name} — {sheets} л")
+            # Проверяем остаток незакрытых деталей
+            item = db.query(OrderItem).get(op.order_item_id)
+            if item:
+                remaining = max(0, (item.quantity or 0) - (item.completed_qty or 0) - (item.rejected_qty or 0))
+                if remaining > 0:
+                    warnings.append(f"Не закрыто деталей по позиции: {remaining} шт.")
+        return {"warnings": warnings}
+
+    @app.post("/api/operations/{opid}/reopen")
+    async def api_reopen_op(opid: int, request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        op = db.query(ProductionOp).get(opid)
+        if not op: raise HTTPException(404)
+        if op.status != "Завершена": raise HTTPException(400, "Операция не завершена")
+        prev_actual = op.actual_minutes or 0
+        op.status = "В работе"
+        op.completed_at = None
+        op.started_at = now_msk()
+        op.paused_at = None
+        # Отрицательное значение компенсирует уже накопленное время:
+        # при следующем завершении: actual = elapsed_since_reopen - (-prev_actual) = elapsed + prev_actual
+        op.total_pause_minutes = -prev_actual
+        audit(db, data.get("user_id", 1), "Дополнение операции", "op", opid, op.operation_type)
         db.flush(); db.commit()
         return {"status": "ok"}
 
@@ -4868,9 +4911,10 @@ function pgOperations(c){
               if(o.status==='Пауза')return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
               return '';
             })()+
-            (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
+            (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓ Готово</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
+            (o.status==='Завершена'&&hasPerm('op.reopen')?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="reopenOp('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>':'')+
             ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
-            (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)">↩</button>':'')+
+            (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'')+
           '</td></tr>';
       }).join('')+'</tbody></table></div>';
   });
@@ -4888,7 +4932,25 @@ function dropOp(e){e.preventDefault();var tr=e.target.closest('tr');if(!tr||!dra
   api('/api/operations/reorder','POST',{order:order}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e2){toast(e2.message,'err')})}
 function startOp(id){api('/api/operations/'+id+'/start','POST',{user_id:U.id}).then(function(){toast('Запущена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function pauseOp(id){api('/api/operations/'+id+'/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
-function completeOp(id){api('/api/operations/'+id+'/complete','POST',{user_id:U.id}).then(function(){toast('Завершена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+
+function completeOp(id){
+  // Проверяем несписанные резервы и остаток деталей
+  api('/api/operations/'+id+'/check-before-complete').then(function(res){
+    var warns=res.warnings||[];
+    if(warns.length>0){
+      var msg='⚠ Внимание! Есть незакрытые позиции:\n\n'+warns.map(function(w){return '• '+w}).join('\n')+'\n\nВы уверены, что операция выполнена?';
+      if(!confirm(msg))return;
+    }
+    api('/api/operations/'+id+'/complete','POST',{user_id:U.id}).then(function(){toast('Завершена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')});
+  }).catch(function(){
+    // Если проверка недоступна — завершаем без предупреждения
+    api('/api/operations/'+id+'/complete','POST',{user_id:U.id}).then(function(){toast('Завершена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')});
+  });}
+
+function reopenOp(id){
+  if(!confirm('Дополнить завершённую операцию?\n\nОперация перейдёт обратно в «В работе», таймер продолжит отсчёт.'))return;
+  api('/api/operations/'+id+'/reopen','POST',{user_id:U.id}).then(function(){toast('Операция возобновлена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')});}
+
 function rollbackOp(id){if(!confirm('Откатить?'))return;api('/api/operations/'+id+'/rollback','POST',{user_id:U.id}).then(function(){toast('Откат','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 function onWoMatTypeChange(){
