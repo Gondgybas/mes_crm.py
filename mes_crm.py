@@ -136,6 +136,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     username = Column(String(100), unique=True, nullable=False, index=True)
     password_hash = Column(String(256), nullable=False)
+    password_plain = Column(String(200), default="")
     full_name = Column(String(200), nullable=False)
     role = Column(String(50), nullable=False, default="operator")
     is_active = Column(Boolean, default=True)
@@ -492,8 +493,25 @@ class ProductionOp(Base):
     order = relationship("Order", back_populates="operations")
     order_item = relationship("OrderItem")
     resource = relationship("Resource")
-    operator = relationship("User")
+    operator = relationship("User", foreign_keys=[assigned_to])
     component_template = relationship("PartTemplate", foreign_keys=[component_template_id], lazy="joined")
+    sessions = relationship("OpSession", back_populates="op", cascade="all, delete-orphan")
+
+
+class OpSession(Base):
+    """Личная сессия оператора на операции — хранит индивидуальное время работы."""
+    __tablename__ = "op_sessions"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    op_id = Column(Integer, ForeignKey("production_ops.id"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    started_at = Column(DateTime, default=now_msk)
+    ended_at = Column(DateTime, nullable=True)
+    paused_at = Column(DateTime, nullable=True)
+    total_pause_minutes = Column(Integer, default=0)
+    actual_minutes = Column(Integer, nullable=True)
+    status = Column(String(50), default="В работе")  # В работе | Пауза | Завершена
+    op = relationship("ProductionOp", back_populates="sessions")
+    user = relationship("User")
 
 
 class PartStationLog(Base):
@@ -666,6 +684,7 @@ DEFAULT_PERMS = [
     ("admin.users", "Пользователи", "Админ"), ("admin.roles", "Роли", "Админ"),
     ("admin.grades", "Марки металла", "Админ"), ("admin.categories", "Категории склада", "Админ"),
     ("admin.logs", "Логи", "Админ"), ("admin.op_types", "Типы операций", "Админ"),
+    ("stats.view", "Просмотр статистики", "Статистика"),
 ]
 
 ALL_P = [p[0] for p in DEFAULT_PERMS]
@@ -678,9 +697,19 @@ ROLE_LABELS = {"admin": "Администратор", "master": "Мастер", 
 
 
 def init_database():
+    # Миграция колонок ПЕРЕД create_all, чтобы схема БД совпадала с моделями
+    from sqlalchemy import inspect as sa_inspect, text
+    _insp_pre = sa_inspect(engine)
+    if _insp_pre.has_table("users"):
+        _ucols = [c["name"] for c in _insp_pre.get_columns("users")]
+        if "password_plain" not in _ucols:
+            with engine.connect() as _conn:
+                _conn.execute(text("ALTER TABLE users ADD COLUMN password_plain VARCHAR(200) DEFAULT ''"))
+                _conn.commit()
+            log.info("Migration: added password_plain to users")
+
     Base.metadata.create_all(engine)
     # Миграция: добавляем writeoff_mode в operation_type_cfgs
-    from sqlalchemy import inspect as sa_inspect, text
     insp = sa_inspect(engine)
     cols = [c["name"] for c in insp.get_columns("operation_type_cfgs")]
     if "writeoff_mode" not in cols:
@@ -1364,9 +1393,12 @@ def create_app():
             u.tab_number = data.get("tab_number", u.tab_number)
             if data.get("password"):
                 u.password_hash = User.hash_pw(data["password"])
+                u.password_plain = data["password"]
         else:
+            plain_pw = data.get("password", "1234")
             u = User(username=data["username"],
-                     password_hash=User.hash_pw(data.get("password", "1234")),
+                     password_hash=User.hash_pw(plain_pw),
+                     password_plain=plain_pw,
                      full_name=data.get("full_name", ""),
                      role=data.get("role", "operator"),
                      tab_number=data.get("tab_number", ""))
@@ -1375,6 +1407,16 @@ def create_app():
         u.allowed_stations = db.query(Resource).filter(Resource.id.in_(sids)).all() if sids else []
         db.flush(); db.commit()
         return {"id": u.id}
+
+    @app.post("/api/users/delete")
+    async def api_delete_user(request: Request, db: Session = Depends(db_dep)):
+        data = await request.json()
+        uid = data.get("id")
+        u = db.query(User).get(uid)
+        if not u: raise HTTPException(404, "Пользователь не найден")
+        if u.username == "admin": raise HTTPException(400, "Нельзя удалить администратора")
+        db.delete(u); db.commit()
+        return {"status": "ok"}
 
     # ─── Roles ──────────────────────────────────────
     @app.get("/api/roles")
@@ -2324,7 +2366,15 @@ def create_app():
                  "prev_op_type": prev_op.operation_type if prev_op is not None else None,
                  "prev_op_id": prev_op.id if prev_op is not None else None,
                  # Готовые комплекты для первой сборочной операции
-                 "available_kits": available_kits_map.get(o.id)})
+                 "available_kits": available_kits_map.get(o.id),
+                 "sessions": [{"id": s.id, "user_id": s.user_id,
+                     "user_name": s.user.full_name if s.user else "",
+                     "status": s.status,
+                     "started_at": s.started_at.isoformat() if s.started_at else None,
+                     "actual_min": s.actual_minutes,
+                     "total_pause_min": s.total_pause_minutes or 0,
+                     "paused_at": s.paused_at.isoformat() if s.paused_at else None}
+                    for s in (o.sessions or []) if s.status != "Завершена"]})
         return result
 
     @app.post("/api/operations/save")
@@ -2428,10 +2478,89 @@ def create_app():
         if not op: raise HTTPException(404)
         n = now_msk()
         op.status = "Завершена"; op.completed_at = n
-        if op.started_at:
+        # Закрываем все активные сессии операторов
+        active_sessions = db.query(OpSession).filter(
+            OpSession.op_id == opid, OpSession.status != "Завершена").all()
+        total_op_minutes = 0
+        for sess in active_sessions:
+            if sess.status == "Пауза" and sess.paused_at:
+                pause_dur = int((n - sess.paused_at).total_seconds() / 60)
+                sess.total_pause_minutes = (sess.total_pause_minutes or 0) + pause_dur
+            if sess.started_at:
+                elapsed = int((n - sess.started_at).total_seconds() / 60)
+                sess.actual_minutes = max(0, elapsed - (sess.total_pause_minutes or 0))
+            else:
+                sess.actual_minutes = 0
+            total_op_minutes += sess.actual_minutes or 0
+            sess.status = "Завершена"; sess.ended_at = n
+        # Если были сессии — фактическое время = сумма по операторам; иначе — старый расчёт
+        if active_sessions:
+            op.actual_minutes = total_op_minutes
+        elif op.started_at:
             total_elapsed = int((n - op.started_at).total_seconds() / 60)
             op.actual_minutes = total_elapsed - (op.total_pause_minutes or 0)
         audit(db, data.get("user_id", 1), "Завершение операции", "op", opid, op.operation_type)
+        db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.post("/api/operations/{opid}/session/start")
+    async def api_session_start(opid: int, request: Request, db: Session = Depends(db_dep)):
+        """Оператор запускает/возобновляет свою персональную сессию на операции."""
+        data = await request.json()
+        user_id = data.get("user_id", 1)
+        op = db.query(ProductionOp).get(opid)
+        if not op: raise HTTPException(404)
+        n = now_msk()
+        # Если операция завершена — переоткрываем (Дополнить)
+        if op.status == "Завершена":
+            op.status = "В работе"; op.completed_at = None
+            op.started_at = n; op.paused_at = None; op.total_pause_minutes = 0
+        # Если операция не запущена — запускаем
+        elif op.status in ("Ожидает", "Запланирована"):
+            op.started_at = n; op.status = "В работе"; op.assigned_to = user_id
+        elif op.status == "Пауза":
+            # Возобновляем op-уровень только если это была глобальная пауза
+            if op.paused_at:
+                pause_dur = int((n - op.paused_at).total_seconds() / 60)
+                op.total_pause_minutes = (op.total_pause_minutes or 0) + pause_dur
+                op.paused_at = None
+            op.status = "В работе"
+        # Ищем незавершённую сессию этого пользователя
+        sess = db.query(OpSession).filter(
+            OpSession.op_id == opid, OpSession.user_id == user_id,
+            OpSession.status != "Завершена").first()
+        if sess:
+            if sess.status == "Пауза" and sess.paused_at:
+                pause_dur = int((n - sess.paused_at).total_seconds() / 60)
+                sess.total_pause_minutes = (sess.total_pause_minutes or 0) + pause_dur
+                sess.paused_at = None
+            sess.status = "В работе"
+        else:
+            sess = OpSession(op_id=opid, user_id=user_id, started_at=n, status="В работе")
+            db.add(sess)
+        audit(db, user_id, "Старт сессии оператора", "op", opid, op.operation_type)
+        db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.post("/api/operations/{opid}/session/pause")
+    async def api_session_pause(opid: int, request: Request, db: Session = Depends(db_dep)):
+        """Оператор ставит свою сессию на паузу."""
+        data = await request.json()
+        user_id = data.get("user_id", 1)
+        op = db.query(ProductionOp).get(opid)
+        if not op: raise HTTPException(404)
+        n = now_msk()
+        sess = db.query(OpSession).filter(
+            OpSession.op_id == opid, OpSession.user_id == user_id,
+            OpSession.status == "В работе").first()
+        if sess:
+            sess.status = "Пауза"; sess.paused_at = n
+        # Если больше нет активных сессий — ставим операцию на паузу
+        active_count = db.query(OpSession).filter(
+            OpSession.op_id == opid, OpSession.status == "В работе").count()
+        if active_count == 0:
+            op.status = "Пауза"; op.paused_at = n
+        audit(db, user_id, "Пауза сессии оператора", "op", opid, op.operation_type)
         db.flush(); db.commit()
         return {"status": "ok"}
 
@@ -2461,21 +2590,8 @@ def create_app():
 
     @app.post("/api/operations/{opid}/reopen")
     async def api_reopen_op(opid: int, request: Request, db: Session = Depends(db_dep)):
-        data = await request.json()
-        op = db.query(ProductionOp).get(opid)
-        if not op: raise HTTPException(404)
-        if op.status != "Завершена": raise HTTPException(400, "Операция не завершена")
-        prev_actual = op.actual_minutes or 0
-        op.status = "В работе"
-        op.completed_at = None
-        op.started_at = now_msk()
-        op.paused_at = None
-        # Отрицательное значение компенсирует уже накопленное время:
-        # при следующем завершении: actual = elapsed_since_reopen - (-prev_actual) = elapsed + prev_actual
-        op.total_pause_minutes = -prev_actual
-        audit(db, data.get("user_id", 1), "Дополнение операции", "op", opid, op.operation_type)
-        db.flush(); db.commit()
-        return {"status": "ok"}
+        """Устаревший эндпоинт — перенаправляем на session/start."""
+        return await api_session_start(opid, request, db)
 
     @app.post("/api/operations/{opid}/rollback")
     async def api_rollback_op(opid: int, request: Request, db: Session = Depends(db_dep)):
@@ -2486,6 +2602,8 @@ def create_app():
         old = op.status; op.status = "Ожидает"
         op.completed_at = None; op.actual_minutes = None; op.started_at = None
         op.paused_at = None; op.total_pause_minutes = 0
+        # Удаляем все сессии операторов по этой операции
+        db.query(OpSession).filter(OpSession.op_id == opid).delete()
         audit(db, data.get("user_id", 1), "Откат операции", "op", opid, f"{old} → Ожидает")
         db.flush(); db.commit()
         return {"status": "ok"}
@@ -2498,6 +2616,81 @@ def create_app():
             if op: op.sort_order = item["sort_order"]
         db.flush(); db.commit()
         return {"status": "ok"}
+
+    @app.get("/api/statistics")
+    def api_statistics(date_from: str = None, date_to: str = None, db: Session = Depends(db_dep)):
+        """Статистика: все завершённые и активные сессии операторов."""
+        from datetime import datetime as _datetime
+        q = db.query(OpSession).options(
+            joinedload(OpSession.user),
+            joinedload(OpSession.op).joinedload(ProductionOp.order).joinedload(Order.customer),
+            joinedload(OpSession.op).joinedload(ProductionOp.order_item).joinedload(OrderItem.part_template),
+            joinedload(OpSession.op).joinedload(ProductionOp.resource))
+        if date_from:
+            try:
+                df = _datetime.fromisoformat(date_from)
+                q = q.filter(OpSession.started_at >= df)
+            except Exception: pass
+        if date_to:
+            try:
+                dt = _datetime.fromisoformat(date_to + "T23:59:59") if len(date_to) == 10 else _datetime.fromisoformat(date_to)
+                q = q.filter(OpSession.started_at <= dt)
+            except Exception: pass
+        sessions = q.order_by(OpSession.started_at.desc()).limit(5000).all()
+
+        # Загружаем станки из списаний единым запросом — группируем по (op_id, user_id)
+        op_ids = list({s.op_id for s in sessions if s.op_id})
+        wo_resources: dict = {}  # (op_id, user_id) -> list[str]
+        if op_ids:
+            wos = db.query(WriteOff).options(joinedload(WriteOff.resource)).filter(
+                WriteOff.production_op_id.in_(op_ids),
+                WriteOff.is_cancelled == False,
+                WriteOff.resource_id.isnot(None)
+            ).all()
+            for w in wos:
+                key = (w.production_op_id, w.user_id)
+                if key not in wo_resources:
+                    wo_resources[key] = []
+                rname = w.resource.name if w.resource else None
+                if rname and rname not in wo_resources[key]:
+                    wo_resources[key].append(rname)
+
+        result = []
+        n = now_msk()
+        for s in sessions:
+            op = s.op
+            if not op: continue
+            # Фактическое время
+            if s.status == "Завершена":
+                actual_min = s.actual_minutes or 0
+            elif s.started_at:
+                elapsed = int((n - s.started_at).total_seconds() / 60)
+                actual_min = max(0, elapsed - (s.total_pause_minutes or 0))
+                if s.status == "Пауза" and s.paused_at:
+                    current_pause = int((n - s.paused_at).total_seconds() / 60)
+                    actual_min = max(0, actual_min - current_pause)
+            else:
+                actual_min = 0
+            # Станок: берём из списаний; если нет — из назначенного на операцию
+            wo_res_list = wo_resources.get((op.id, s.user_id), [])
+            resource_str = ", ".join(wo_res_list) if wo_res_list else (op.resource.name if op.resource else "—")
+            result.append({
+                "session_id": s.id,
+                "order": (op.order.order_number + (" — " + op.order.description[:50] if op.order.description else "")) if op.order else "",
+                "customer": op.order.customer.short_name or op.order.customer.name if (op.order and op.order.customer) else "",
+                "order_status": op.order.status if op.order else "",
+                "operator": s.user.full_name if s.user else "",
+                "part": pt_display(op.order_item.part_template) if op.order_item and op.order_item.part_template else "",
+                "qty": op.planned_qty or 0,
+                "operation": op.operation_type,
+                "resource": resource_str,
+                "estimated_min": op.estimated_minutes or 0,
+                "actual_min": actual_min,
+                "session_status": s.status,
+                "started_at": s.started_at.isoformat() if s.started_at else None,
+                "ended_at": s.ended_at.isoformat() if s.ended_at else None,
+            })
+        return result
 
     # ─── Resources for operation type ───────────────
     @app.get("/api/resources/for-operation/{op_type}")
@@ -3901,6 +4094,7 @@ var PAGES=[{id:'dashboard',icon:'📊',label:'Панель',perm:null},{id:'orde
   {id:'operations',icon:'🔧',label:'Операции',perm:'op.view'},{id:'reservations',icon:'🔒',label:'Резервы',perm:'reserve.view'},
   {id:'parts_log',icon:'📝',label:'Учёт деталей',perm:'parts.log'},{id:'ready_to_ship',icon:'🚚',label:'Отгрузка',perm:'ship.view'},
   {id:'writeoffs',icon:'📤',label:'Списания',perm:'writeoff.material'},
+  {id:'statistics',icon:'📉',label:'Статистика',perm:'stats.view'},
   {id:'load',icon:'📈',label:'Загруженность',perm:'load.view'},{id:'customers',icon:'🏢',label:'Клиенты',perm:'cust.view'},
   {id:'resources',icon:'🏭',label:'Станки',perm:'res.view'},{id:'logs',icon:'📜',label:'Логи',perm:'admin.logs'},
   {id:'settings',icon:'⚙',label:'Настройки',perm:'admin.users'}];
@@ -3912,6 +4106,7 @@ function loadPage(p){var c=document.getElementById('mainContent');try{switch(p){
   case'warehouse':pgWarehouse(c);break;case'operations':pgOperations(c);break;case'reservations':pgReservations(c);break;
   case'parts_log':pgPartsLog(c);break;case'writeoffs':pgWriteoffs(c);break;case'load':pgLoad(c);break;
   case'ready_to_ship':pgReadyToShip(c);break;
+  case'statistics':pgStatistics(c);break;
   case'customers':pgCustomers(c);break;case'resources':pgResources(c);break;case'logs':pgLogs(c);break;
   case'settings':pgSettings(c);break;default:c.innerHTML='<p>Не найдено</p>'}}catch(e){c.innerHTML='<p style="color:var(--err)">Ошибка: '+e.message+'</p>';console.error(e)}}
 
@@ -4898,23 +5093,37 @@ function pgOperations(c){
           '<td>'+statusBadge(o.status)+'</td>'+
           '<td style="white-space:nowrap">'+
             (function(){
-              // Кнопка старта: блокируем если нет деталей/комплектов с предыдущего участка
+              var mySess=(o.sessions||[]).find(function(s){return s.user_id===U.id});
+              var activeSessions=(o.sessions||[]).filter(function(s){return s.status!=='Завершена'});
+              // Плашки активных операторов
+              var operBadges=activeSessions.map(function(s){
+                return '<span style="font-size:.72em;background:rgba(99,102,241,.15);border-radius:3px;padding:1px 5px;margin:1px;display:inline-block">'+
+                  esc(s.user_name)+(s.status==='Пауза'?' ⏸':' ▶')+'</span>';}).join('');
+              var btns='';
               if(o.status==='Ожидает'||o.status==='Запланирована'){
-                // Сборочная операция: проверяем готовые комплекты
+                // Проверка блокировок
                 if(o.available_kits!=null&&o.available_kits===0)
-                  return '<button class="btn sm" disabled title="Нельзя начать сборку — неполный комплект деталей. Все компоненты должны пройти свои операции" style="opacity:.45;cursor:not-allowed">▶</button>';
-                // Обычная деталь: проверяем поступившие с предыдущего участка
-                if(o.available_kits==null&&o.available_input!=null&&o.available_input===0)
-                  return '<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
-                return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
+                  btns='<button class="btn sm" disabled title="Нельзя начать сборку — неполный комплект деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+                else if(o.available_kits==null&&o.available_input!=null&&o.available_input===0)
+                  btns='<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+                else
+                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Начать операцию">▶ Начать</button>';
+              } else if(o.status==='В работе'||o.status==='Пауза'){
+                if(!mySess||mySess.status==='Завершена'){
+                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Присоединиться к операции">▶ Начать</button>';
+                } else if(mySess.status==='В работе'){
+                  btns='<button class="btn sm" onclick="sessionPause('+o.id+')" title="Поставить свою работу на паузу">⏸ Пауза</button>';
+                } else if(mySess.status==='Пауза'){
+                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Возобновить свою работу">▶ Продолжить</button>';
+                }
+                btns+='<button class="btn sm ok" onclick="completeOp('+o.id+')">✓ Готово</button>';
+              } else if(o.status==='Завершена'&&hasPerm('op.reopen')){
+                btns='<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="sessionStart('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>';
               }
-              if(o.status==='Пауза')return '<button class="btn sm warn" onclick="startOp('+o.id+')">▶</button>';
-              return '';
+              btns+=((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
+                (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'');
+              return operBadges+'<br style="line-height:.5em">'+btns;
             })()+
-            (o.status==='В работе'?'<button class="btn sm ok" onclick="completeOp('+o.id+')">✓ Готово</button><button class="btn sm" onclick="pauseOp('+o.id+')">⏸</button>':'')+
-            (o.status==='Завершена'&&hasPerm('op.reopen')?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="reopenOp('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>':'')+
-            ((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
-            (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'')+
           '</td></tr>';
       }).join('')+'</tbody></table></div>';
   });
@@ -4932,6 +5141,9 @@ function dropOp(e){e.preventDefault();var tr=e.target.closest('tr');if(!tr||!dra
   api('/api/operations/reorder','POST',{order:order}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e2){toast(e2.message,'err')})}
 function startOp(id){api('/api/operations/'+id+'/start','POST',{user_id:U.id}).then(function(){toast('Запущена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function pauseOp(id){api('/api/operations/'+id+'/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+function sessionStart(id){api('/api/operations/'+id+'/session/start','POST',{user_id:U.id}).then(function(){toast('Запущено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+function sessionPause(id){api('/api/operations/'+id+'/session/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+function reopenOp(id){sessionStart(id)}
 
 function completeOp(id){
   // Проверяем несписанные резервы и остаток деталей
@@ -6211,6 +6423,93 @@ function _logRenderTable(){
   }).join('');
   tblUpdateBtns('log');}
 
+// ═══ СТАТИСТИКА ═══
+var _stat={items:[],filters:{},dateFrom:'',dateTo:''};
+function _statGetVal(row,col){
+  if(col==='order')return row.order||'';
+  if(col==='order_status')return row.order_status||'';
+  if(col==='customer')return row.customer||'';
+  if(col==='operator')return row.operator||'';
+  if(col==='part')return row.part||'';
+  if(col==='operation')return row.operation||'';
+  if(col==='resource')return row.resource||'';
+  if(col==='session_status')return row.session_status||'';
+  return '';}
+function _statRender(){
+  var rows=tblGetFiltered('stat');
+  var tbody=document.getElementById('stat_tbody');
+  if(!tbody)return;
+  if(!rows.length){tbody.innerHTML='<tr><td colspan="10" style="text-align:center;color:var(--text3)">Нет данных за выбранный период</td></tr>';return;}
+  // Итоги
+  var totalEst=rows.reduce(function(s,r){return s+(r.estimated_min||0)},0);
+  var totalAct=rows.reduce(function(s,r){return s+(r.actual_min||0)},0);
+  var sumEl=document.getElementById('stat_totals');
+  if(sumEl)sumEl.innerHTML='Итого: '+rows.length+' записей | ⏱ Расч.: '+fmtMinToH(totalEst)+' | ⏱ Факт: '+fmtMinToH(totalAct);
+  tbody.innerHTML=rows.map(function(r){
+    var over=r.estimated_min&&r.actual_min>r.estimated_min;
+    var actColor=over?'var(--err)':'var(--ok)';
+    var statusBg=r.session_status==='В работе'?'rgba(99,102,241,.15)':r.session_status==='Завершена'?'rgba(34,197,94,.12)':'rgba(245,158,11,.15)';
+    return '<tr>'+
+      '<td style="font-size:.84em;font-weight:600">'+esc(r.customer)+'</td>'+
+      '<td style="font-size:.84em">'+esc(r.order)+'</td>'+
+      '<td>'+statusBadge(r.order_status)+'</td>'+
+      '<td style="font-size:.84em;font-weight:600">'+esc(r.operator)+'</td>'+
+      '<td style="font-size:.82em">'+esc(r.part)+'</td>'+
+      '<td style="text-align:center">'+r.qty+'</td>'+
+      '<td style="font-size:.82em">'+esc(r.operation)+'</td>'+
+      '<td style="font-size:.82em">'+esc(r.resource)+'</td>'+
+      '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(r.estimated_min)+'</td>'+
+      '<td style="font-size:.82em;font-weight:600;color:'+actColor+'">'+fmtMinToH(r.actual_min)+(over?' ⚠':'')+'</td>'+
+      '<td><span style="font-size:.75em;background:'+statusBg+';border-radius:3px;padding:1px 6px">'+esc(r.session_status)+'</span></td>'+
+      '<td style="font-size:.75em;color:var(--text3)">'+fmtDT(r.started_at)+'</td>'+
+    '</tr>';}).join('');}
+function _statLoad(){
+  var url='/api/statistics';
+  var params=[];
+  if(_stat.dateFrom)params.push('date_from='+_stat.dateFrom);
+  if(_stat.dateTo)params.push('date_to='+_stat.dateTo);
+  if(params.length)url+='?'+params.join('&');
+  var tbody=document.getElementById('stat_tbody');
+  if(tbody)tbody.innerHTML='<tr><td colspan="12" style="text-align:center;color:var(--text3)">⏳ Загрузка...</td></tr>';
+  api(url).then(function(rows){
+    window['_statItems']=rows;
+    _stat.items=rows;
+    window['_statFilters']=_stat.filters={};
+    window['_statGetVal']=_statGetVal;
+    window['_statRender']=_statRender;
+    tblUpdateBtns('stat');
+    _statRender();
+  }).catch(function(e){toast(e.message,'err')});}
+function pgStatistics(c){
+  c.innerHTML='<div class="toolbar">'+
+    '<div class="info-box" style="margin:0;padding:6px 12px">📉 Статистика операций</div>'+
+    '<span class="spacer"></span>'+
+    '<span id="stat_totals" style="font-size:.85em;color:var(--text3);padding:4px 12px"></span>'+
+    '<button class="btn" onclick="_stat.filters={};window[\'_statFilters\']={};tblUpdateBtns(\'stat\');_statRender()">✕ Сбросить фильтры</button>'+
+  '</div>'+
+  '<div class="filter-bar" style="flex-wrap:wrap;gap:6px">'+
+    '<label style="color:var(--text2)">Период с:</label>'+
+    '<input type="date" class="ctl" id="stat_from" value="'+_stat.dateFrom+'" style="width:140px" onchange="_stat.dateFrom=this.value;_statLoad()">'+
+    '<label style="color:var(--text2)">по:</label>'+
+    '<input type="date" class="ctl" id="stat_to" value="'+_stat.dateTo+'" style="width:140px" onchange="_stat.dateTo=this.value;_statLoad()">'+
+    '<button class="btn" onclick="_stat.dateFrom=\'\';_stat.dateTo=\'\';document.getElementById(\'stat_from\').value=\'\';document.getElementById(\'stat_to\').value=\'\';_statLoad()">Все периоды</button>'+
+  '</div>'+
+  '<div class="tbl-wrap"><table id="stat_table"><thead><tr>'+
+    tblFTh('Заказчик','stat','customer')+
+    tblFTh('Заказ','stat','order')+
+    tblFTh('Статус заказа','stat','order_status')+
+    tblFTh('Оператор','stat','operator')+
+    tblFTh('Деталь','stat','part')+
+    '<th>Кол-во</th>'+
+    tblFTh('Операция','stat','operation')+
+    tblFTh('Станок/Участок','stat','resource')+
+    '<th>⏱ Расч.</th><th>⏱ Факт.</th>'+
+    tblFTh('Статус','stat','session_status')+
+    '<th>Начало</th>'+
+  '</tr></thead><tbody id="stat_tbody"><tr><td colspan="12" style="text-align:center;color:var(--text3)">⏳ Загрузка...</td></tr></tbody></table></div>';
+  window['_statItems']=[];window['_statFilters']={};window['_statGetVal']=_statGetVal;window['_statRender']=_statRender;
+  _statLoad();}
+
 // ═══ НАСТРОЙКИ ═══
 var setTab='users';
 function pgSettings(c){c.innerHTML='<div class="toolbar">'+
@@ -6223,20 +6522,51 @@ function pgSettings(c){c.innerHTML='<div class="toolbar">'+
   switch(setTab){case'users':setUsers(sc);break;case'roles':setRoles(sc);break;case'grades':setGrades(sc);break;
     case'categories':setCategories(sc);break;case'op_types':setOpTypes(sc);break}}
 
+var _TRANSLIT={'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'Yo','Ж':'Zh','З':'Z','И':'I','Й':'J','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya','а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'};
+function _translit(s){return s.split('').map(function(c){return _TRANSLIT[c]!==undefined?_TRANSLIT[c]:c}).join('');}
+function genLoginPwd(){
+  var fn=document.getElementById('fu_n').value.trim();
+  if(!fn){toast('Сначала введите ФИО','err');return;}
+  var parts=fn.split(/\s+/);
+  var sur=parts[0]||'',first=parts[1]||'';
+  var latSur=_translit(sur.charAt(0).toUpperCase()+sur.slice(1).toLowerCase());
+  var latFirst=_translit(first.charAt(0).toUpperCase());
+  var login=latSur+(latFirst||'');
+  var shortSur=(latSur.charAt(0).toUpperCase()+latSur.slice(1,3).toLowerCase());
+  var pwd=shortSur+(Math.floor(1000+Math.random()*9000));
+  document.getElementById('fu_l').value=login;
+  var pInp=document.getElementById('fu_p');pInp.value=pwd;pInp.type='text';}
+
 function setUsers(sc){api('/api/users').then(function(users){
+  var isAdm=U&&U.role==='admin';
   sc.innerHTML='<button class="btn primary" onclick="modalUser()" style="margin-bottom:12px">+ Пользователь</button>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Логин</th><th>ФИО</th><th>Таб.</th><th>Роль</th><th>Акт.</th><th></th></tr></thead>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Логин</th><th>ФИО</th><th>Таб.</th><th>Роль</th>'+
+    (isAdm?'<th>Пароль</th>':'')+
+    '<th>Акт.</th><th></th></tr></thead>'+
   '<tbody>'+users.map(function(u){return '<tr><td><strong>'+u.username+'</strong></td><td>'+u.full_name+'</td><td>'+(u.tab_number||'—')+'</td>'+
-    '<td>'+statusBadge(u.role_label)+'</td><td>'+(u.is_active?'✅':'❌')+'</td>'+
+    '<td>'+statusBadge(u.role_label)+'</td>'+
+    (isAdm?'<td><code style="font-size:.82em;background:var(--s2);padding:2px 6px;border-radius:3px">'+(u.password_plain||'—')+'</code></td>':'')+
+    '<td>'+(u.is_active?'✅':'❌')+'</td>'+
     '<td><button class="btn sm" onclick="modalUser('+u.id+')">✏</button></td></tr>'}).join('')+'</tbody></table></div>'})}
+
 function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles')]).then(function(arr){
   var resources=arr[0],roles=arr[1];
+  var isAdm=U&&U.role==='admin';
   var p1=uid?api('/api/users'):Promise.resolve(null);p1.then(function(us){var u=us?us.find(function(x){return x.id===uid}):null;
   var uSt=u?u.stations:[];var roleOpts=roles.map(function(r){return{v:r.role,t:r.display_name+' ('+r.role+')'}});
   openModal('<h2>'+(u?'✏':'+')+' Пользователь</h2>'+
-  '<div class="form-row"><div><label>Логин</label><input id="fu_l" value="'+(u?u.username:'')+'" '+(u?'disabled':'')+'></div>'+
-    '<div><label>Пароль '+(u?'(пусто=не менять)':'')+'</label><input type="password" id="fu_p"></div></div>'+
-  '<div class="form-row"><div><label>ФИО</label><input id="fu_n" value="'+(u?u.full_name:'')+'"></div><div><label>Таб.№</label><input id="fu_t" value="'+(u?u.tab_number:'')+'"></div></div>'+
+  '<div class="form-row"><div><label>Логин</label>'+
+    (u?'<input id="fu_l" value="'+esc(u.username)+'" disabled>'
+      :'<input id="fu_l" value="" placeholder="KuznecovI">')+'</div>'+
+    '<div><label>Пароль '+(u?'(пусто=не менять)':'')+'</label>'+
+    '<div style="display:flex;gap:6px">'+
+      '<input '+(isAdm?'type="text"':'type="password"')+' id="fu_p" value="'+(u&&isAdm?(u.password_plain||''):'')+'" style="flex:1" placeholder="Пароль">'+
+      '<button type="button" class="btn sm" onclick="var i=document.getElementById(\'fu_p\');i.type=i.type===\'text\'?\'password\':\'text\'" title="Показать/скрыть">👁</button>'+
+    '</div></div></div>'+
+  '<div class="form-row"><div><label>ФИО</label><input id="fu_n" value="'+(u?esc(u.full_name):'')+'" placeholder="Кузнецов Илья"></div>'+
+    '<div><label>Таб.№</label><input id="fu_t" value="'+(u?esc(u.tab_number||''):'')+'"></div></div>'+
+  (!u?'<div style="margin:-4px 0 10px"><button type="button" class="btn sm" onclick="genLoginPwd()" style="background:var(--info);border-color:var(--info);color:#fff">⚡ Авто-логин/пароль</button>'+
+    '<span style="font-size:.78em;color:var(--text3);margin-left:8px">по ФИО (введите ФИО выше)</span></div>':'')+
   '<div class="form-row"><div><label>Роль</label>'+SS('fu_r',roleOpts,u?u.role:'operator','Роль')+'</div>'+
     '<div><label>Активен</label><select id="fu_a"><option value="true" '+(!u||u.is_active?'selected':'')+'>Да</option><option value="false" '+(u&&!u.is_active?'selected':'')+'>Нет</option></select></div></div>'+
   '<div class="section-hdr">Участки</div>'+
@@ -6248,6 +6578,9 @@ function saveUser(uid){var b={full_name:document.getElementById('fu_n').value,ta
   if(uid)b.id=uid;else{b.username=document.getElementById('fu_l').value;b.password=document.getElementById('fu_p').value}
   var pw=document.getElementById('fu_p').value;if(pw&&uid)b.password=pw;
   api('/api/users/save','POST',b).then(function(){closeModal();toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
+function delUser(uid,name){
+  if(!confirm('Удалить пользователя «'+name+'»?\n\nЭто действие нельзя отменить.'))return;
+  api('/api/users/delete','POST',{id:uid}).then(function(){toast('Удалён','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 
 function setRoles(sc){Promise.all([api('/api/roles'),api('/api/permissions')]).then(function(arr){var roles=arr[0],perms=arr[1];
   var cats={};perms.forEach(function(p){if(!cats[p.category])cats[p.category]=[];cats[p.category].push(p)});var WO=['Материал','Детали'];
