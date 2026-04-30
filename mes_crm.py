@@ -37,6 +37,7 @@ def now_msk():
 # ─── Защита от брутфорса ────────────────────────────────────────────────────
 # Структура: { "ip": {"attempts": N, "blocked_until": datetime | None} }
 _login_attempts: dict = {}
+_impersonate_tokens: dict = {}  # token -> (user_id, expires_at_ts)
 _LOGIN_MAX_ATTEMPTS = 5       # попыток до блокировки
 _LOGIN_BLOCK_MINUTES = 15     # минут блокировки
 _LOGIN_ATTEMPT_WINDOW = 600   # секунд — окно для сброса счётчика (10 мин)
@@ -886,10 +887,21 @@ def init_database():
             db.flush()
         # Ensure new permissions exist
         existing_codes = {p.code for p in db.query(Permission).all()}
+        new_perm_codes = []
         for code, name, cat in DEFAULT_PERMS:
             if code not in existing_codes:
                 db.add(Permission(code=code, name=name, category=cat))
+                new_perm_codes.append(code)
         db.flush()
+        # Авто-выдача новых разрешений роли admin
+        if new_perm_codes:
+            admin_role = db.query(RoleConfig).filter(RoleConfig.role == "admin").first()
+            if admin_role:
+                for code in new_perm_codes:
+                    p = db.query(Permission).filter(Permission.code == code).first()
+                    if p and p not in admin_role.permissions:
+                        admin_role.permissions.append(p)
+                db.flush()
         if db.query(RoleConfig).count() == 0:
             all_p = {p.code: p for p in db.query(Permission).all()}
             for role, disp, pcodes, wo in [
@@ -1335,6 +1347,9 @@ def create_app():
                 raise HTTPException(429, f"Слишком много попыток. Подождите {_LOGIN_BLOCK_MINUTES} мин.")
         # Успешный вход — сбрасываем счётчик
         _reset_login_attempts(ip)
+        # Бэкфилл password_plain для старых пользователей (для просмотра администратором)
+        if not (user.password_plain or "").strip():
+            user.password_plain = data["password"]
         rc = db.query(RoleConfig).filter(RoleConfig.role == user.role).first()
         perms = [p.code for p in rc.permissions] if rc else []
         wo_types = rc.get_wo_types() if rc else []
@@ -1417,6 +1432,45 @@ def create_app():
         if u.username == "admin": raise HTTPException(400, "Нельзя удалить администратора")
         db.delete(u); db.commit()
         return {"status": "ok"}
+
+    # ─── Impersonation (вход под пользователем для администратора) ──
+    @app.post("/api/users/impersonate")
+    async def api_impersonate(request: Request, db: Session = Depends(db_dep)):
+        import secrets as _secrets, time as _time
+        data = await request.json()
+        uid = data.get("id")
+        u = db.query(User).get(uid)
+        if not u or not u.is_active:
+            raise HTTPException(404, "Пользователь не найден или неактивен")
+        # Чистим протухшие токены
+        now_ts = _time.time()
+        for t, (_uid, exp) in list(_impersonate_tokens.items()):
+            if exp < now_ts: _impersonate_tokens.pop(t, None)
+        token = _secrets.token_urlsafe(24)
+        _impersonate_tokens[token] = (u.id, now_ts + 60)  # 60 секунд
+        audit(db, data.get("by_user_id", 0), "Вход под пользователем", "user", u.id, u.username)
+        db.commit()
+        return {"token": token}
+
+    @app.post("/api/auth/impersonate-exchange")
+    async def api_impersonate_exchange(request: Request, db: Session = Depends(db_dep)):
+        import time as _time
+        data = await request.json()
+        token = data.get("token", "")
+        rec = _impersonate_tokens.pop(token, None)
+        if not rec: raise HTTPException(401, "Токен недействителен или истёк")
+        uid, exp = rec
+        if exp < _time.time(): raise HTTPException(401, "Токен истёк")
+        user = db.query(User).get(uid)
+        if not user or not user.is_active: raise HTTPException(404, "Пользователь недоступен")
+        rc = db.query(RoleConfig).filter(RoleConfig.role == user.role).first()
+        perms = [p.code for p in rc.permissions] if rc else []
+        wo_types = rc.get_wo_types() if rc else []
+        stations = [{"id": s.id, "name": s.name} for s in user.allowed_stations]
+        return {"id": user.id, "username": user.username, "role": user.role,
+                "role_label": rc.display_name if rc else user.role,
+                "full_name": user.full_name, "permissions": perms,
+                "stations": stations, "writeoff_types": wo_types}
 
     # ─── Roles ──────────────────────────────────────
     @app.get("/api/roles")
@@ -4086,6 +4140,17 @@ function doLogin(){api('/api/auth/login','POST',{username:document.getElementByI
   document.getElementById('userInfo').textContent=U.full_name+' ('+U.role_label+')';buildNav();connectWS();loadPage('dashboard')}).catch(function(e){document.getElementById('loginErr').textContent=e.message})}
 function doLogout(){U=null;location.reload()}
 document.getElementById('loginPass').addEventListener('keydown',function(e){if(e.key==='Enter')doLogin()});
+// Авто-вход по токену импersonation (?imp=TOKEN)
+(function(){var m=location.search.match(/[?&]imp=([^&]+)/);if(!m)return;
+  var tok=decodeURIComponent(m[1]);
+  // Удаляем токен из URL, чтобы не остался в истории
+  if(history.replaceState){history.replaceState(null,'',location.pathname);}
+  api('/api/auth/impersonate-exchange','POST',{token:tok}).then(function(u){
+    U=u;document.getElementById('loginScreen').style.display='none';document.getElementById('appShell').style.display='block';
+    document.getElementById('userInfo').textContent=U.full_name+' ('+U.role_label+') 👤[имперсонация]';
+    buildNav();connectWS();loadPage('dashboard');
+  }).catch(function(e){document.getElementById('loginErr').textContent='Ошибка имперсонации: '+e.message});
+})();
 function connectWS(){try{var p=location.protocol==='https:'?'wss':'ws';ws=new WebSocket(p+'://'+location.host+'/ws');
   ws.onopen=function(){document.getElementById('wsDot').classList.add('on')};ws.onclose=function(){document.getElementById('wsDot').classList.remove('on');setTimeout(connectWS,5000)};ws.onerror=function(){}}catch(e){}}
 
@@ -6538,35 +6603,50 @@ function genLoginPwd(){
   var pInp=document.getElementById('fu_p');pInp.value=pwd;pInp.type='text';}
 
 function setUsers(sc){api('/api/users').then(function(users){
-  var isAdm=U&&U.role==='admin';
+  var canSeePw=hasPerm('admin.users');
+  var canDel=hasPerm('admin.users_delete');
+  var canImpers=U&&U.role==='admin';
   sc.innerHTML='<button class="btn primary" onclick="modalUser()" style="margin-bottom:12px">+ Пользователь</button>'+
   '<div class="tbl-wrap"><table><thead><tr><th>Логин</th><th>ФИО</th><th>Таб.</th><th>Роль</th>'+
-    (isAdm?'<th>Пароль</th>':'')+
+    (canSeePw?'<th>Пароль</th>':'')+
     '<th>Акт.</th><th></th></tr></thead>'+
-  '<tbody>'+users.map(function(u){return '<tr><td><strong>'+u.username+'</strong></td><td>'+u.full_name+'</td><td>'+(u.tab_number||'—')+'</td>'+
-    '<td>'+statusBadge(u.role_label)+'</td>'+
-    (isAdm?'<td><code style="font-size:.82em;background:var(--s2);padding:2px 6px;border-radius:3px">'+(u.password_plain||'—')+'</code></td>':'')+
+  '<tbody>'+users.map(function(u){
+    var pwCell=canSeePw?('<td><code style="font-size:.82em;background:var(--s2);padding:2px 6px;border-radius:3px">'+(u.password_plain?esc(u.password_plain):'<span style="color:var(--text3)" title="Старый пользователь — пароль будет сохранён при следующем входе или после смены">— (нет)</span>')+'</code></td>'):'';
+    var delBtn=(canDel&&u.username!=='admin')?'<button class="btn sm" onclick="delUser('+u.id+',\''+esc(u.username)+'\')" style="color:var(--err)" title="Удалить пользователя">🗑</button>':'';
+    var impBtn=(canImpers&&U.id!==u.id&&u.is_active)?'<button class="btn sm" onclick="impersonateUser('+u.id+',\''+esc(u.username)+'\')" style="background:var(--info);border-color:var(--info);color:#fff" title="Войти под пользователем (новая вкладка)">🔑</button>':'';
+    return '<tr><td><strong>'+u.username+'</strong></td><td>'+u.full_name+'</td><td>'+(u.tab_number||'—')+'</td>'+
+    '<td>'+statusBadge(u.role_label)+'</td>'+pwCell+
     '<td>'+(u.is_active?'✅':'❌')+'</td>'+
-    '<td><button class="btn sm" onclick="modalUser('+u.id+')">✏</button></td></tr>'}).join('')+'</tbody></table></div>'})}
+    '<td><button class="btn sm" onclick="modalUser('+u.id+')">✏</button>'+impBtn+delBtn+'</td></tr>'}).join('')+'</tbody></table></div>'})}
+
+function impersonateUser(uid,name){
+  if(!confirm('Войти под пользователем «'+name+'»?\n\nОткроется новая вкладка с автоматическим входом. Текущая сессия администратора сохранится.'))return;
+  api('/api/users/impersonate','POST',{id:uid,by_user_id:U.id}).then(function(r){
+    var url=location.pathname+'?imp='+encodeURIComponent(r.token);
+    var w=window.open(url,'_blank');
+    if(!w)toast('Браузер заблокировал открытие вкладки. Разрешите popup.','err');
+    else toast('Открыта новая вкладка под '+name,'ok');
+  }).catch(function(e){toast(e.message,'err')})}
 
 function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles')]).then(function(arr){
   var resources=arr[0],roles=arr[1];
-  var isAdm=U&&U.role==='admin';
+  var isAdm=hasPerm('admin.users');
   var p1=uid?api('/api/users'):Promise.resolve(null);p1.then(function(us){var u=us?us.find(function(x){return x.id===uid}):null;
   var uSt=u?u.stations:[];var roleOpts=roles.map(function(r){return{v:r.role,t:r.display_name+' ('+r.role+')'}});
+  var pwHint=(u&&isAdm&&!(u.password_plain||'').trim())?'<div style="font-size:.78em;color:var(--warn);margin-top:4px">⚠ Старый пароль скрыт (создан до сохранения plain). Введите новый или попросите пользователя войти — после входа пароль появится.</div>':'';
   openModal('<h2>'+(u?'✏':'+')+' Пользователь</h2>'+
   '<div class="form-row"><div><label>Логин</label>'+
     (u?'<input id="fu_l" value="'+esc(u.username)+'" disabled>'
       :'<input id="fu_l" value="" placeholder="KuznecovI">')+'</div>'+
     '<div><label>Пароль '+(u?'(пусто=не менять)':'')+'</label>'+
     '<div style="display:flex;gap:6px">'+
-      '<input '+(isAdm?'type="text"':'type="password"')+' id="fu_p" value="'+(u&&isAdm?(u.password_plain||''):'')+'" style="flex:1" placeholder="Пароль">'+
+      '<input '+(isAdm?'type="text"':'type="password"')+' id="fu_p" value="'+(u&&isAdm?esc(u.password_plain||''):'')+'" style="flex:1" placeholder="Пароль">'+
       '<button type="button" class="btn sm" onclick="var i=document.getElementById(\'fu_p\');i.type=i.type===\'text\'?\'password\':\'text\'" title="Показать/скрыть">👁</button>'+
-    '</div></div></div>'+
+      '<button type="button" class="btn sm" onclick="genLoginPwd()" title="Авто-генерация по ФИО">⚡</button>'+
+    '</div>'+pwHint+'</div></div>'+
   '<div class="form-row"><div><label>ФИО</label><input id="fu_n" value="'+(u?esc(u.full_name):'')+'" placeholder="Кузнецов Илья"></div>'+
     '<div><label>Таб.№</label><input id="fu_t" value="'+(u?esc(u.tab_number||''):'')+'"></div></div>'+
-  (!u?'<div style="margin:-4px 0 10px"><button type="button" class="btn sm" onclick="genLoginPwd()" style="background:var(--info);border-color:var(--info);color:#fff">⚡ Авто-логин/пароль</button>'+
-    '<span style="font-size:.78em;color:var(--text3);margin-left:8px">по ФИО (введите ФИО выше)</span></div>':'')+
+  (!u?'<div style="margin:-4px 0 10px"><span style="font-size:.78em;color:var(--text3)">⚡ — авто-генерация логина и пароля по ФИО (введите ФИО ниже)</span></div>':'')+
   '<div class="form-row"><div><label>Роль</label>'+SS('fu_r',roleOpts,u?u.role:'operator','Роль')+'</div>'+
     '<div><label>Активен</label><select id="fu_a"><option value="true" '+(!u||u.is_active?'selected':'')+'>Да</option><option value="false" '+(u&&!u.is_active?'selected':'')+'>Нет</option></select></div></div>'+
   '<div class="section-hdr">Участки</div>'+
@@ -6601,7 +6681,7 @@ function saveRole(rid){var d=document.getElementById('role_disp_'+rid);
   var b={id:rid,permissions:Array.from(document.querySelectorAll('#role_perms_'+rid+' input:checked')).map(function(cb){return cb.value}),
     writeoff_types:Array.from(document.querySelectorAll('#role_wo_'+rid+' input:checked')).map(function(cb){return cb.value})};
   if(d)b.display_name=d.value;api('/api/roles/save','POST',b).then(function(){toast('OK','ok')}).catch(function(e){toast(e.message,'err')})}
-function deleteRole(rid){if(!confirm('Удалить?'))return;api('/api/roles/delete','POST',{id:rid}).then(function(){toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
+function deleteRole(rid){if(!confirm('Удалить роль?\n\nВсе пользователи с этой ролью будут переназначены на «operator».'))return;api('/api/roles/delete','POST',{id:rid}).then(function(r){toast('Удалено'+(r&&r.reassigned?' (переназначено: '+r.reassigned+')':''),'ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
 function modalNewRole(){api('/api/permissions').then(function(perms){var cats={};perms.forEach(function(p){if(!cats[p.category])cats[p.category]=[];cats[p.category].push(p)});
   openModal('<h2>+ Роль</h2>'+
   '<div class="form-row"><div><label>Код (лат.)</label><input id="fnr_code" placeholder="supervisor"></div><div><label>Имя</label><input id="fnr_disp" placeholder="Супервайзер"></div></div>'+
