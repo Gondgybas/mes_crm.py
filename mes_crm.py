@@ -4038,7 +4038,11 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .pm-asm-row td{background:rgba(59,130,246,.07)!important;font-weight:600}
 .pm-comp-row td{background:var(--s1)}
 .pm-comp-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
-.pm-comp-name{padding-left:22px!important;color:var(--text2);font-size:.85em}
+.pm-comp-name{padding-left:34px!important;color:var(--text2);font-size:.85em;position:relative}
+/* Дерево: вертикальная линия от сборки к компонентам + горизонтальный отросток */
+.pm-comp-row .pm-comp-name::before{content:'';position:absolute;left:14px;top:0;bottom:0;border-left:2px solid var(--info);opacity:.55}
+.pm-comp-row.pm-comp-last .pm-comp-name::before{bottom:auto;height:50%}
+.pm-comp-row .pm-comp-name::after{content:'';position:absolute;left:14px;top:50%;width:12px;border-top:2px solid var(--info);opacity:.55}
 .pm-part-row td{background:var(--s1)}
 .pm-part-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
 .pm-op-cell{text-align:center;padding:4px 6px!important}
@@ -4047,6 +4051,8 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .op-cell-active{background:rgba(251,191,36,.15)!important;color:var(--warn)}
 .op-cell-partial{background:rgba(59,130,246,.13)!important;color:var(--info)}
 .op-cell-wait{background:var(--bg);color:var(--text3)}
+/* Пустая строка-разделитель между заказами: без фона и без рамок */
+.parts-matrix tr.pm-gap td{background:var(--bg)!important;border:0!important;padding:0!important;height:14px;line-height:0;font-size:0}
 
 /* ═══════════════════════════════════════════
    МОБИЛЬНАЯ АДАПТАЦИЯ (≤ 900px)
@@ -5836,7 +5842,16 @@ function renderPartsMatrix(data,allOpTypes){
     allOpTypes.map(function(ot){return '<th class="pm-op-col">'+ot+'</th>'}).join('')+
     '</tr></thead><tbody>';
 
+  // Группируем по заказу, сохраняя исходный порядок появления
+  var groups={},orderKeys=[];
   data.forEach(function(d){
+    var k=(d.order_id!=null?d.order_id:d.order_number);
+    if(!(k in groups)){groups[k]=[];orderKeys.push(k);}
+    groups[k].push(d);
+  });
+  var colCount=3+allOpTypes.length;
+
+  function renderRow(d){
     var hasSurplus=d.surplus>0;
     var surpBadge=hasSurplus?'<span class="surplus-label" style="font-size:.72em;margin-left:5px">ПС +'+d.surplus+'</span>':'';
     var orderBadge='<span class="badge b-info" style="font-size:.72em;margin-right:4px">'+d.order_number+'</span>';
@@ -5851,24 +5866,7 @@ function renderPartsMatrix(data,allOpTypes){
           byComp[key][op.op_type]=op;
       });
 
-      // 1. Сначала — строки компонентов
-      (d.components||[]).forEach(function(comp){
-        var cid=String(comp.id);
-        var ops=byComp[cid]||{};
-        var compSurplus=Object.values(ops).some(function(op){return op.completed_qty>op.planned_qty&&op.planned_qty>0});
-        h+='<tr class="pm-comp-row'+(compSurplus?' has-surplus-row':'')+'">'+
-          '<td class="pm-part-col pm-comp-name">🔩 <strong>'+comp.name+'</strong> <span style="color:var(--text3)">×'+comp.qty+'</span></td>'+
-          '<td class="pm-plan-col" style="color:var(--text3)">—</td>'+
-          '<td class="pm-done-col" style="color:var(--text3)">—</td>'+
-          allOpTypes.map(function(ot){
-            var op=ops[ot];
-            if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
-            return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
-          }).join('')+
-        '</tr>';
-      });
-
-      // 2. В конце — строка сборки с только сборочными операциями
+      // 1. Сначала — строка сборки (заголовок)
       var asmOps=byComp['__asm__']||{};
       var asmOver=d.completed>d.quantity;
       h+='<tr class="pm-asm-row'+(hasSurplus?' has-surplus':'')+'">'+
@@ -5886,6 +5884,25 @@ function renderPartsMatrix(data,allOpTypes){
           return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
         }).join('')+
       '</tr>';
+
+      // 2. Затем — строки компонентов, привязанные деревом к сборке выше
+      var comps=d.components||[];
+      comps.forEach(function(comp,ci){
+        var cid=String(comp.id);
+        var ops=byComp[cid]||{};
+        var compSurplus=Object.values(ops).some(function(op){return op.completed_qty>op.planned_qty&&op.planned_qty>0});
+        var isLast=(ci===comps.length-1);
+        h+='<tr class="pm-comp-row'+(isLast?' pm-comp-last':'')+(compSurplus?' has-surplus-row':'')+'">'+
+          '<td class="pm-part-col pm-comp-name">🔩 <strong>'+comp.name+'</strong> <span style="color:var(--text3)">×'+comp.qty+'</span></td>'+
+          '<td class="pm-plan-col" style="color:var(--text3)">—</td>'+
+          '<td class="pm-done-col" style="color:var(--text3)">—</td>'+
+          allOpTypes.map(function(ot){
+            var op=ops[ot];
+            if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
+            return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
+          }).join('')+
+        '</tr>';
+      });
     } else {
       // ─ Обычная деталь ─
       var ops={};
@@ -5909,6 +5926,11 @@ function renderPartsMatrix(data,allOpTypes){
         }).join('')+
       '</tr>';
     }
+  }
+
+  orderKeys.forEach(function(k,gi){
+    if(gi>0) h+='<tr class="pm-gap"><td colspan="'+colCount+'">&nbsp;</td></tr>';
+    groups[k].forEach(renderRow);
   });
 
   h+='</tbody></table></div>';
