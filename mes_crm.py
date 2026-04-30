@@ -4539,13 +4539,30 @@ function modalEditItem(oid,iid){api('/api/orders').then(function(os){var o=os.fi
 function updateItem(oid,iid){api('/api/order-items/save','POST',{id:iid,quantity:+document.getElementById('fei_qty').value,user_id:U.id}).then(function(){closeModal();toast('OK','ok');modalOrderDetail(oid)}).catch(function(e){toast(e.message,'err')})}
 function delItem(iid,oid){if(!confirm('Удалить?'))return;api('/api/order-items/delete','POST',{id:iid}).then(function(){modalOrderDetail(oid)})}
 function delOp(opid,oid){if(!confirm('Удалить?'))return;api('/api/operations/delete','POST',{id:opid}).then(function(){modalOrderDetail(oid)})}
-function modalUpload(oid){openModal('<h2>📎 Загрузка</h2><div class="form-row full"><div><label>Файл</label><input type="file" id="fu_file" style="padding:8px"></div></div>'+
-  '<div class="form-row"><div><label>Тип</label><select id="fu_type"><option>Чертёж</option><option>3D Модель</option><option>УП (NC)</option><option>Фото</option><option>Спецификация</option><option>Прочее</option></select></div>'+
-    '<div><label>Описание</label><input id="fu_desc"></div></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="doUpload('+oid+')">Загрузить</button></div>')}
-function doUpload(oid){var f=document.getElementById('fu_file').files[0];if(!f){toast('Файл','err');return}
-  var fd=new FormData();fd.append('file',f);fd.append('file_type',document.getElementById('fu_type').value);fd.append('description',document.getElementById('fu_desc').value);fd.append('user_id',U.id);
-  apiUpload('/api/orders/'+oid+'/upload',fd).then(function(){closeModal();toast('Загружено','ok');modalOrderDetail(oid)}).catch(function(e){toast(e.message,'err')})}
+function modalUpload(oid){openModal('<h2>📎 Загрузка файлов</h2>'+
+  '<div class="form-row full"><div><label>Файлы <span style="color:var(--text3);font-size:.85em">(можно выбрать несколько)</span></label>'+
+  '<input type="file" id="fu_file" multiple style="padding:8px"></div></div>'+
+  '<div id="fu_preview" style="margin-bottom:8px"></div>'+
+  '<div class="form-row"><div><label>Тип (для всех)</label><select id="fu_type"><option>Чертёж</option><option>3D Модель</option><option>УП (NC)</option><option>Фото</option><option>Спецификация</option><option>Прочее</option></select></div>'+
+    '<div><label>Описание (для всех)</label><input id="fu_desc"></div></div>'+
+  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" id="fu_btn" onclick="doUpload('+oid+')">Загрузить</button></div>')}
+document.addEventListener("change",function(e){if(e.target&&e.target.id==="fu_file"){
+  var files=e.target.files;var pr=document.getElementById("fu_preview");if(!pr)return;
+  if(!files.length){pr.innerHTML="";return;}
+  pr.innerHTML='<div style="font-size:.8em;color:var(--text3);padding:4px 0">Выбрано '+files.length+' файл(ов):<br>'+
+    Array.from(files).map(function(f){return "• "+f.name+" ("+Math.round(f.size/1024)+" КБ)"}).join("<br>")+"</div>"}});
+function doUpload(oid){var files=document.getElementById("fu_file").files;if(!files.length){toast("Выберите файлы","err");return}
+  var ftype=document.getElementById("fu_type").value;var fdesc=document.getElementById("fu_desc").value;
+  var btn=document.getElementById("fu_btn");if(btn)btn.disabled=true;
+  var arr=Array.from(files);var done=0;var errors=0;
+  function uploadNext(i){if(i>=arr.length){
+    if(btn)btn.disabled=false;closeModal();
+    toast("Загружено: "+done+(errors?" (ошибок: "+errors+")":""),"ok");
+    modalOrderDetail(oid);return;}
+  var fd=new FormData();fd.append("file",arr[i]);fd.append("file_type",ftype);fd.append("description",fdesc);fd.append("user_id",U.id);
+  if(btn)btn.textContent="Загрузка "+(i+1)+"/"+arr.length+"...";
+  apiUpload("/api/orders/"+oid+"/upload",fd).then(function(){done++;uploadNext(i+1)}).catch(function(e){errors++;toast(arr[i].name+": "+e.message,"err");uploadNext(i+1)})}
+  uploadNext(0)}
 function delFile(fid,oid){if(!confirm('Удалить?'))return;api('/api/files/delete','POST',{id:fid}).then(function(){modalOrderDetail(oid)})}
 
 function modalReports(){api('/api/customers').then(function(custs){
@@ -4793,15 +4810,30 @@ function savePT(pid){
     refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function delPT(pid){if(!confirm('Удалить?'))return;api('/api/part-templates/delete','POST',{id:pid}).then(function(){refreshPage()})}
 
-function modalPTUpload(ptid){openModal('<h2>📎 Файл детали</h2>'+
-  '<div class="form-row full"><div><label>Файл</label><input type="file" id="fpu_file" style="padding:8px"></div></div>'+
-  '<div class="form-row"><div><label>Тип</label><select id="fpu_type"><option>Чертёж</option><option>3D Модель</option><option>Развёртка</option><option>Фото</option><option>Прочее</option></select></div>'+
-    '<div><label>Описание</label><input id="fpu_desc"></div></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="doPTUpload('+ptid+')">Загрузить</button></div>')}
-function doPTUpload(ptid){var f=document.getElementById('fpu_file').files[0];if(!f){toast('Файл','err');return}
-  var fd=new FormData();fd.append('file',f);fd.append('file_type',document.getElementById('fpu_type').value);
-  fd.append('description',document.getElementById('fpu_desc').value);fd.append('user_id',U.id);
-  apiUpload('/api/part-templates/'+ptid+'/upload',fd).then(function(){closeModal();toast('Загружено','ok');modalPartTpl(ptid)}).catch(function(e){toast(e.message,'err')})}
+function modalPTUpload(ptid){openModal('<h2>📎 Файлы детали</h2>'+
+  '<div class="form-row full"><div><label>Файлы <span style="color:var(--text3);font-size:.85em">(можно выбрать несколько)</span></label>'+
+  '<input type="file" id="fpu_file" multiple style="padding:8px"></div></div>'+
+  '<div id="fpu_preview" style="margin-bottom:8px"></div>'+
+  '<div class="form-row"><div><label>Тип (для всех)</label><select id="fpu_type"><option>Чертёж</option><option>3D Модель</option><option>Развёртка</option><option>Фото</option><option>Прочее</option></select></div>'+
+    '<div><label>Описание (для всех)</label><input id="fpu_desc"></div></div>'+
+  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" id="fpu_btn" onclick="doPTUpload('+ptid+')">Загрузить</button></div>')}
+document.addEventListener("change",function(e){if(e.target&&e.target.id==="fpu_file"){
+  var files=e.target.files;var pr=document.getElementById("fpu_preview");if(!pr)return;
+  if(!files.length){pr.innerHTML="";return;}
+  pr.innerHTML='<div style="font-size:.8em;color:var(--text3);padding:4px 0">Выбрано '+files.length+' файл(ов):<br>'+
+    Array.from(files).map(function(f){return "• "+f.name+" ("+Math.round(f.size/1024)+" КБ)"}).join("<br>")+"</div>"}});
+function doPTUpload(ptid){var files=document.getElementById("fpu_file").files;if(!files.length){toast("Выберите файлы","err");return}
+  var ftype=document.getElementById("fpu_type").value;var fdesc=document.getElementById("fpu_desc").value;
+  var btn=document.getElementById("fpu_btn");if(btn)btn.disabled=true;
+  var arr=Array.from(files);var done=0;var errors=0;
+  function uploadNext(i){if(i>=arr.length){
+    if(btn)btn.disabled=false;closeModal();
+    toast("Загружено: "+done+(errors?" (ошибок: "+errors+")":""),"ok");
+    modalPartTpl(ptid);return;}
+  var fd=new FormData();fd.append("file",arr[i]);fd.append("file_type",ftype);fd.append("description",fdesc);fd.append("user_id",U.id);
+  if(btn)btn.textContent="Загрузка "+(i+1)+"/"+arr.length+"...";
+  apiUpload("/api/part-templates/"+ptid+"/upload",fd).then(function(){done++;uploadNext(i+1)}).catch(function(e){errors++;toast(arr[i].name+": "+e.message,"err");uploadNext(i+1)})}
+  uploadNext(0)}
 function delPTFile(fid,ptid){if(!confirm('Удалить?'))return;api('/api/part-template-files/delete','POST',{id:fid}).then(function(){modalPartTpl(ptid)})}
 
 // ═══ СКЛАД ═══
