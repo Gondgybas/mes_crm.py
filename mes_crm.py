@@ -3911,8 +3911,9 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .modal .form-row.full{grid-template-columns:1fr}
 .modal .form-row.triple{grid-template-columns:1fr 1fr 1fr}
 .modal label{display:block;font-size:.8em;color:var(--text2);margin-bottom:3px;font-weight:500}
-.modal input,.modal select,.modal textarea{width:100%;padding:8px 10px;border-radius:var(--r);border:1px solid var(--s2);background:var(--bg);color:var(--text);font-size:.9em}
-.modal input:focus,.modal select:focus,.modal textarea:focus{border-color:var(--accent);outline:none}
+.modal input:not([type=checkbox]),.modal select,.modal textarea{width:100%;padding:8px 10px;border-radius:var(--r);border:1px solid var(--s2);background:var(--bg);color:var(--text);font-size:.9em}
+.modal input[type=checkbox]{width:16px;height:16px;padding:0;margin:0;border:1px solid var(--s2);background:var(--bg);accent-color:var(--accent);flex-shrink:0;cursor:pointer}
+.modal input:not([type=checkbox]):focus,.modal select:focus,.modal textarea:focus{border-color:var(--accent);outline:none}
 .modal textarea{resize:vertical;min-height:60px}
 .modal .actions{display:flex;gap:8px;justify-content:flex-end;margin-top:16px;padding-top:12px;border-top:1px solid var(--s2)}
 .section-hdr{font-size:.9em;font-weight:600;color:var(--text2);margin:16px 0 8px;padding-bottom:4px;border-bottom:1px solid var(--s2)}
@@ -5040,7 +5041,7 @@ function adjChg(val){if(!window._adjMats)return;var m=window._adjMats.find(funct
     h='<div class="form-row"><div><label>Текущее: '+m.qty_sheets+'л / '+fmtN(m.qty_kg)+'кг</label></div></div>'+
     '<div class="form-row"><div><label>Новое кол-во (листов)</label><input type="number" id="fa_sheets" value="'+m.qty_sheets+'" oninput="adjCalcKg()"></div>'+
     '<div><label>Новое кол-во (кг) '+swHint+'</label><input type="number" id="fa_kg" step="0.01" value="'+m.qty_kg+'"></div></div>';
-    if(m.sheet_weight>0){h+='<div class="form-row"><div><label><input type="checkbox" id="fa_auto_kg" checked onchange="adjCalcKg()"> Авто-расчёт кг по весу листа ('+m.sheet_weight+' кг/л)</label></div></div>'}
+    if(m.sheet_weight>0){h+='<div class="form-row full"><div><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.85em;color:var(--text2)"><input type="checkbox" id="fa_auto_kg" checked onchange="adjCalcKg()"> Авто-расчёт кг по весу листа ('+m.sheet_weight+' кг/л)</label></div></div>'}
   }
   else if(m.type==='Краска'||m.type==='Труба'||m.type==='Пруток')h='<div class="form-row"><div><label>Текущее: '+fmtN(m.qty_kg)+' кг</label></div></div>'+
     '<div class="form-row"><div><label>Новое (кг)</label><input type="number" id="fa_kg" step="0.01" value="'+m.qty_kg+'"></div><div></div></div>';
@@ -5686,7 +5687,7 @@ function resItemChg2(){var sel=document.getElementById('fres_item');var opt=sel.
   var mats=[];try{mats=JSON.parse(opt.dataset.mats||'[]')}catch(e){}
   document.getElementById('fres_mat').innerHTML=mats.map(function(m){return '<option value="'+m.material_id+'">'+m.name+' ('+m.sheets_needed+'л)</option>'}).join('')||'<option value="">Нет</option>'}
 function submitCreateRes(){var ordId=+ssVal('fres_ord');var itemSel=document.getElementById('fres_item');
-  var tid=+(itemSel.options[itemSel.selectedIndex]||{}).dataset?.tid||null;var matId=+document.getElementById('fres_mat').value;
+  var _selOpt=itemSel.options[itemSel.selectedIndex];var tid=(_selOpt&&_selOpt.dataset&&_selOpt.dataset.tid)?+_selOpt.dataset.tid||null:null;var matId=+document.getElementById('fres_mat').value;
   if(!ordId||!matId){toast('Заполните','err');return}
   api('/api/reservations/create','POST',{user_id:U.id,order_id:ordId,order_item_id:+itemSel.value||null,
     part_template_id:tid,material_id:matId,sheets:+document.getElementById('fres_sh').value,note:document.getElementById('fres_note').value}).then(function(){
@@ -6760,7 +6761,7 @@ function execClearTestData(){
     setTimeout(function(){refreshPage()},1200);
   }).catch(function(e){toast(e.message,'err')});}
 
-var _TRANSLIT='A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'Yo','Ж':'Zh','З':'Z','И':'I','Й':'J','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya','а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'};
+var _TRANSLIT={'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'Yo','Ж':'Zh','З':'Z','И':'I','Й':'J','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya','а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'};
 function _translit(s){return s.split('').map(function(c){return _TRANSLIT[c]!==undefined?_TRANSLIT[c]:c}).join('');}
 function genLoginPwd(){
   var fn=document.getElementById('fu_n').value.trim();
