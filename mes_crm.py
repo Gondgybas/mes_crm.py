@@ -4036,7 +4036,6 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .pm-plan-col,.pm-done-col{min-width:48px;text-align:center;white-space:nowrap}
 .pm-op-col{min-width:95px;text-align:center;white-space:nowrap;font-size:.78em}
 .pm-asm-row td{background:rgba(59,130,246,.07)!important;font-weight:600}
-.pm-asm-row.has-surplus td{background:rgba(239,68,68,.09)!important}
 .pm-comp-row td{background:var(--s1)}
 .pm-comp-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
 .pm-comp-name{padding-left:22px!important;color:var(--text2);font-size:.85em}
