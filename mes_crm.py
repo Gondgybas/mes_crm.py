@@ -167,6 +167,20 @@ class Customer(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=now_msk)
     orders = relationship("Order", back_populates="customer")
+    contacts = relationship("CustomerContact", back_populates="customer",
+                            order_by="CustomerContact.sort_order", cascade="all, delete-orphan")
+
+
+class CustomerContact(Base):
+    __tablename__ = "customer_contacts"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    customer_id = Column(Integer, ForeignKey("customers.id"), nullable=False)
+    name = Column(String(200), default="")
+    position = Column(String(200), default="")
+    phone = Column(String(50), default="")
+    email = Column(String(200), default="")
+    sort_order = Column(Integer, default=0)
+    customer = relationship("Customer", back_populates="contacts")
 
 
 class MetalGrade(Base):
@@ -1032,6 +1046,12 @@ def init_database():
                          contact_person="Сидоров В.П.", phone="+7-999-444-5566"),
             ])
             db.flush()
+        # Миграция старых контактных полей customers → customer_contacts
+        for cu in db.query(Customer).all():
+            if not cu.contacts and (cu.contact_person or cu.phone or cu.email):
+                db.add(CustomerContact(customer_id=cu.id, name=cu.contact_person or "",
+                                       phone=cu.phone or "", email=cu.email or "", sort_order=0))
+        db.flush()
     log.info("Database initialized")
 
 
@@ -1610,14 +1630,17 @@ def create_app():
 
     @app.get("/api/customers")
     def api_customers(search: str = "", db: Session = Depends(db_dep)):
-        q = db.query(Customer)
+        from sqlalchemy.orm import joinedload as jl
+        q = db.query(Customer).options(jl(Customer.contacts))
         if search:
             sq = f"%{search}%"
             q = q.filter((Customer.name.ilike(sq)) | (Customer.short_name.ilike(sq)) | (Customer.inn.ilike(sq)))
         return [{"id": c.id, "name": c.name, "short_name": c.short_name,
                  "inn": c.inn, "contact_person": c.contact_person,
                  "phone": c.phone, "email": c.email, "address": c.address,
-                 "notes": c.notes, "is_active": c.is_active}
+                 "notes": c.notes, "is_active": c.is_active,
+                 "contacts": [{"id": cc.id, "name": cc.name, "position": cc.position,
+                                "phone": cc.phone, "email": cc.email} for cc in c.contacts]}
                 for c in q.order_by(Customer.name).all()]
 
     @app.post("/api/customers/save")
@@ -1628,6 +1651,20 @@ def create_app():
         else: c = Customer(); db.add(c)
         for k in ["name", "short_name", "inn", "contact_person", "phone", "email", "address", "notes"]:
             if k in data: setattr(c, k, data[k])
+        db.flush()
+        # Сохраняем контакты если переданы
+        if "contacts" in data:
+            db.query(CustomerContact).filter(CustomerContact.customer_id == c.id).delete()
+            for i, ct in enumerate(data["contacts"]):
+                db.add(CustomerContact(customer_id=c.id, name=ct.get("name", ""),
+                                       position=ct.get("position", ""), phone=ct.get("phone", ""),
+                                       email=ct.get("email", ""), sort_order=i))
+            # Обновляем legacy-поля из первого контакта (для обратной совместимости)
+            if data["contacts"]:
+                first = data["contacts"][0]
+                c.contact_person = first.get("name", "")
+                c.phone = first.get("phone", "")
+                c.email = first.get("email", "")
         db.flush(); db.commit()
         return {"id": c.id}
 
@@ -5255,6 +5292,7 @@ function pgOperations(c){
 
   typeOrder.forEach(function(tname){
     var data=byType[tname];
+    data.ops.sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;return aD-bD;});
     var totalMin=data.ops.reduce(function(s,o){return s+o.estimated_min},0);
     var noRes=data.ops.filter(function(o){return !o.resource_id}).length;
     html+='<div class="section-hdr">'+
@@ -5282,7 +5320,7 @@ function pgOperations(c){
           var over2=o.estimated_min&&elapsedMin>o.estimated_min;
           actualCell='<span style="font-size:.82em;color:'+(over2?'var(--err)':'var(--info)')+'">'+fmtMinToH(elapsedMin)+(o.status==='В работе'?' 🔄':'')+(over2?' ⚠':'')+'</span>';
         }
-        return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)">'+
+        return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)"'+(o.status==='Завершена'?' style="opacity:.55"':'')+'>'+
           '<td style="cursor:grab">☰</td>'+
           '<td style="font-size:.85em">'+(o.order_display||o.order_number)+'</td>'+
           '<td>'+(o.component_name
@@ -6522,9 +6560,7 @@ function pgCustomers(c){api('/api/customers').then(function(custs){
     tblFTh('Название','cust','name')+
     tblFTh('Сокр.','cust','short_name')+
     tblFTh('ИНН','cust','inn')+
-    tblFTh('Контакт','cust','contact')+
-    tblFTh('Тел.','cust','phone')+
-    tblFTh('Email','cust','email')+
+    '<th>Контакты</th>'+
     '<th></th>'+
   '</tr></thead><tbody id="custTbody"></tbody></table></div>';
   _custRenderTable();})}
@@ -6533,23 +6569,87 @@ function _custRenderTable(){
   var items=tblGetFiltered('cust');
   var tbody=document.getElementById('custTbody');if(!tbody)return;
   var cnt=document.getElementById('cust_count');if(cnt)cnt.innerHTML='Показано: <strong>'+items.length+'</strong>';
-  tbody.innerHTML=items.map(function(cu){return '<tr>'+
-    '<td><strong>'+cu.name+'</strong></td><td>'+(cu.short_name||'—')+'</td><td>'+(cu.inn||'—')+'</td>'+
-    '<td>'+(cu.contact_person||'—')+'</td><td>'+(cu.phone||'—')+'</td><td>'+(cu.email||'—')+'</td>'+
-    '<td>'+(hasPerm('cust.edit')?'<button class="btn sm" onclick="modalCust('+cu.id+')">✏</button>':'')+'</td></tr>';
+  tbody.innerHTML=items.map(function(cu){
+    var contacts=cu.contacts&&cu.contacts.length?cu.contacts:
+      (cu.contact_person?[{name:cu.contact_person,phone:cu.phone||'',email:cu.email||''}]:[]);
+    var contactCell=contacts.map(function(c){
+      var parts=[c.name];if(c.phone)parts.push(c.phone);if(c.email)parts.push(c.email);
+      return parts.join(' / ');}).join('<br>');
+    return '<tr>'+
+      '<td><strong>'+cu.name+'</strong></td><td>'+(cu.short_name||'—')+'</td><td>'+(cu.inn||'—')+'</td>'+
+      '<td style="font-size:.82em">'+(contactCell||'—')+'</td>'+
+      '<td>'+(hasPerm('cust.edit')?'<button class="btn sm" onclick="modalCust('+cu.id+')">✏</button>':'')+'</td></tr>';
   }).join('');
   tblUpdateBtns('cust');}
 function modalCust(cid){var p1=cid?api('/api/customers'):Promise.resolve(null);p1.then(function(cs){var cu=cs?cs.find(function(x){return x.id===cid}):null;
+  // Инициализируем список контактов: из нового поля contacts или из legacy-полей
+  window._custContacts=[];
+  if(cu&&cu.contacts&&cu.contacts.length){
+    window._custContacts=cu.contacts.map(function(c){return{name:c.name||'',position:c.position||'',phone:c.phone||'',email:c.email||''}});
+  } else if(cu&&(cu.contact_person||cu.phone||cu.email)){
+    window._custContacts=[{name:cu.contact_person||'',position:'',phone:cu.phone||'',email:cu.email||''}];
+  }
   openModal('<h2>'+(cu?'✏':'+')+' Клиент</h2>'+
-  '<div class="form-row"><div><label>Название</label><input id="fcu_name" value="'+(cu?cu.name:'')+'"></div><div><label>Сокр.</label><input id="fcu_short" value="'+(cu?cu.short_name:'')+'"></div></div>'+
-  '<div class="form-row"><div><label>ИНН</label><input id="fcu_inn" value="'+(cu?cu.inn:'')+'"></div><div><label>Контакт</label><input id="fcu_cp" value="'+(cu?cu.contact_person:'')+'"></div></div>'+
-  '<div class="form-row"><div><label>Тел.</label><input id="fcu_ph" value="'+(cu?cu.phone:'')+'"></div><div><label>Email</label><input id="fcu_em" value="'+(cu?cu.email:'')+'"></div></div>'+
-  '<div class="form-row full"><div><label>Адрес</label><textarea id="fcu_addr" rows="2">'+(cu?cu.address||'':'')+'</textarea></div></div>'+
-  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveCust('+(cid||0)+')">Сохранить</button></div>')})}
-function saveCust(cid){var b={name:document.getElementById('fcu_name').value,short_name:document.getElementById('fcu_short').value,
-  inn:document.getElementById('fcu_inn').value,contact_person:document.getElementById('fcu_cp').value,
-  phone:document.getElementById('fcu_ph').value,email:document.getElementById('fcu_em').value,address:document.getElementById('fcu_addr').value};
-  if(cid)b.id=cid;api('/api/customers/save','POST',b).then(function(){closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+  '<div class="form-row"><div><label>Название</label><input id="fcu_name" value="'+(cu?escH(cu.name):'')+'"></div>'+
+  '<div><label>Сокр.</label><input id="fcu_short" value="'+(cu?escH(cu.short_name||''):'')+'"></div></div>'+
+  '<div class="form-row"><div><label>ИНН</label><input id="fcu_inn" value="'+(cu?escH(cu.inn||''):'')+'"></div>'+
+  '<div><label>Адрес</label><input id="fcu_addr" value="'+(cu?escH(cu.address||''):'')+'"></div></div>'+
+  '<div class="form-row full"><div><label>Примечания</label><textarea id="fcu_notes" rows="2">'+(cu?escH(cu.notes||''):'')+'</textarea></div></div>'+
+  '<div class="section-hdr" style="display:flex;align-items:center;justify-content:space-between">'+
+    '<span>👤 Контакты</span>'+
+    '<button class="btn sm primary" onclick="custAddContact()">+ Добавить</button>'+
+  '</div>'+
+  '<div id="fcu_contacts_wrap"></div>'+
+  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+  '<button class="btn primary" onclick="saveCust('+(cid||0)+')">Сохранить</button></div>');
+  _renderCustContacts();})}
+
+function escH(s){return String(s||'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+
+function _renderCustContacts(){
+  var wrap=document.getElementById('fcu_contacts_wrap');if(!wrap)return;
+  var c=window._custContacts||[];
+  if(!c.length){
+    wrap.innerHTML='<div style="font-size:.85em;color:var(--text3);padding:6px 0 10px">Контакты не добавлены</div>';return;
+  }
+  wrap.innerHTML=c.map(function(ct,i){
+    return '<div class="cf-row" style="gap:6px;flex-wrap:wrap;align-items:flex-end;margin-bottom:6px">'+
+      '<div style="flex:2;min-width:130px"><label style="font-size:.75em;margin-bottom:2px">ФИО / Имя</label>'+
+        '<input value="'+escH(ct.name)+'" oninput="window._custContacts['+i+'].name=this.value"></div>'+
+      '<div style="flex:1.5;min-width:110px"><label style="font-size:.75em;margin-bottom:2px">Должность</label>'+
+        '<input value="'+escH(ct.position)+'" oninput="window._custContacts['+i+'].position=this.value"></div>'+
+      '<div style="flex:1.5;min-width:110px"><label style="font-size:.75em;margin-bottom:2px">Телефон</label>'+
+        '<input value="'+escH(ct.phone)+'" oninput="window._custContacts['+i+'].phone=this.value"></div>'+
+      '<div style="flex:2;min-width:140px"><label style="font-size:.75em;margin-bottom:2px">Email</label>'+
+        '<input value="'+escH(ct.email)+'" oninput="window._custContacts['+i+'].email=this.value"></div>'+
+      '<button class="btn sm" style="color:var(--err);padding:6px 10px;flex-shrink:0;align-self:flex-end" '+
+        'onclick="custDelContact('+i+')" title="Удалить контакт">🗑</button>'+
+    '</div>';
+  }).join('');
+}
+function custAddContact(){
+  if(!window._custContacts)window._custContacts=[];
+  window._custContacts.push({name:'',position:'',phone:'',email:''});
+  _renderCustContacts();
+  // Фокус на первое поле нового контакта
+  var wrap=document.getElementById('fcu_contacts_wrap');
+  if(wrap){var ins=wrap.querySelectorAll('input');if(ins.length)ins[ins.length-4].focus();}
+}
+function custDelContact(i){
+  if(!window._custContacts)return;
+  window._custContacts.splice(i,1);
+  _renderCustContacts();
+}
+function saveCust(cid){
+  var contacts=(window._custContacts||[]).filter(function(c){return c.name||c.phone||c.email;});
+  var b={name:document.getElementById('fcu_name').value,
+    short_name:document.getElementById('fcu_short').value,
+    inn:document.getElementById('fcu_inn').value,
+    address:document.getElementById('fcu_addr').value,
+    notes:document.getElementById('fcu_notes').value||'',
+    contacts:contacts};
+  if(cid)b.id=cid;
+  api('/api/customers/save','POST',b).then(function(){closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ СТАНКИ ═══
 var _resrcItems=[],_resrcFilters={};
