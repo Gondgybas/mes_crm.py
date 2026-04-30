@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """MetalWorks MES v5.6"""
 
 import argparse, datetime, hashlib, json, logging, mimetypes
@@ -2334,10 +2334,35 @@ def create_app():
         return {"status": "ok"}
 
     @app.get("/api/reservations/by-item/{item_id}")
-    def api_res_by_item(item_id: int, db: Session = Depends(db_dep)):
-        rs = db.query(Reservation).options(
+    def api_res_by_item(item_id: int, part_template_id: int | None = None,
+                        db: Session = Depends(db_dep)):
+        # Берём ВСЕ резервы по позиции (включая закрытые).
+        # Если задан part_template_id — фильтруем СТРОГО по нему (важно для компонентных
+        # операций: разные детали одной сборки могут использовать один материал, и
+        # дедупликация по material_id скрывала бы «не свой» резерв).
+        # Дедупликация — по паре (material_id, part_template_id):
+        # приоритет — активный; если активного нет — самый свежий закрытый.
+        q = db.query(Reservation).options(
             joinedload(Reservation.material), joinedload(Reservation.part_template)
-        ).filter(Reservation.order_item_id == item_id, Reservation.is_active == True).all()
+        ).filter(Reservation.order_item_id == item_id)
+        if part_template_id is not None:
+            # Резервы могут не иметь part_template_id (старые/ручные) — fallback на позицию.
+            item_pt_id = None
+            it = db.query(OrderItem).get(item_id)
+            if it: item_pt_id = it.part_template_id
+            if part_template_id == item_pt_id:
+                # Операция уровня сборки: резервы либо без part_template_id, либо равные сборочному
+                q = q.filter((Reservation.part_template_id == part_template_id) |
+                             (Reservation.part_template_id.is_(None)))
+            else:
+                q = q.filter(Reservation.part_template_id == part_template_id)
+        all_rs = q.order_by(Reservation.is_active.desc(), Reservation.id.desc()).all()
+        seen = set(); rs = []
+        for r in all_rs:
+            key = (r.material_id, r.part_template_id)
+            if key in seen: continue
+            seen.add(key)
+            rs.append(r)
         # Fallback: if reservation has no part_template_id, use order_item's template
         item = db.query(OrderItem).get(item_id)
         fallback_pt_id = item.part_template_id if item else None
@@ -2351,6 +2376,7 @@ def create_app():
                 "id": r.id, "material_id": r.material_id,
                 "material": r.material.name if r.material else "",
                 "sheets": r.quantity_sheets, "kg": r.quantity_kg,
+                "is_active": bool(r.is_active),
                 "part_template_id": r.part_template_id,
                 "part_name": pt_display(r.part_template) if r.part_template else "—",
                 "parts_per_sheets": ptm.parts_per_sheets if ptm else None,
@@ -2729,6 +2755,7 @@ def create_app():
             joinedload(OpSession.user),
             joinedload(OpSession.op).joinedload(ProductionOp.order).joinedload(Order.customer),
             joinedload(OpSession.op).joinedload(ProductionOp.order_item).joinedload(OrderItem.part_template),
+            joinedload(OpSession.op).joinedload(ProductionOp.component_template),
             joinedload(OpSession.op).joinedload(ProductionOp.resource))
         if date_from:
             try:
@@ -2742,22 +2769,26 @@ def create_app():
             except Exception: pass
         sessions = q.order_by(OpSession.started_at.desc()).limit(5000).all()
 
-        # Загружаем станки из списаний единым запросом — группируем по (op_id, user_id)
+        # Загружаем станки + объёмы списаний единым запросом — группируем по (op_id, user_id)
         op_ids = list({s.op_id for s in sessions if s.op_id})
         wo_resources: dict = {}  # (op_id, user_id) -> list[str]
+        wo_by_op_user: dict = {}  # (op_id, user_id) -> list[(created_at, parts_good, parts_rejected)]
         if op_ids:
             wos = db.query(WriteOff).options(joinedload(WriteOff.resource)).filter(
                 WriteOff.production_op_id.in_(op_ids),
                 WriteOff.is_cancelled == False,
-                WriteOff.resource_id.isnot(None)
             ).all()
             for w in wos:
                 key = (w.production_op_id, w.user_id)
-                if key not in wo_resources:
-                    wo_resources[key] = []
-                rname = w.resource.name if w.resource else None
-                if rname and rname not in wo_resources[key]:
-                    wo_resources[key].append(rname)
+                if w.resource_id is not None:
+                    if key not in wo_resources:
+                        wo_resources[key] = []
+                    rname = w.resource.name if w.resource else None
+                    if rname and rname not in wo_resources[key]:
+                        wo_resources[key].append(rname)
+                if key not in wo_by_op_user:
+                    wo_by_op_user[key] = []
+                wo_by_op_user[key].append((w.created_at, w.parts_good or 0, w.parts_rejected or 0))
 
         result = []
         n = now_msk()
@@ -2778,14 +2809,36 @@ def create_app():
             # Станок: берём из списаний; если нет — из назначенного на операцию
             wo_res_list = wo_resources.get((op.id, s.user_id), [])
             resource_str = ", ".join(wo_res_list) if wo_res_list else (op.resource.name if op.resource else "—")
+            # Кол-во: списано данным пользователем за временное окно этой сессии
+            sess_start = s.started_at
+            sess_end = s.ended_at or n
+            session_qty = 0
+            session_rej = 0
+            for (wcr, wgood, wrej) in wo_by_op_user.get((op.id, s.user_id), []):
+                if wcr is None: continue
+                if sess_start and wcr < sess_start: continue
+                if sess_end and wcr > sess_end: continue
+                session_qty += wgood
+                session_rej += wrej
+            # Деталь: если операция относится к компоненту сборки — показываем компонент,
+            # с указанием родительской сборки. Иначе — деталь/сборку из позиции заказа.
+            asm_name = pt_display(op.order_item.part_template) if op.order_item and op.order_item.part_template else ""
+            if op.component_template_id and op.component_template is not None:
+                part_label = pt_display(op.component_template)
+                if asm_name and asm_name != part_label:
+                    part_label = f"{part_label} ← {asm_name}"
+            else:
+                part_label = asm_name
             result.append({
                 "session_id": s.id,
                 "order": (op.order.order_number + (" — " + op.order.description[:50] if op.order.description else "")) if op.order else "",
                 "customer": op.order.customer.short_name or op.order.customer.name if (op.order and op.order.customer) else "",
                 "order_status": op.order.status if op.order else "",
                 "operator": s.user.full_name if s.user else "",
-                "part": pt_display(op.order_item.part_template) if op.order_item and op.order_item.part_template else "",
-                "qty": op.planned_qty or 0,
+                "part": part_label,
+                "qty": session_qty,
+                "qty_rejected": session_rej,
+                "qty_planned": op.planned_qty or 0,
                 "operation": op.operation_type,
                 "resource": resource_str,
                 "estimated_min": op.estimated_minutes or 0,
@@ -3223,18 +3276,39 @@ def create_app():
             wo.material_id = mat.id; wo.reservation_id = res_id
             sh = int(data.get("sheets", 0)); kg = float(data.get("kg", 0))
             if sh > 0:
-                # Проверка лимита по резерву
-                if reservation and reservation.is_active and sh > reservation.quantity_sheets:
-                    raise HTTPException(400, f"Превышает остаток резерва ({reservation.quantity_sheets} л). Нельзя списать больше зарезервированного.")
+                # Резерв обязателен — даже если он закрыт/исчерпан, его можно расширить.
+                if not reservation:
+                    raise HTTPException(400, "Не указан резерв. Создайте резерв материала на этот заказ — сверхнормативные списания возможны только при наличии резерва.")
+                cur_res_sh = reservation.quantity_sheets or 0
+                # Перерасход: списываем больше, чем осталось в резерве — расширяем резерв
+                delta_sh = max(0, sh - cur_res_sh)
+                delta_kg = 0
+                if delta_sh > 0:
+                    delta_kg = round(delta_sh * (mat.sheet_weight_kg or 0), 2)
+                    # Перерасход разрешён даже при недостатке свободного остатка —
+                    # склад может уйти в минус; это фиксируется флагом is_anomaly.
+                    # Расширяем резерв на дельту (реактивируем, если был закрыт)
+                    reservation.quantity_sheets = cur_res_sh + delta_sh
+                    reservation.quantity_kg = (reservation.quantity_kg or 0) + delta_kg
+                    if not reservation.is_active:
+                        reservation.is_active = True
+                    mat.reserved_sheets = (mat.reserved_sheets or 0) + delta_sh
+                    mat.reserved_kg = (mat.reserved_kg or 0) + delta_kg
                 sub_kg = round(sh * (mat.sheet_weight_kg or 0), 2)
                 mat.quantity_sheets -= sh; mat.quantity_kg -= sub_kg
                 wo.quantity_sheets = sh; wo.quantity_kg = sub_kg
-                if reservation and reservation.is_active:
-                    reservation.quantity_sheets = max(0, reservation.quantity_sheets - sh)
-                    reservation.quantity_kg = max(0, reservation.quantity_kg - sub_kg)
-                    mat.reserved_sheets = max(0, mat.reserved_sheets - sh)
-                    mat.reserved_kg = max(0, mat.reserved_kg - sub_kg)
-                    if reservation.quantity_sheets <= 0: reservation.is_active = False
+                # Обычное списание из резерва
+                reservation.quantity_sheets = max(0, reservation.quantity_sheets - sh)
+                reservation.quantity_kg = max(0, reservation.quantity_kg - sub_kg)
+                mat.reserved_sheets = max(0, mat.reserved_sheets - sh)
+                mat.reserved_kg = max(0, mat.reserved_kg - sub_kg)
+                if reservation.quantity_sheets <= 0: reservation.is_active = False
+                # Помечаем перерасход
+                if delta_sh > 0:
+                    wo.is_anomaly = True
+                    wo.anomaly_note = f"Перерасход +{delta_sh}л (+{delta_kg}кг). Резерв расширен автоматически."
+                    audit(db, uid, "Перерасход материала", "writeoff", 0,
+                          f"{mat.name}: резерв #{reservation.id} расширен на +{delta_sh}л (+{delta_kg}кг)")
                 db.add(MaterialMovement(material_id=mat.id, movement_type="Списание",
                                         quantity_sheets=sh, quantity_kg=sub_kg,
                                         order_id=data.get("order_id"), user_id=uid,
@@ -5299,6 +5373,14 @@ function pgOperations(c){
     if(!byType[tn]){byType[tn]={ops:[]};typeOrder.push(tn);}
     byType[tn].ops.push(o);
   });
+  // Сортируем секции по sort_order участка (OperationTypeCfg)
+  typeOrder.sort(function(a,b){
+    var oa=window._opTypesData[a],ob=window._opTypesData[b];
+    var sa=oa&&oa.sort_order!=null?oa.sort_order:1e9;
+    var sb=ob&&ob.sort_order!=null?ob.sort_order:1e9;
+    if(sa!==sb)return sa-sb;
+    return a.localeCompare(b);
+  });
 
   var resOpts=[{v:'0',t:'Все участки'}].concat(resources.map(function(r){return{v:String(r.id),t:r.name}}));
   var typeOpts=[{v:'',t:'Все типы'}].concat(opTypes.filter(function(o){return o.is_active}).map(function(o){return{v:o.name,t:o.name}}));
@@ -5511,28 +5593,20 @@ function modalOpWriteoff(opid){
   var showMat=mode.indexOf('Материал')>=0&&U.writeoff_types.indexOf('Материал')>=0;
   var showParts=mode.indexOf('Детали')>=0&&U.writeoff_types.indexOf('Детали')>=0;
   if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
-  var p=showMat&&op.item_id?api('/api/reservations/by-item/'+op.item_id):Promise.resolve([]);
+  // Формируем URL: для компонентной операции — запрашиваем резервы строго этого компонента,
+  // для обычной детали — все резервы позиции (по умолчанию).
+  var resUrl='';
+  if(showMat&&op.item_id){
+    resUrl='/api/reservations/by-item/'+op.item_id;
+    if(op.component_template_id) resUrl+='?part_template_id='+op.component_template_id;
+  }
+  var p=resUrl?api(resUrl):Promise.resolve([]);
   // Если станок не назначен — подгружаем только совместимые со станком типы
   var pRes=!op.resource_id?api('/api/resources/for-operation/'+encodeURIComponent(op.type)):Promise.resolve(null);
   Promise.all([p,pRes]).then(function(arr){
     var reservations=arr[0];var compatResources=arr[1];
-    // Автоматически определяем нужный компонент из операции — без выбора
-    var autoCompKey=op.component_template_id?String(op.component_template_id):'0';
-    // Группируем резервы по компоненту
-    var byComp={};reservations.forEach(function(r){
-      var key=r.part_template_id?String(r.part_template_id):'0';
-      var name=r.part_name||'Общие';
-      if(!byComp[key])byComp[key]={name:name,items:[]};byComp[key].items.push(r)});
-    // Для компонентного операции — фильтруем строго по компоненту.
-    // Для обычной детали (component_template_id=null) — берём ВСЕ резервы позиции,
-    // т.к. резервы хранятся с part_template_id = id детали (не null).
-    var matchedItems;
-    if(op.component_template_id){
-      matchedItems=(byComp[autoCompKey]&&byComp[autoCompKey].items)||
-                   (byComp['0']&&byComp['0'].items)||[];
-    } else {
-      matchedItems=reservations.slice();
-    }
+    // Резервы уже отфильтрованы на бэкенде по нужному компоненту/детали
+    var matchedItems=reservations.slice();
 
     // Блок: выбор участка если не задан в заказе — только совместимые станки
     var resBlockHtml='';
@@ -5562,9 +5636,11 @@ function modalOpWriteoff(opid){
 
     if(showMat&&matchedItems.length){
       var matOpts=matchedItems.map(function(r){
+        var lock=r.is_active===false?'🔒 ':'';
+        var partTag=r.part_name&&r.part_name!=='—'?' · 🔩 '+r.part_name:'';
         return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+
                '" data-pps="'+(r.parts_per_sheets||0)+'" data-shi="'+(r.sheets_input||1)+'">'+
-               r.material+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)</option>';
+               lock+r.material+partTag+' (ост. '+r.sheets+'л / '+fmtN(r.kg)+'кг)'+(r.is_active===false?' — резерв закрыт':'')+'</option>';
       }).join('');
       h+='<div class="section-hdr">📦 Материал</div>'+
         '<div class="form-row" style="align-items:flex-end"><div><label>Тип источника</label>'+
@@ -5669,7 +5745,10 @@ function submitOpWriteoff(opid,showMat,showParts){
       if(matSel&&shVal>0){
         var matOpt=matSel.options[matSel.selectedIndex];
         var maxSh=+(matOpt.dataset.sh||0);
-        if(maxSh>0&&shVal>maxSh){toast('Нельзя списать больше резерва ('+maxSh+' л)','err');return}
+        if(shVal>maxSh){
+          var delta=shVal-maxSh;
+          if(!confirm('⚠ Перерасход +'+delta+' л сверх резерва ('+maxSh+' л).\n\nРезерв будет автоматически расширен на +'+delta+' л за счёт свободного остатка склада.\nЕсли свободного остатка не хватит — списание будет отклонено.\n\nПродолжить?'))return;
+        }
         var payload={writeoff_type:'Материал',user_id:U.id,order_id:op.order_id,
           order_item_id:op.item_id,resource_id:effResId,group_id:gid,
           material_id:+matSel.value,sheets:shVal,note:'['+op.type+'] '+note};
@@ -6365,7 +6444,7 @@ function woFillTable(el){
       :'<span class="badge b-ok" style="font-size:.73em">🔩 Детали</span>';
     var partsW=row.parts;var matW=row.mat;
     var cancelled=isBoth?(partsW.is_cancelled&&matW.is_cancelled):(w.is_cancelled);
-    var anomaly=partsW&&partsW.is_anomaly;
+    var anomaly=(partsW&&partsW.is_anomaly)||(matW&&matW.is_anomaly);
     var partCell=partsW
       ?(partsW.component_name
         ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(partsW.part_name||'—')+'</span><br>🔩 <strong>'+esc(partsW.component_name)+'</strong></div>'
@@ -6373,7 +6452,9 @@ function woFillTable(el){
       :(matW?(matW.component_name
         ?'<div style="font-size:.88em"><span style="color:var(--text3)">🔧 '+esc(matW.part_name||'—')+'</span><br>🔩 <strong>'+esc(matW.component_name)+'</strong></div>'
         :(matW.part_name||'—')):'—');
-    var anomNote=anomaly?'<div style="font-size:.78em;color:var(--err)">⚠ '+esc(partsW.anomaly_note||'')+'</div>':'';
+    var anomNote='';
+    if(partsW&&partsW.is_anomaly)anomNote+='<div style="font-size:.78em;color:var(--err)">⚠ '+esc(partsW.anomaly_note||'')+'</div>';
+    if(matW&&matW.is_anomaly)anomNote+='<div style="font-size:.78em;color:var(--warn)"><span class="badge b-warn" style="font-size:.72em">📦+ Перерасход</span> '+esc(matW.anomaly_note||'')+'</div>';
     var cancelNote=cancelled?'<span class="badge b-err" style="font-size:.73em">↩</span>':'';
     var noteText=w.note?esc(w.note.replace(/^\[[^\]]+\]\s*/,'')):'';
     // Для группы Мат+Дет используем любой ID — бэкенд отменит всю группу по group_id
@@ -6501,9 +6582,11 @@ function woItemChg2(){
   var itemId=+itemSel.value;if(!itemId)return;
   api('/api/reservations/by-item/'+itemId).then(function(rs){
     document.getElementById('fwo_mat').innerHTML=rs.map(function(r){
+      var lock=r.is_active===false?'🔒 ':'';
+      var partTag=r.part_name&&r.part_name!=='—'?' · 🔩 '+r.part_name:'';
       return '<option value="'+r.material_id+'" data-rid="'+r.id+'" data-sh="'+r.sheets+
              '" data-pps="'+(r.parts_per_sheets||0)+'" data-shi="'+(r.sheets_input||1)+'">'+
-             r.material+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
+             lock+r.material+partTag+' ('+r.sheets+'л/'+fmtN(r.kg)+'кг)'+(r.is_active===false?' — резерв закрыт':'')+'</option>'}).join('')||'<option value="">Нет</option>'}).catch(function(e){toast(e.message,'err')})}
 
 function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementById('fwo_item').value;
   if(!ordId){toast('Заказ','err');return}if(!itemId){toast('Деталь','err');return}
@@ -6517,7 +6600,10 @@ function submitWO(){var ordId=+ssVal('fwo_ord');var itemId=+document.getElementB
     // Проверка лимита только для обычного списания
     if(wtype==='Материал'){
       var maxSh=+(matOpt.dataset.sh||0);
-      if(maxSh>0&&shVal>maxSh){toast('Нельзя списать больше резерва ('+maxSh+' л)','err');return}
+      if(shVal>maxSh){
+        var delta=shVal-maxSh;
+        if(!confirm('⚠ Перерасход +'+delta+' л сверх резерва ('+maxSh+' л).\n\nРезерв будет автоматически расширен на +'+delta+' л за счёт свободного остатка склада.\nЕсли свободного остатка не хватит — списание будет отклонено.\n\nПродолжить?'))return;
+      }
     }
     b.material_id=matId;b.sheets=shVal;
     if(wtype==='Материал') b.reservation_id=+(matOpt.dataset.rid)||null;
@@ -6858,7 +6944,10 @@ function _statRender(){
       '<td>'+statusBadge(r.order_status)+'</td>'+
       '<td style="font-size:.84em;font-weight:600">'+esc(r.operator)+'</td>'+
       '<td style="font-size:.82em">'+esc(r.part)+'</td>'+
-      '<td style="text-align:center">'+r.qty+'</td>'+
+      '<td style="text-align:center" title="Списано данным оператором за время сессии (план: '+(r.qty_planned||0)+')">'+
+        '<strong>'+(r.qty||0)+'</strong>'+
+        ((r.qty_rejected||0)>0?' <span style="color:var(--err);font-size:.78em">/ ✗'+r.qty_rejected+'</span>':'')+
+      '</td>'+
       '<td style="font-size:.82em">'+esc(r.operation)+'</td>'+
       '<td style="font-size:.82em">'+esc(r.resource)+'</td>'+
       '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(r.estimated_min)+'</td>'+
