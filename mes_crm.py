@@ -3989,6 +3989,8 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .ss-opt{padding:6px 10px;cursor:pointer;font-size:.85em;border-bottom:1px solid rgba(255,255,255,.03)}
 .ss-opt:hover,.ss-opt.hl{background:var(--accent);color:#fff}
 .ss-opt.selected{background:rgba(239,68,68,.15);font-weight:600}
+.ss-opt.pri{background:rgba(34,197,94,.1);border-left:3px solid var(--ok)}
+.ss-opt.pri:hover,.ss-opt.pri.hl{background:var(--accent);color:#fff;border-left-color:var(--accent)}
 .ss-empty{padding:8px 10px;color:var(--text3);font-size:.85em}
 .stat-card{background:var(--bg);border:1px solid var(--s2);border-radius:var(--r);padding:12px;margin-bottom:8px}
 .stat-card .stat-label{font-size:.75em;color:var(--text3);text-transform:uppercase}
@@ -4268,7 +4270,7 @@ function ssClose(uid){var d=document.getElementById(uid+'_drop');if(d)d.classLis
 function ssFilter(uid,q){var inst=ssInstances[uid];if(!inst)return;var list=document.getElementById(uid+'_list');var ql=q.toLowerCase();
   var f=inst.options.filter(function(o){return o.t.toLowerCase().indexOf(ql)>=0});
   if(!f.length){list.innerHTML='<div class="ss-empty">Ничего не найдено</div>';return}
-  list.innerHTML=f.map(function(o,i){return '<div class="ss-opt '+(String(o.v)===String(inst.selected)?'selected':'')+' '+(i===0?'hl':'')+'" data-v="'+String(o.v).replace(/"/g,'&quot;')+'" onclick="ssPick(\''+uid+'\',\''+String(o.v).replace(/'/g,"\\'")+'\')">'+(o.t||'—')+'</div>'}).join('');}
+  list.innerHTML=f.map(function(o,i){return '<div class="ss-opt '+(String(o.v)===String(inst.selected)?'selected':'')+' '+(i===0?'hl':'')+' '+(o.pri?'pri':'')+'" data-v="'+String(o.v).replace(/"/g,'&quot;')+'" onclick="ssPick(\''+uid+'\',\''+String(o.v).replace(/'/g,"\\'")+'\')">'+(o.t||'—')+'</div>'}).join('');}
 function ssKey(e,uid){var list=document.getElementById(uid+'_list');var opts=Array.from(list.querySelectorAll('.ss-opt'));var hi=opts.findIndex(function(o){return o.classList.contains('hl')});
   if(e.key==='ArrowDown'){e.preventDefault();if(hi<opts.length-1){opts.forEach(function(o){o.classList.remove('hl')});opts[hi+1].classList.add('hl');opts[hi+1].scrollIntoView({block:'nearest'})}}
   else if(e.key==='ArrowUp'){e.preventDefault();if(hi>0){opts.forEach(function(o){o.classList.remove('hl')});opts[hi-1].classList.add('hl');opts[hi-1].scrollIntoView({block:'nearest'})}}
@@ -4742,7 +4744,7 @@ function modalPartTpl(pid){
   var h='<h2>'+(p?'✏':'+')+' Деталь</h2>'+
   '<div class="form-row"><div><label>Наименование</label><input id="fp_name" value="'+(p?p.name:'')+'"></div>'+
     '<div><label>Чертёжный номер</label><input id="fp_num" value="'+(p?p.part_number:'')+'"></div></div>'+
-  '<div class="form-row"><div><label>Заказчик</label>'+SS('fp_cust',custOpts,p?String(p.customer_id||''):'','Заказчик')+'</div><div></div></div>'+
+  '<div class="form-row"><div><label>Заказчик</label>'+SS('fp_cust',custOpts,p?String(p.customer_id||''):'','Заказчик',function(){renderPTComps()})+'</div><div></div></div>'+
 '<div style="margin-bottom:12px;padding:8px;background:var(--bg);border:1px solid var(--s2);border-radius:var(--r)"><label style="display:flex;align-items:center;gap:8px;cursor:pointer;font-size:.9em"><input type="checkbox" id="fp_is_asm" '+(p&&p.is_assembly?'checked':'')+' onchange="toggleAsmUI()" style="width:18px;height:18px;accent-color:var(--accent)"> Это сборка (состоит из нескольких деталей)</label></div>'+
   '<div id="fp_asm_section" style="display:'+(p&&p.is_assembly?'block':'none')+'">'+
     '<div class="section-hdr">Компоненты сборки <button class="btn sm" onclick="addPTComp()">+</button></div><div id="fp_comps_list"></div></div>'+
@@ -4812,8 +4814,12 @@ function toggleAsmUI(){var ch=document.getElementById('fp_is_asm');
   document.getElementById('fp_asm_section').style.display=ch.checked?'block':'none'}
 
 function renderPTComps(){var el=document.getElementById('fp_comps_list');if(!el)return;
+  var custId=ssVal('fp_cust');
   var allPts=(window._allPTs||[]).filter(function(p){return!p.is_assembly});
-  var ptOpts=allPts.map(function(p){return{v:String(p.id),t:p.display_name+' ['+p.customer_name+']'}});
+  var matched=custId?allPts.filter(function(p){return String(p.customer_id)===String(custId)}):[];
+  var others=custId?allPts.filter(function(p){return String(p.customer_id)!==String(custId)}):allPts;
+  var ptOpts=matched.map(function(p){return{v:String(p.id),t:'★ '+p.display_name+' ['+p.customer_name+']',pri:true}})
+    .concat(others.map(function(p){return{v:String(p.id),t:p.display_name+' ['+p.customer_name+']'}}));
   el.innerHTML=ptComponents.map(function(c,i){
     return '<div class="mat-row">'+
     '<div style="flex:1"><label>Деталь</label>'+SS('ptc_'+i,ptOpts,String(c.component_id),'Деталь...')+'</div>'+
@@ -4823,7 +4829,9 @@ function renderPTComps(){var el=document.getElementById('fp_comps_list');if(!el)
 
 function addPTComp(){var allPts=(window._allPTs||[]).filter(function(p){return!p.is_assembly});
   if(!allPts.length){toast('Нет деталей для компонентов','err');return}
-  ptComponents.push({component_id:allPts[0].id,component_name:allPts[0].display_name,quantity:1});renderPTComps()}
+  var custId=ssVal('fp_cust');
+  var first=(custId&&allPts.find(function(p){return String(p.customer_id)===String(custId)}))||allPts[0];
+  ptComponents.push({component_id:first.id,component_name:first.display_name,quantity:1});renderPTComps()}
 
 function savePT(pid){
   // sync select values from DOM before saving
