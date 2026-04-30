@@ -2700,22 +2700,41 @@ def create_app():
         if not op: raise HTTPException(404)
         warnings = []
         if op.order_item_id:
-            # Проверяем несписанные активные резервы
-            active_res = db.query(Reservation).filter(
+            item = db.query(OrderItem).get(op.order_item_id)
+            # Определяем «свой» part_template_id для этой операции:
+            # компонентная операция — её component_template_id;
+            # сборочная операция — part_template позиции (с допуском NULL для старых резервов).
+            is_component_op = op.component_template_id is not None
+            target_pt_id = op.component_template_id if is_component_op else (
+                item.part_template_id if item else None)
+
+            # Проверяем несписанные активные резервы — СТРОГО по своей детали/компоненту.
+            res_q = db.query(Reservation).filter(
                 Reservation.order_item_id == op.order_item_id,
                 Reservation.is_active == True
-            ).all()
-            for r in active_res:
+            )
+            if is_component_op:
+                # Только резервы этого компонента
+                res_q = res_q.filter(Reservation.part_template_id == target_pt_id)
+            else:
+                # Сборка: свои резервы либо без указания компонента
+                res_q = res_q.filter((Reservation.part_template_id == target_pt_id) |
+                                     (Reservation.part_template_id.is_(None)))
+            for r in res_q.all():
                 mat = db.query(Material).get(r.material_id)
                 mat_name = mat.name if mat else f"Материал #{r.material_id}"
                 sheets = r.quantity_sheets or 0
                 warnings.append(f"Несписанный резерв: {mat_name} — {sheets} л")
-            # Проверяем остаток незакрытых деталей
-            item = db.query(OrderItem).get(op.order_item_id)
-            if item:
-                remaining = max(0, (item.quantity or 0) - (item.completed_qty or 0) - (item.rejected_qty or 0))
-                if remaining > 0:
-                    warnings.append(f"Не закрыто деталей по позиции: {remaining} шт.")
+
+            # Проверяем остаток деталей именно ПО ЭТОЙ операции
+            # (planned/completed/rejected на ProductionOp — это счётчики самой операции,
+            # они корректны и для компонента, и для сборки).
+            planned = op.planned_qty or 0
+            done = (op.completed_qty or 0) + (op.rejected_qty or 0)
+            remaining = max(0, planned - done)
+            if remaining > 0:
+                label = "по компоненту" if is_component_op else "по позиции"
+                warnings.append(f"Не закрыто деталей {label}: {remaining} шт.")
         return {"warnings": warnings}
 
     @app.post("/api/operations/{opid}/reopen")
