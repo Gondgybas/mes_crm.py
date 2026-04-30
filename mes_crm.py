@@ -675,7 +675,7 @@ DEFAULT_PERMS = [
     ("parts.edit", "Редактирование деталей", "Детали"), ("parts.log", "Учёт деталей", "Детали"),
     ("parts.files", "Просмотр файлов деталей", "Детали"),
     ("writeoff.material", "Списание материала", "Списания"), ("writeoff.parts", "Списание деталей", "Списания"),
-    ("writeoff.cancel", "Отмена списания", "Списания"),
+    ("writeoff.cancel_own", "Отмена своих списаний", "Списания"), ("writeoff.cancel", "Отмена всех списаний", "Списания"),
     ("cust.view", "Просмотр клиентов", "Клиенты"), ("cust.create", "Создание клиентов", "Клиенты"),
     ("cust.edit", "Редактирование клиентов", "Клиенты"),
     ("res.view", "Просмотр станков", "Станки"), ("res.create", "Создание станков", "Станки"),
@@ -3087,6 +3087,7 @@ def create_app():
                  "order_item_id": w.order_item_id,
                  "group_id": w.group_id or "",
                  "user": w.user.full_name if w.user else "",
+                 "user_id": w.user_id,
                  "resource": w.resource.name if w.resource else "",
                  "order_display": w.order.display_name if w.order else "",
                  "customer": w.order.customer.name if w.order and w.order.customer else "",
@@ -3238,9 +3239,18 @@ def create_app():
     async def api_cancel_wo(wid: int, request: Request, db: Session = Depends(db_dep)):
         data = await request.json()
         uid = data.get("user_id", 1)
+        perms = data.get("permissions", [])  # передаём с фронта для проверки
         wo = db.query(WriteOff).get(wid)
         if not wo: raise HTTPException(404)
         if wo.is_cancelled: raise HTTPException(400, "Уже отменено")
+
+        can_cancel_all = "writeoff.cancel" in perms
+        can_cancel_own = "writeoff.cancel_own" in perms
+        if not can_cancel_all and not can_cancel_own:
+            raise HTTPException(403, "Нет прав на отмену списания")
+        if not can_cancel_all and can_cancel_own:
+            if wo.user_id != uid:
+                raise HTTPException(403, "Можно отменять только свои списания")
 
         # Собираем все записи для отмены: сама запись + все записи группы (по group_id)
         wos_to_cancel = [wo]
@@ -6109,8 +6119,14 @@ function woFillTable(el){
     var noteText=w.note?esc(w.note.replace(/^\[[^\]]+\]\s*/,'')):'';
     // Для группы Мат+Дет используем любой ID — бэкенд отменит всю группу по group_id
     var cancelWid=isBoth?(partsW.is_cancelled?matW.id:partsW.id):w.id;
+    var ownWid=isBoth?(partsW.is_cancelled?matW.id:partsW.id):w.id;
+    var ownUid=isBoth?(partsW.user_id||matW.user_id):w.user_id;
+    var canCancelAll=hasPerm('writeoff.cancel');
+    var canCancelOwn=hasPerm('writeoff.cancel_own')&&(ownUid===U.id);
     var cancelBtn=cancelled?'':
-      '<button class="btn sm" onclick="cancelWO('+cancelWid+')" title="Отменить'+(isBoth?' всё списание (материал + детали)':'')+'" '+(hasPerm('writeoff.cancel')?'':'disabled')+'>↩</button>';
+      (canCancelAll||canCancelOwn)?
+        '<button class="btn sm" onclick="cancelWO('+cancelWid+')" title="Отменить'+(isBoth?' всё списание (материал + детали)':'')+'" >↩</button>':
+        '';
     return '<tr class="'+(cancelled?'cancelled-row':anomaly?'anomaly':'')+'">'+
       '<td style="font-size:.8em;white-space:nowrap">'+fmtDT(w.date)+'</td>'+
       '<td>'+typeBadge+'</td>'+
@@ -6132,7 +6148,7 @@ function woFillTable(el){
   tblUpdateBtns('wo');}
 
 function cancelWO(wid){if(!confirm('Отменить списание?\n\nВсё что было списано (материал и детали) вернётся обратно: материал на склад и в резерв, счётчики деталей на операции.'))return;
-  api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id}).then(function(r){
+  api('/api/writeoffs/'+wid+'/cancel','POST',{user_id:U.id,permissions:U.permissions}).then(function(r){
     var msg=r.cancelled_count>1?'Отменено записей: '+r.cancelled_count+' (группа)':'Списание отменено';
     toast(msg,'ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function modalWriteoff(){Promise.all([api('/api/orders'),api('/api/resources'),api('/api/op-types')]).then(function(arr){
