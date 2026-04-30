@@ -2937,6 +2937,8 @@ def create_app():
                 "order_number": it.order.order_number if it.order else "",
                 "order_display": it.order.display_name if it.order else "",
                 "order_status": it.order.status if it.order else "",
+                "customer_name": (it.order.customer.name if (it.order and it.order.customer) else "—"),
+                "order_title": (it.order.description if it.order else "") or "",
                 "part_name": pt_display(it.part_template),
                 "is_assembly": is_asm,
                 "template_id": it.part_template_id,
@@ -4031,8 +4033,11 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .parts-matrix{width:100%;border-collapse:collapse;table-layout:auto}
 .parts-matrix th,.parts-matrix td{border:1px solid var(--s2);padding:5px 8px;font-size:.82em;vertical-align:middle}
 .parts-matrix thead th{background:var(--bg);font-weight:700;white-space:nowrap;text-align:center;position:sticky;top:0;z-index:2}
-.parts-matrix thead th.pm-part-col{text-align:left;min-width:200px;max-width:280px;position:sticky;left:0;z-index:3}
-.pm-part-col{text-align:left;min-width:200px;max-width:280px;position:sticky;left:0;background:var(--s1);z-index:1}
+.parts-matrix thead th.pm-part-col{text-align:left;min-width:200px;max-width:280px}
+.pm-part-col{text-align:left;min-width:200px;max-width:280px;background:var(--s1)}
+.pm-cust-col{text-align:left;min-width:140px;max-width:200px;font-weight:600;vertical-align:middle!important;background:var(--s1)}
+.pm-title-col{text-align:left;min-width:180px;max-width:260px;vertical-align:middle!important;background:var(--s1);color:var(--text2)}
+.pm-cust-col .pm-onum{display:block;font-size:.75em;color:var(--text3);font-weight:500;margin-top:2px}
 .pm-plan-col,.pm-done-col{min-width:48px;text-align:center;white-space:nowrap}
 .pm-op-col{min-width:95px;text-align:center;white-space:nowrap;font-size:.78em}
 .pm-asm-row td{background:rgba(59,130,246,.07)!important;font-weight:600}
@@ -5784,17 +5789,34 @@ function submitEditRes(rid){api('/api/reservations/'+rid+'/edit','POST',{user_id
 function cancelRes(rid){if(!confirm('Снять?'))return;api('/api/reservations/'+rid+'/cancel','POST',{user_id:U.id}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 
 // ═══ УЧЁТ ДЕТАЛЕЙ ═══
-var plFilter={name:'',active_only:1},plSearchTimer=null;
-function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active_only).then(function(data){
-  var filtered=data;
-  if(plFilter.name)filtered=filtered.filter(function(d){return d.part_name.toLowerCase().indexOf(plFilter.name.toLowerCase())>=0});
+var _plItems=[],_plFilters={},_plAllOpTypes=[];
+window._plItems=_plItems;window._plFilters=_plFilters;
+window._plGetVal=function(d,col){
+  if(col==='customer')return d.customer_name||'';
+  if(col==='order_title')return d.order_title||'';
+  if(col==='part_name')return d.part_name||'';
+  if(col==='status')return d.order_status||'';
+  return '';};
+window._plRender=function(){_plRenderMatrix();};
 
-  var surplusItems=filtered.filter(function(d){return d.surplus>0});
+function _plRenderMatrix(){
+  var wrap=document.getElementById('plMatrixWrap');if(!wrap)return;
+  var filtered=tblGetFiltered('pl');
+  var cnt=document.getElementById('pl_count');
+  if(cnt)cnt.innerHTML='Показано: <strong>'+filtered.length+'</strong> / '+_plItems.length;
+  wrap.innerHTML=filtered.length?renderPartsMatrix(filtered,_plAllOpTypes):'<div class="info-box">Нет данных по выбранным фильтрам</div>';
+  tblUpdateBtns('pl');
+}
+
+function pgPartsLog(c){api('/api/part-station-logs?active_only=0').then(function(data){
+  _plItems=data;window._plItems=_plItems;window._plFilters=_plFilters;
+
+  var surplusItems=data.filter(function(d){return d.surplus>0});
   var totalSurplus=surplusItems.reduce(function(s,d){return s+d.surplus},0);
 
   // Типы операций: компонентные — слева, сборочные/одиночные — справа
   var compOpSeq={},asmOpSeq={};
-  filtered.forEach(function(d){
+  data.forEach(function(d){
     (d.planned_ops||[]).forEach(function(op){
       if(!op.op_type) return;
       if(op.component_id!=null){
@@ -5806,7 +5828,7 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
   });
   var compTypes=Object.keys(compOpSeq).sort(function(a,b){return compOpSeq[a]-compOpSeq[b]});
   var asmOnlyTypes=Object.keys(asmOpSeq).filter(function(t){return !(t in compOpSeq)}).sort(function(a,b){return asmOpSeq[a]-asmOpSeq[b]});
-  var allOpTypes=compTypes.concat(asmOnlyTypes);
+  _plAllOpTypes=compTypes.concat(asmOnlyTypes);
 
   var bannerHtml='';
   if(totalSurplus>0){
@@ -5819,24 +5841,20 @@ function pgPartsLog(c){api('/api/part-station-logs?active_only='+plFilter.active
   c.innerHTML='<div class="toolbar">'+
     (totalSurplus>0?'<button class="btn" style="background:var(--err);border-color:var(--err);color:#fff" onclick="modalSurplus()">🚨 Пересорт из пр-ва (+'+totalSurplus+')</button>':'')+
     '<button class="btn" style="background:var(--warn);border-color:var(--warn);color:#fff" onclick="modalSurplusPool()">📦 Склад пересорта</button>'+
+    '<span class="spacer"></span>'+
+    '<span id="pl_count" style="font-size:.85em;color:var(--text2)"></span>'+
+    '<button class="btn sm" onclick="tblFpResetAll(\'pl\')">✕ Сброс фильтров</button>'+
     '</div>'+
-    '<div class="filter-bar"><label>Деталь:</label><input id="plNameInput" style="width:180px" value="'+esc(plFilter.name)+'">'+
-    '<label>Заказы:</label><select onchange="plFilter.active_only=+this.value;pgPartsLog(document.getElementById(\'mainContent\'))">'+
-    '<option value="1" '+(plFilter.active_only?'selected':'')+'>В работе</option>'+
-    '<option value="0" '+(!plFilter.active_only?'selected':'')+'>Все</option></select></div>'+
     bannerHtml+
-    (filtered.length?renderPartsMatrix(filtered,allOpTypes):'<div class="info-box">Нет данных</div>');
-
-  var inp=document.getElementById('plNameInput');
-  if(inp){
-    inp.addEventListener('input',function(){plFilter.name=this.value;clearTimeout(plSearchTimer);plSearchTimer=setTimeout(function(){pgPartsLog(document.getElementById('mainContent'))},400)});
-    inp.focus();inp.setSelectionRange(inp.value.length,inp.value.length);
-  }
+    '<div id="plMatrixWrap"></div>';
+  _plRenderMatrix();
 })}
 
 function renderPartsMatrix(data,allOpTypes){
   var h='<div class="tbl-wrap" style="max-height:75vh"><table class="parts-matrix"><thead><tr>'+
-    '<th class="pm-part-col">Деталь / Компонент</th>'+
+    tblFTh('Заказчик','pl','customer')+
+    tblFTh('Название заказа','pl','order_title')+
+    tblFTh('Деталь / Компонент','pl','part_name')+
     '<th class="pm-plan-col">План</th>'+
     '<th class="pm-done-col">Факт</th>'+
     allOpTypes.map(function(ot){return '<th class="pm-op-col">'+ot+'</th>'}).join('')+
@@ -5849,16 +5867,16 @@ function renderPartsMatrix(data,allOpTypes){
     if(!(k in groups)){groups[k]=[];orderKeys.push(k);}
     groups[k].push(d);
   });
-  var colCount=3+allOpTypes.length;
+  var colCount=5+allOpTypes.length;
 
-  function renderRow(d){
+  // Возвращает HTML строк одной позиции (без колонок Заказчик/Название) и количество строк
+  function renderItem(d,leadCells){
     var hasSurplus=d.surplus>0;
     var surpBadge=hasSurplus?'<span class="surplus-label" style="font-size:.72em;margin-left:5px">ПС +'+d.surplus+'</span>':'';
-    var orderBadge='<span class="badge b-info" style="font-size:.72em;margin-right:4px">'+d.order_number+'</span>';
+    var rows=[];
 
     if(d.is_assembly){
-      // Группируем planned_ops по component_id
-      var byComp={}; // String(component_id)|'__asm__' -> {op_type -> op}
+      var byComp={};
       (d.planned_ops||[]).forEach(function(op){
         var key=op.component_id!=null?String(op.component_id):'__asm__';
         if(!byComp[key])byComp[key]={};
@@ -5866,11 +5884,11 @@ function renderPartsMatrix(data,allOpTypes){
           byComp[key][op.op_type]=op;
       });
 
-      // 1. Сначала — строка сборки (заголовок)
+      // 1. Строка сборки
       var asmOps=byComp['__asm__']||{};
       var asmOver=d.completed>d.quantity;
-      h+='<tr class="pm-asm-row'+(hasSurplus?' has-surplus':'')+'">'+
-        '<td class="pm-part-col">'+orderBadge+statusBadge(d.order_status)+
+      rows.push('<tr class="pm-asm-row'+(hasSurplus?' has-surplus':'')+'">'+
+        '<td class="pm-part-col">'+statusBadge(d.order_status)+
           ' <strong>🔧 '+d.part_name+'</strong>'+surpBadge+'</td>'+
         '<td class="pm-plan-col"><strong>'+d.quantity+'</strong></td>'+
         '<td class="pm-done-col">'+(asmOver
@@ -5883,16 +5901,16 @@ function renderPartsMatrix(data,allOpTypes){
           if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
           return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
         }).join('')+
-      '</tr>';
+      '</tr>');
 
-      // 2. Затем — строки компонентов, привязанные деревом к сборке выше
+      // 2. Компоненты (с tree-линиями)
       var comps=d.components||[];
       comps.forEach(function(comp,ci){
         var cid=String(comp.id);
         var ops=byComp[cid]||{};
         var compSurplus=Object.values(ops).some(function(op){return op.completed_qty>op.planned_qty&&op.planned_qty>0});
         var isLast=(ci===comps.length-1);
-        h+='<tr class="pm-comp-row'+(isLast?' pm-comp-last':'')+(compSurplus?' has-surplus-row':'')+'">'+
+        rows.push('<tr class="pm-comp-row'+(isLast?' pm-comp-last':'')+(compSurplus?' has-surplus-row':'')+'">'+
           '<td class="pm-part-col pm-comp-name">🔩 <strong>'+comp.name+'</strong> <span style="color:var(--text3)">×'+comp.qty+'</span></td>'+
           '<td class="pm-plan-col" style="color:var(--text3)">—</td>'+
           '<td class="pm-done-col" style="color:var(--text3)">—</td>'+
@@ -5901,7 +5919,7 @@ function renderPartsMatrix(data,allOpTypes){
             if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
             return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
           }).join('')+
-        '</tr>';
+        '</tr>');
       });
     } else {
       // ─ Обычная деталь ─
@@ -5910,8 +5928,8 @@ function renderPartsMatrix(data,allOpTypes){
         if(!ops[op.op_type]||op.seq>ops[op.op_type].seq)ops[op.op_type]=op;
       });
       var partOver=d.completed>d.quantity;
-      h+='<tr class="pm-part-row'+(hasSurplus?' has-surplus-row':'')+'">'+
-        '<td class="pm-part-col">'+orderBadge+statusBadge(d.order_status)+
+      rows.push('<tr class="pm-part-row'+(hasSurplus?' has-surplus-row':'')+'">'+
+        '<td class="pm-part-col">'+statusBadge(d.order_status)+
           ' <strong>🔩 '+d.part_name+'</strong>'+surpBadge+'</td>'+
         '<td class="pm-plan-col">'+d.quantity+'</td>'+
         '<td class="pm-done-col">'+(partOver
@@ -5924,13 +5942,29 @@ function renderPartsMatrix(data,allOpTypes){
           if(!op)return '<td class="pm-op-cell pm-no-op">—</td>';
           return '<td class="pm-op-cell '+plOpClass(op)+'">'+plOpCell(op)+'</td>';
         }).join('')+
-      '</tr>';
+      '</tr>');
     }
+
+    // Вставляем leadCells в первую строку этой позиции
+    if(leadCells) rows[0]=rows[0].replace('<tr','<tr data-lead="1"').replace(/^<tr([^>]*)>/, '<tr$1>'+leadCells);
+    return rows.join('');
   }
 
   orderKeys.forEach(function(k,gi){
     if(gi>0) h+='<tr class="pm-gap"><td colspan="'+colCount+'">&nbsp;</td></tr>';
-    groups[k].forEach(renderRow);
+    var grp=groups[k];
+    // Считаем общее число строк в группе (для rowspan заказчика/названия)
+    var totalRows=0;
+    grp.forEach(function(d){
+      totalRows += d.is_assembly ? (1+(d.components||[]).length) : 1;
+    });
+    var first=grp[0];
+    var custCell='<td class="pm-cust-col" rowspan="'+totalRows+'">'+esc(first.customer_name||'—')+
+      '<span class="pm-onum">'+esc(first.order_number||'')+'</span></td>';
+    var titleCell='<td class="pm-title-col" rowspan="'+totalRows+'">'+esc(first.order_title||'—')+'</td>';
+    grp.forEach(function(d,di){
+      h += renderItem(d, di===0 ? (custCell+titleCell) : '');
+    });
   });
 
   h+='</tbody></table></div>';
