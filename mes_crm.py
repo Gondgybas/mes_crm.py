@@ -4014,11 +4014,17 @@ tr:hover td{background:rgba(239,68,68,.04)}
    Десктоп не затрагивается
    ═══════════════════════════════════════════ */
 @media (max-width:900px){
+  /* --- Тач-оптимизации --- */
+  html{-webkit-text-size-adjust:100%;-webkit-tap-highlight-color:rgba(239,68,68,.15)}
+  body{font-size:15px}
+  input,select,textarea{font-size:16px!important}  /* предотвращает зум iOS при фокусе */
+
   /* --- Шапка --- */
   .header{padding:8px 12px}
-  .header h1{font-size:1em}
-  .hdr-r{gap:6px;font-size:.8em}
+  .header h1{font-size:1em;flex-shrink:0}
+  .hdr-r{gap:6px;font-size:.8em;flex-shrink:1;min-width:0}
   .hdr-r .ws-dot{display:none}
+  #userInfo{max-width:140px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block;vertical-align:middle}
 
   /* --- Навигация: большие кнопки с удобным нажатием --- */
   .nav{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
@@ -4036,31 +4042,35 @@ tr:hover td{background:rgba(239,68,68,.04)}
   /* --- Таблицы --- */
   .tbl-wrap{max-height:none;overflow-x:auto;-webkit-overflow-scrolling:touch}
   table{font-size:.82em}
-  th{padding:7px 8px;font-size:.72em}
+  th{padding:7px 8px;font-size:.72em;position:static}  /* sticky th не работает в overflow-x контейнере на мобильных */
   td{padding:6px 8px}
+  /* Оставляем горизонтальную полоску прокрутки заметной */
+  .tbl-wrap::-webkit-scrollbar{height:6px}
+  .tbl-wrap::-webkit-scrollbar-thumb{background:var(--s3);border-radius:3px}
 
   /* --- Тулбар --- */
   .toolbar{gap:6px;margin-bottom:8px}
-  .toolbar .btn{min-height:40px;padding:8px 12px;font-size:.85em}
+  .toolbar .btn,.toolbar > a.btn{min-height:40px;padding:8px 12px;font-size:.85em}
 
   /* --- Кнопки --- */
   .btn{min-height:38px;padding:7px 12px;font-size:.85em}
   .btn.sm{min-height:34px;padding:5px 10px;font-size:.8em}
 
-  /* --- Модальное окно --- */
+  /* --- Модальное окно (bottom sheet) --- */
   .modal-bg{padding-top:0;align-items:flex-end}
-  .modal{width:100%;max-width:100%;max-height:92vh;border-radius:var(--r) var(--r) 0 0;padding:20px 16px;border-bottom:none}
+  .modal{width:100%;max-width:100%;max-height:92vh;border-radius:var(--r) var(--r) 0 0;padding:20px 16px calc(20px + env(safe-area-inset-bottom)) 16px;border-bottom:none}
+  .modal h2{font-size:1.05em;padding-right:30px;line-height:1.3}
   .modal .form-row{grid-template-columns:1fr;gap:8px}
   .modal .form-row.triple{grid-template-columns:1fr 1fr}
-  .modal .actions{flex-wrap:wrap;gap:8px}
-  .modal .actions .btn{flex:1;min-width:120px;justify-content:center}
-  .modal input,.modal select,.modal textarea{padding:10px 12px;font-size:1em}
+  .modal .actions{flex-wrap:wrap;gap:8px;position:sticky;bottom:-20px;background:var(--s1);margin-left:-16px;margin-right:-16px;padding:12px 16px;margin-bottom:-20px}
+  .modal .actions .btn{flex:1;min-width:100px;justify-content:center;min-height:42px}
+  .modal input,.modal select,.modal textarea{padding:10px 12px}
   .modal label{font-size:.9em}
 
   /* --- Фильтр-бар --- */
   .filter-bar{flex-direction:column;align-items:stretch;gap:8px;padding:10px}
   .filter-bar label{font-size:.85em}
-  .filter-bar select,.filter-bar input{padding:8px 10px;font-size:.9em;width:100%}
+  .filter-bar select,.filter-bar input{padding:8px 10px;width:100%}
   /* flex-контейнеры внутри filter-bar */
   .filter-bar > div[style*="display:flex"]{flex-direction:column!important;align-items:stretch!important;gap:4px!important}
   .filter-bar > div[style*="display:flex"] label{white-space:normal!important}
@@ -4068,7 +4078,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
   /* --- Строки материалов/операций в редакторе --- */
   .mat-row{flex-wrap:wrap;gap:8px}
   .mat-row > div{min-width:120px;flex:1}
-  .mat-row select,.mat-row input{font-size:.9em;padding:8px}
+  .mat-row select,.mat-row input{padding:8px}
   .cf-row{flex-wrap:wrap;gap:8px}
   .cf-row > *{flex:1;min-width:120px}
 
@@ -4078,21 +4088,52 @@ tr:hover td{background:rgba(239,68,68,.04)}
   .sub-tabs button{white-space:nowrap;flex-shrink:0;min-height:40px;padding:8px 14px;font-size:.85em}
 
   /* --- Info-box --- */
-  .info-box{padding:10px;font-size:.88em}
+  .info-box{padding:10px;font-size:.88em;word-break:break-word}
 
-  /* --- Операционный флоу в карточках деталей --- */
+  /* --- Карточки деталей и оперфлоу --- */
+  .part-card{padding:10px 12px}
+  .part-card-title{font-size:.95em}
+  .part-card-stats{gap:10px;font-size:.82em}
   .op-flow{gap:3px}
   .op-step{min-width:70px;padding:4px 6px;font-size:.75em}
 
   /* --- Поисковый select (SS) --- */
-  .ss-input{padding:10px 30px 10px 10px;font-size:.95em}
-  .ss-opt{padding:10px 12px;font-size:.9em}
+  .ss-input{padding:10px 30px 10px 10px}
+  .ss-opt{padding:10px 12px}
+  .ss-drop{max-height:50vh}
 
   /* --- Бейджи --- */
   .badge{font-size:.72em;padding:3px 7px}
 
+  /* --- Чекбоксы крупнее для пальца --- */
+  .check-grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+  .check-grid label{padding:10px;font-size:.9em;min-height:42px}
+  .check-grid input[type=checkbox]{width:20px;height:20px}
+
+  /* --- Тосты на всю ширину --- */
+  #toast{bottom:12px;right:12px;left:12px;display:flex;flex-direction:column;align-items:stretch;pointer-events:none}
+  .toast{pointer-events:auto;font-size:.9em;padding:12px 16px;text-align:center}
+
+  /* --- Stat-card --- */
+  .stat-card{padding:10px}
+  .stat-card .stat-val{font-size:1.2em}
+
+  /* --- Section header --- */
+  .section-hdr{font-size:.95em;margin:14px 0 8px}
+
+  /* --- Surplus banner --- */
+  .surplus-banner{padding:10px 12px;flex-wrap:wrap}
+  .surplus-banner .sb-icon{font-size:1.3em}
+  .surplus-banner .sb-count{font-size:.95em;padding:3px 10px}
+
+  /* --- Модальные таблицы / popups для фильтров --- */
+  .wh-filter-popup{max-width:90vw;min-width:200px}
+
   /* --- Кнопки logout/refresh в шапке --- */
-  .hdr-r #themeCtl{display:none}
+  .hdr-r #themeCtl{padding:6px 4px;min-width:42px;font-size:1em;text-align:center;-webkit-appearance:none;appearance:none;background-position:right 4px center}
+
+  /* --- Login экран --- */
+  #loginScreen > div{width:100%!important;max-width:400px!important}
 }
 
 /* ═══ Очень маленькие экраны (< 480px) ═══ */
@@ -4108,12 +4149,30 @@ tr:hover td{background:rgba(239,68,68,.04)}
   th{padding:6px 6px;font-size:.68em}
   td{padding:5px 6px}
   .modal{padding:16px 12px;max-height:95vh}
+  .modal h2{font-size:1em}
   .modal .form-row.triple{grid-template-columns:1fr}
+  .modal .actions{margin-left:-12px;margin-right:-12px;padding:10px 12px}
   .btn{padding:8px 10px;font-size:.82em}
   .hdr-r .btn{padding:6px 8px;font-size:.78em}
+  #userInfo{max-width:100px;font-size:.85em}
   /* Скрываем текст кнопок "↻ Выход" — оставляем только иконки */
   .hdr-r #logoutBtn .btn-label{display:none}
+  /* Тема — совсем компактная */
+  .hdr-r #themeCtl{min-width:36px;padding:4px 2px;font-size:.95em}
+  /* Tighter сheck-grid */
+  .check-grid{grid-template-columns:1fr 1fr}
+  /* Stat cards 2 в ряд */
+  .stat-card{padding:8px}
+  /* Toolbar — кнопки в столбик при необходимости, но позволить ряду */
+  .toolbar{gap:6px}
+  .toolbar .btn,.toolbar > a.btn{padding:8px 10px;font-size:.8em}
+  /* Section-hdr с кнопкой + */
+  .section-hdr .btn.sm{margin-left:8px}
+  /* op-step — еще меньше */
+  .op-step{min-width:60px;padding:3px 5px;font-size:.7em}
+  .op-step .op-type{font-size:.95em}
 }
+
 </style>
 </head>
 <body>
