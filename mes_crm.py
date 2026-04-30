@@ -472,12 +472,16 @@ class Reservation(Base):
     is_active = Column(Boolean, default=True)
     reserved_by = Column(Integer, ForeignKey("users.id"), nullable=True)
     note = Column(Text, default="")
+    # Если задан — этот резерв принадлежит карте раскроя (NestingGroup),
+    # тогда конкретные order_id/order_item_id/part_template_id хранятся в NestingGroupItem.
+    nesting_group_id = Column(Integer, ForeignKey("nesting_groups.id"), nullable=True, index=True)
     created_at = Column(DateTime, default=now_msk)
     order = relationship("Order", back_populates="reservations")
     order_item = relationship("OrderItem")
     material = relationship("Material")
     part_template = relationship("PartTemplate")
     reserver = relationship("User", foreign_keys=[reserved_by])
+    nesting_group = relationship("NestingGroup", foreign_keys=[nesting_group_id])
 
 
 OP_STATUSES = ["Ожидает", "Запланирована", "В работе", "Завершена", "Частично", "Пауза"]
@@ -505,12 +509,17 @@ class ProductionOp(Base):
     completed_at = Column(DateTime, nullable=True)
     paused_at = Column(DateTime, nullable=True)
     total_pause_minutes = Column(Integer, default=0)
+    # Если задан — это «карточная» (объединённая) операция, обслуживающая NestingGroup.
+    # У такой op order_item_id/component_template_id обычно NULL,
+    # реальный список деталей — в NestingGroupItem.
+    nesting_group_id = Column(Integer, ForeignKey("nesting_groups.id"), nullable=True, index=True)
     order = relationship("Order", back_populates="operations")
     order_item = relationship("OrderItem")
     resource = relationship("Resource")
     operator = relationship("User", foreign_keys=[assigned_to])
     component_template = relationship("PartTemplate", foreign_keys=[component_template_id], lazy="joined")
     sessions = relationship("OpSession", back_populates="op", cascade="all, delete-orphan")
+    nesting_group = relationship("NestingGroup", foreign_keys=[nesting_group_id])
 
 
 class OpSession(Base):
@@ -568,6 +577,7 @@ class WriteOff(Base):
     operation_type = Column(String(200), default="")
     group_id = Column(String(64), default="", nullable=True)
     production_op_id = Column(Integer, ForeignKey("production_ops.id"), nullable=True)
+    nesting_group_id = Column(Integer, ForeignKey("nesting_groups.id"), nullable=True, index=True)
     is_anomaly = Column(Boolean, default=False)
     anomaly_note = Column(Text, default="")
     is_cancelled = Column(Boolean, default=False)
@@ -583,6 +593,66 @@ class WriteOff(Base):
     material = relationship("Material")
     reservation = relationship("Reservation")
     component_template = relationship("PartTemplate", foreign_keys=[component_template_id])
+
+
+class NestingGroup(Base):
+    """Карта раскроя — объединённая операция (нестинг) на одном станке/участке.
+    Связывает один материал и N деталей из 1..M заказов.
+    К группе привязан ровно один объединённый Reservation и одна объединённая ProductionOp.
+    """
+    __tablename__ = "nesting_groups"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(200), default="")
+    material_id = Column(Integer, ForeignKey("materials.id"), nullable=False, index=True)
+    operation_type = Column(String(200), nullable=False)  # участок (Лазер/Пробивка/...)
+    resource_id = Column(Integer, ForeignKey("resources.id"), nullable=True)  # станок необязателен
+    sheets_planned = Column(Integer, default=0)  # итог листов после нестинга (вводит админ)
+    status = Column(String(50), default="Активна")  # Активна | Расформирована
+    note = Column(Text, default="")
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=now_msk)
+    disbanded_at = Column(DateTime, nullable=True)
+    material = relationship("Material")
+    resource = relationship("Resource")
+    creator = relationship("User", foreign_keys=[created_by])
+    items = relationship("NestingGroupItem", back_populates="group", cascade="all, delete-orphan")
+
+
+class NestingGroupItem(Base):
+    """Конкретная деталь в составе карты раскроя.
+    Хранит ссылку на исходный резерв (для отката) и снимок исходных параметров ProductionOp,
+    чтобы при расформировании карты можно было вернуть индивидуальные операции.
+    """
+    __tablename__ = "nesting_group_items"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(Integer, ForeignKey("nesting_groups.id"), nullable=False, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    order_item_id = Column(Integer, ForeignKey("order_items.id"), nullable=True)
+    # Конкретная деталь/компонент. Сборка (is_assembly) в карту попасть не может.
+    part_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=False)
+    component_template_id = Column(Integer, ForeignKey("part_templates.id"), nullable=True)
+    qty_planned = Column(Integer, default=0)       # сколько штук этой детали должно выйти из карты
+    qty_completed = Column(Integer, default=0)
+    qty_rejected = Column(Integer, default=0)
+    # Снимок исходного резерва (для расформирования) — ссылка на запись в reservations
+    src_reservation_id = Column(Integer, ForeignKey("reservations.id"), nullable=True)
+    # Снимок исходной ProductionOp (для расформирования)
+    src_op_id = Column(Integer, nullable=True)               # информационно (op уже удалена)
+    src_op_planned_qty = Column(Integer, default=0)
+    src_op_estimated_minutes = Column(Integer, default=0)
+    src_op_sequence = Column(Integer, default=0)
+    src_op_sort_order = Column(Integer, default=0)
+    src_op_resource_id = Column(Integer, ForeignKey("resources.id"), nullable=True)
+    # Исходные количества из резерва — нужны для возврата при расформировании
+    src_reservation_sheets = Column(Integer, default=0)
+    src_reservation_kg = Column(Float, default=0.0)
+    group = relationship("NestingGroup", back_populates="items")
+    order = relationship("Order")
+    order_item = relationship("OrderItem")
+    part_template = relationship("PartTemplate", foreign_keys=[part_template_id])
+    component_template = relationship("PartTemplate", foreign_keys=[component_template_id])
+    src_reservation = relationship("Reservation", foreign_keys=[src_reservation_id])
+    src_resource = relationship("Resource", foreign_keys=[src_op_resource_id])
 
 
 class AuditLog(Base):
@@ -680,6 +750,9 @@ DEFAULT_PERMS = [
     ("order.files", "Файлы заказов", "Заказы"), ("order.reports", "Отчёты", "Заказы"),
     ("reserve.view", "Просмотр резервов", "Резервы"), ("reserve.create", "Создание резервов", "Резервы"),
     ("reserve.edit", "Редактирование резервов", "Резервы"), ("reserve.cancel", "Отмена резервов", "Резервы"),
+    ("nesting.view", "Просмотр карт раскроя", "Резервы"),
+    ("nesting.create", "Создание карт раскроя (объединение резервов)", "Резервы"),
+    ("nesting.disband", "Расформирование карт раскроя", "Резервы"),
     ("op.view", "Просмотр операций", "Операции"), ("op.create", "Создание операций", "Операции"),
     ("op.edit", "Редактирование операций", "Операции"), ("op.start", "Запуск операций", "Операции"),
     ("op.complete", "Завершение операций", "Операции"), ("op.reopen", "Дополнение завершённых операций", "Операции"),
@@ -797,6 +870,34 @@ def init_database():
             conn.execute(text("ALTER TABLE writeoffs ADD COLUMN production_op_id INTEGER REFERENCES production_ops(id)"))
             conn.commit()
         log.info("Migration: added production_op_id to writeoffs")
+
+    # ─── Миграция: карты раскроя (NestingGroup) ─────────────────────
+    if not insp.has_table("nesting_groups"):
+        Base.metadata.tables["nesting_groups"].create(engine)
+        log.info("Migration: created nesting_groups table")
+    if not insp.has_table("nesting_group_items"):
+        Base.metadata.tables["nesting_group_items"].create(engine)
+        log.info("Migration: created nesting_group_items table")
+    # Добавляем nesting_group_id в reservations / production_ops / writeoffs
+    insp = sa_inspect(engine)
+    res_cols = [c["name"] for c in insp.get_columns("reservations")]
+    if "nesting_group_id" not in res_cols:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE reservations ADD COLUMN nesting_group_id INTEGER REFERENCES nesting_groups(id)"))
+            conn.commit()
+        log.info("Migration: added nesting_group_id to reservations")
+    prod_cols2 = [c["name"] for c in insp.get_columns("production_ops")]
+    if "nesting_group_id" not in prod_cols2:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE production_ops ADD COLUMN nesting_group_id INTEGER REFERENCES nesting_groups(id)"))
+            conn.commit()
+        log.info("Migration: added nesting_group_id to production_ops")
+    wo_cols2 = [c["name"] for c in insp.get_columns("writeoffs")]
+    if "nesting_group_id" not in wo_cols2:
+        with engine.connect() as conn:
+            conn.execute(text("ALTER TABLE writeoffs ADD COLUMN nesting_group_id INTEGER REFERENCES nesting_groups(id)"))
+            conn.commit()
+        log.info("Migration: added nesting_group_id to writeoffs")
 
     # Миграция: ship_status в orders
     ord_cols = [c["name"] for c in insp.get_columns("orders")]
@@ -2249,7 +2350,8 @@ def create_app():
         q = db.query(Reservation).options(
             joinedload(Reservation.order).joinedload(Order.customer),
             joinedload(Reservation.material), joinedload(Reservation.part_template),
-            joinedload(Reservation.reserver), joinedload(Reservation.order_item))
+            joinedload(Reservation.reserver), joinedload(Reservation.order_item),
+            joinedload(Reservation.nesting_group))
         if active_only: q = q.filter(Reservation.is_active == True)
         rs_all = q.order_by(Reservation.created_at.desc()).all()
         consumed_map = {}
@@ -2258,24 +2360,40 @@ def create_app():
         ).filter(WriteOff.reservation_id.isnot(None), WriteOff.is_cancelled == False).group_by(WriteOff.reservation_id).all()
         for rid, sh, kg in consumed_q:
             consumed_map[rid] = {"sheets": int(sh or 0), "kg": round(kg or 0, 2)}
-        return [{"id": r.id, "order_id": r.order_id,
-                 "order_display": r.order.display_name if r.order else "",
-                 "order_status": r.order.status if r.order else "",
-                 "material": r.material.name if r.material else "",
-                 "material_id": r.material_id,
-                 "material_type": r.material.material_type if r.material else "",
-                 "part_name": pt_display(r.part_template) if r.part_template else "",
-                 # Оригинальное кол-во резерва = текущий остаток + уже списанное
-                 "kg": r.quantity_kg + consumed_map.get(r.id, {}).get("kg", 0),
-                 "sheets": r.quantity_sheets + consumed_map.get(r.id, {}).get("sheets", 0),
-                 "consumed_sheets": consumed_map.get(r.id, {}).get("sheets", 0),
-                 "consumed_kg": consumed_map.get(r.id, {}).get("kg", 0),
-                 # remaining = текущее quantity_sheets (уже уменьшается при каждом списании)
-                 "remaining_sheets": r.quantity_sheets,
-                 "remaining_kg": round(r.quantity_kg, 2),
-                 "active": r.is_active, "note": r.note,
-                 "reserved_by": r.reserver.full_name if r.reserver else "",
-                 "created": r.created_at.isoformat()} for r in rs_all]
+        # Признак сборки определяется через part_template; для резерва карты — None
+        # Возможность объединения: активный + не в карте + деталь не сборка + не списано
+        result = []
+        for r in rs_all:
+            is_assembly = bool(r.part_template.is_assembly) if r.part_template else False
+            consumed = consumed_map.get(r.id, {}).get("sheets", 0) > 0
+            can_merge = bool(r.is_active and not r.nesting_group_id and not is_assembly and not consumed)
+            ng = r.nesting_group
+            result.append({
+                "id": r.id, "order_id": r.order_id,
+                "order_display": r.order.display_name if r.order else "",
+                "order_status": r.order.status if r.order else "",
+                "material": r.material.name if r.material else "",
+                "material_id": r.material_id,
+                "material_type": r.material.material_type if r.material else "",
+                "part_name": pt_display(r.part_template) if r.part_template else "",
+                "is_assembly": is_assembly,
+                "kg": r.quantity_kg + consumed_map.get(r.id, {}).get("kg", 0),
+                "sheets": r.quantity_sheets + consumed_map.get(r.id, {}).get("sheets", 0),
+                "consumed_sheets": consumed_map.get(r.id, {}).get("sheets", 0),
+                "consumed_kg": consumed_map.get(r.id, {}).get("kg", 0),
+                "remaining_sheets": r.quantity_sheets,
+                "remaining_kg": round(r.quantity_kg, 2),
+                "active": r.is_active, "note": r.note,
+                "reserved_by": r.reserver.full_name if r.reserver else "",
+                "created": r.created_at.isoformat() if r.created_at else None,
+                # ── нестинг ──
+                "nesting_group_id": r.nesting_group_id,
+                "nesting_group_name": ng.name if ng else None,
+                "nesting_op_type": ng.operation_type if ng else None,
+                "is_nesting_merged": bool(r.nesting_group_id),  # сам объединённый резерв (хранится с привязкой к группе)
+                "can_merge": can_merge,
+            })
+        return result
 
     @app.post("/api/reservations/create")
     async def api_create_res(request: Request, db: Session = Depends(db_dep)):
@@ -2332,6 +2450,345 @@ def create_app():
                                 order_id=res.order_id, user_id=uid))
         db.flush(); db.commit()
         return {"status": "ok"}
+
+    # ─── Карты раскроя (NestingGroup) ───────────────────────────────
+    @app.get("/api/nesting-groups")
+    def api_nesting_list(active_only: int = 1, db: Session = Depends(db_dep)):
+        q = db.query(NestingGroup).options(
+            joinedload(NestingGroup.material),
+            joinedload(NestingGroup.resource),
+            joinedload(NestingGroup.creator),
+            joinedload(NestingGroup.items).joinedload(NestingGroupItem.part_template),
+            joinedload(NestingGroup.items).joinedload(NestingGroupItem.order),
+        )
+        if active_only:
+            q = q.filter(NestingGroup.status == "Активна")
+        result = []
+        for g in q.order_by(NestingGroup.id.desc()).all():
+            # Поиск объединённого резерва
+            res = db.query(Reservation).filter(Reservation.nesting_group_id == g.id).first()
+            # Объединённая операция
+            op = db.query(ProductionOp).filter(ProductionOp.nesting_group_id == g.id).first()
+            # Списано листов суммарно
+            consumed_sh = db.query(func.coalesce(func.sum(WriteOff.quantity_sheets), 0)).filter(
+                WriteOff.nesting_group_id == g.id, WriteOff.is_cancelled == False,
+                WriteOff.writeoff_type == "Материал").scalar() or 0
+            result.append({
+                "id": g.id, "name": g.name, "status": g.status,
+                "material_id": g.material_id, "material": g.material.name if g.material else "",
+                "operation_type": g.operation_type,
+                "resource_id": g.resource_id, "resource": g.resource.name if g.resource else "",
+                "sheets_planned": g.sheets_planned,
+                "sheets_remaining": (res.quantity_sheets if res else 0),
+                "sheets_consumed": int(consumed_sh),
+                "kg_remaining": (res.quantity_kg if res else 0),
+                "reservation_id": res.id if res else None,
+                "production_op_id": op.id if op else None,
+                "op_status": op.status if op else None,
+                "created": g.created_at.isoformat() if g.created_at else None,
+                "created_by": g.creator.full_name if g.creator else "",
+                "note": g.note,
+                "items": [{
+                    "id": it.id, "order_id": it.order_id, "order_item_id": it.order_item_id,
+                    "order_display": it.order.display_name if it.order else "",
+                    "part_template_id": it.part_template_id,
+                    "component_template_id": it.component_template_id,
+                    "part_name": pt_display(it.part_template) if it.part_template else "",
+                    "qty_planned": it.qty_planned,
+                    "qty_completed": it.qty_completed,
+                    "qty_rejected": it.qty_rejected,
+                } for it in g.items],
+            })
+        return result
+
+    @app.post("/api/nesting-groups/create")
+    async def api_nesting_create(request: Request, db: Session = Depends(db_dep)):
+        """Объединение нескольких активных резервов в одну карту раскроя.
+        Body: {user_id, reservation_ids: [int], operation_type: str, resource_id: int|null,
+               sheets_planned: int, name: str|None, note: str|None}
+        Делает: дезактивирует исходные резервы, удаляет соответствующие индивидуальные
+        ProductionOp (для operation_type), создаёт NestingGroup + объединённый Reservation +
+        одну ProductionOp с nesting_group_id.
+        """
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        require_permission(db, uid, "nesting.create")
+        rids = data.get("reservation_ids") or []
+        op_type = (data.get("operation_type") or "").strip()
+        if not op_type:
+            raise HTTPException(400, "Не указан тип операции")
+        if len(rids) < 1:
+            raise HTTPException(400, "Выберите хотя бы один резерв")
+        sheets_planned = int(data.get("sheets_planned") or 0)
+        if sheets_planned <= 0:
+            raise HTTPException(400, "Укажите количество листов на карту (>0)")
+
+        # Загружаем выбранные резервы
+        srcs = db.query(Reservation).options(
+            joinedload(Reservation.material), joinedload(Reservation.part_template),
+            joinedload(Reservation.order_item)
+        ).filter(Reservation.id.in_(rids)).all()
+        if len(srcs) != len(rids):
+            raise HTTPException(400, "Не все резервы найдены")
+
+        # Валидации
+        material_ids = {r.material_id for r in srcs}
+        if len(material_ids) > 1:
+            raise HTTPException(400, "Все резервы должны быть на ОДИН материал")
+        material_id = material_ids.pop()
+        for r in srcs:
+            if not r.is_active:
+                raise HTTPException(400, f"Резерв #{r.id} не активен — нельзя объединить")
+            if r.nesting_group_id:
+                raise HTTPException(400, f"Резерв #{r.id} уже входит в карту раскроя")
+            if r.part_template and r.part_template.is_assembly:
+                raise HTTPException(400,
+                    f"Резерв #{r.id} — на сборочную единицу, такие в нестинг не объединяются")
+            # Проверка: по этому резерву ещё ничего не списано
+            consumed = db.query(func.count(WriteOff.id)).filter(
+                WriteOff.reservation_id == r.id, WriteOff.is_cancelled == False).scalar() or 0
+            if consumed > 0:
+                raise HTTPException(400,
+                    f"Резерв #{r.id} уже частично списан — объединение невозможно")
+
+        mat = db.query(Material).get(material_id)
+        if not mat:
+            raise HTTPException(404, "Материал не найден")
+
+        # Проверяем тип операции
+        cfg = db.query(OperationTypeCfg).filter(OperationTypeCfg.name == op_type).first()
+        if not cfg:
+            raise HTTPException(400, f"Тип операции «{op_type}» не настроен")
+
+        # Если выбран станок — он должен поддерживать этот тип операции
+        resource_id = data.get("resource_id") or None
+        if resource_id:
+            rsc = db.query(Resource).get(resource_id)
+            if not rsc or op_type not in rsc.get_allowed_ops():
+                raise HTTPException(400, "Станок не поддерживает выбранный тип операции")
+
+        # Создаём NestingGroup
+        primary_order_id = srcs[0].order_id  # формальный «головной» заказ для совместимости с FK
+        group = NestingGroup(
+            name=(data.get("name") or "").strip() or f"Карта №{int(now_msk().timestamp()) % 100000}",
+            material_id=material_id, operation_type=op_type, resource_id=resource_id,
+            sheets_planned=sheets_planned, status="Активна",
+            note=(data.get("note") or "").strip(),
+            created_by=uid,
+        )
+        db.add(group); db.flush()  # нужен group.id
+
+        # По каждому исходному резерву: ищем индивидуальную ProductionOp данного типа
+        # на (order_item_id, component_template_id), снимаем снимок, удаляем её,
+        # создаём NestingGroupItem.
+        for r in srcs:
+            # Деталь/компонент: предпочитаем part_template_id резерва, иначе - из order_item
+            comp_pt_id = None
+            target_pt_id = r.part_template_id
+            item_pt_id = r.order_item.part_template_id if r.order_item else None
+            if target_pt_id and target_pt_id != item_pt_id:
+                # резерв на компонент
+                comp_pt_id = target_pt_id
+            # Ищем индивидуальную операцию данного типа по этой детали
+            op_q = db.query(ProductionOp).filter(
+                ProductionOp.order_item_id == r.order_item_id,
+                ProductionOp.operation_type == op_type,
+                ProductionOp.nesting_group_id.is_(None),
+            )
+            if comp_pt_id:
+                op_q = op_q.filter(ProductionOp.component_template_id == comp_pt_id)
+            else:
+                op_q = op_q.filter(ProductionOp.component_template_id.is_(None))
+            indiv_op = op_q.first()
+
+            # Снимок исходных параметров для возможного восстановления
+            src_op_planned = indiv_op.planned_qty if indiv_op else 0
+            src_op_min = indiv_op.estimated_minutes if indiv_op else 0
+            src_op_seq = indiv_op.sequence if indiv_op else 0
+            src_op_sort = indiv_op.sort_order if indiv_op else 0
+            src_op_res = indiv_op.resource_id if indiv_op else None
+            src_op_id_val = indiv_op.id if indiv_op else None
+
+            # Деталь, по которой сделаем NestingGroupItem
+            item_pt = r.part_template
+            db.add(NestingGroupItem(
+                group_id=group.id,
+                order_id=r.order_id, order_item_id=r.order_item_id,
+                part_template_id=target_pt_id or item_pt_id,
+                component_template_id=comp_pt_id,
+                qty_planned=(indiv_op.planned_qty if indiv_op else (
+                    r.order_item.quantity if r.order_item else 0)),
+                src_reservation_id=r.id,
+                src_op_id=src_op_id_val,
+                src_op_planned_qty=src_op_planned,
+                src_op_estimated_minutes=src_op_min,
+                src_op_sequence=src_op_seq,
+                src_op_sort_order=src_op_sort,
+                src_op_resource_id=src_op_res,
+                src_reservation_sheets=r.quantity_sheets or 0,
+                src_reservation_kg=r.quantity_kg or 0.0,
+            ))
+
+            # Удаляем индивидуальную ProductionOp, если она в безопасном состоянии
+            if indiv_op:
+                if indiv_op.status not in ("Ожидает", "Запланирована"):
+                    raise HTTPException(400,
+                        f"Операция «{op_type}» по детали {pt_display(item_pt) if item_pt else ''} "
+                        f"уже {indiv_op.status} — объединение невозможно")
+                # Удаляем сессии (на всякий случай, даже если статус Ожидает)
+                db.query(OpSession).filter(OpSession.op_id == indiv_op.id).delete()
+                db.delete(indiv_op)
+
+            # Дезактивируем исходный резерв и снимаем mat.reserved_*
+            mat.reserved_sheets = max(0, (mat.reserved_sheets or 0) - (r.quantity_sheets or 0))
+            mat.reserved_kg = max(0, (mat.reserved_kg or 0) - (r.quantity_kg or 0))
+            r.is_active = False
+
+        # Создаём объединённый резерв
+        new_kg = round(sheets_planned * (mat.sheet_weight_kg or 0), 2)
+        merged_res = Reservation(
+            order_id=primary_order_id, order_item_id=None,
+            material_id=mat.id, part_template_id=None,
+            quantity_sheets=sheets_planned, quantity_kg=new_kg,
+            is_active=True, reserved_by=uid,
+            note=f"Карта раскроя #{group.id}",
+            nesting_group_id=group.id,
+        )
+        db.add(merged_res)
+        mat.reserved_sheets = (mat.reserved_sheets or 0) + sheets_planned
+        mat.reserved_kg = (mat.reserved_kg or 0) + new_kg
+
+        # Создаём объединённую ProductionOp
+        total_qty_planned = sum(it.qty_planned or 0 for it in group.items)
+        merged_op = ProductionOp(
+            order_id=primary_order_id, order_item_id=None,
+            operation_type=op_type, status="Ожидает",
+            resource_id=resource_id, sequence=0, sort_order=0,
+            planned_qty=total_qty_planned, completed_qty=0, rejected_qty=0,
+            estimated_minutes=60,
+            component_template_id=None,
+            nesting_group_id=group.id,
+        )
+        db.add(merged_op)
+
+        db.add(MaterialMovement(material_id=mat.id, movement_type="Карта раскроя",
+                                quantity_sheets=sheets_planned, quantity_kg=new_kg,
+                                order_id=primary_order_id, user_id=uid,
+                                note=f"Создана карта раскроя #{group.id} «{group.name}»"))
+        audit(db, uid, "Создание карты раскроя", "nesting_group", group.id,
+              f"{mat.name}: {sheets_planned}л, деталей={len(group.items)}, тип={op_type}")
+        db.flush(); db.commit()
+        return {"id": group.id, "name": group.name,
+                "reservation_id": merged_res.id, "production_op_id": merged_op.id}
+
+    @app.post("/api/nesting-groups/{gid}/disband")
+    async def api_nesting_disband(gid: int, request: Request, db: Session = Depends(db_dep)):
+        """Расформирование карты раскроя.
+        Возможно ТОЛЬКО если по карте нет ни одного WriteOff.
+        Восстанавливает индивидуальные резервы и индивидуальные ProductionOp из снимков.
+        """
+        data = await request.json()
+        uid = data.get("user_id", 1)
+        require_permission(db, uid, "nesting.disband")
+        group = db.query(NestingGroup).options(
+            joinedload(NestingGroup.items),
+            joinedload(NestingGroup.material),
+        ).get(gid)
+        if not group: raise HTTPException(404, "Карта раскроя не найдена")
+        if group.status != "Активна":
+            raise HTTPException(400, "Карта уже расформирована")
+
+        # Любые WriteOff на эту карту блокируют расформирование
+        wo_count = db.query(func.count(WriteOff.id)).filter(
+            WriteOff.nesting_group_id == gid).scalar() or 0
+        if wo_count > 0:
+            raise HTTPException(400,
+                "По карте уже есть списания — расформирование невозможно")
+
+        mat = group.material
+        # Удаляем объединённый резерв и снимаем mat.reserved_*
+        merged_res = db.query(Reservation).filter(Reservation.nesting_group_id == gid).first()
+        if merged_res:
+            mat.reserved_sheets = max(0, (mat.reserved_sheets or 0) - (merged_res.quantity_sheets or 0))
+            mat.reserved_kg = max(0, (mat.reserved_kg or 0) - (merged_res.quantity_kg or 0))
+            db.delete(merged_res)
+        # Удаляем объединённую ProductionOp
+        merged_op = db.query(ProductionOp).filter(ProductionOp.nesting_group_id == gid).first()
+        if merged_op:
+            db.query(OpSession).filter(OpSession.op_id == merged_op.id).delete()
+            db.delete(merged_op)
+
+        # Восстанавливаем исходные резервы и операции
+        for it in group.items:
+            # Восстанавливаем исходный резерв
+            if it.src_reservation_id:
+                src_r = db.query(Reservation).get(it.src_reservation_id)
+                if src_r:
+                    src_r.is_active = True
+                    src_r.quantity_sheets = it.src_reservation_sheets or 0
+                    src_r.quantity_kg = it.src_reservation_kg or 0.0
+                    mat.reserved_sheets = (mat.reserved_sheets or 0) + (src_r.quantity_sheets or 0)
+                    mat.reserved_kg = (mat.reserved_kg or 0) + (src_r.quantity_kg or 0)
+            # Восстанавливаем индивидуальную ProductionOp (если был снимок)
+            if it.src_op_planned_qty or it.src_op_estimated_minutes or it.src_op_id:
+                db.add(ProductionOp(
+                    order_id=it.order_id, order_item_id=it.order_item_id,
+                    operation_type=group.operation_type, status="Ожидает",
+                    resource_id=it.src_op_resource_id,
+                    sequence=it.src_op_sequence or 0,
+                    sort_order=it.src_op_sort_order or 0,
+                    planned_qty=it.src_op_planned_qty or 0,
+                    completed_qty=0, rejected_qty=0,
+                    estimated_minutes=it.src_op_estimated_minutes or 60,
+                    component_template_id=it.component_template_id,
+                ))
+
+        group.status = "Расформирована"
+        group.disbanded_at = now_msk()
+        audit(db, uid, "Расформирование карты раскроя", "nesting_group", gid, group.name)
+        db.flush(); db.commit()
+        return {"status": "ok"}
+
+    @app.get("/api/nesting-groups/{gid}/writeoff-data")
+    def api_nesting_writeoff_data(gid: int, db: Session = Depends(db_dep)):
+        """Данные для модалки списания из карты:
+        — объединённый Reservation (с остатком/перерасходом),
+        — список деталей карты с прогрессом по каждой.
+        """
+        group = db.query(NestingGroup).options(
+            joinedload(NestingGroup.material),
+            joinedload(NestingGroup.items).joinedload(NestingGroupItem.part_template),
+            joinedload(NestingGroup.items).joinedload(NestingGroupItem.order),
+        ).get(gid)
+        if not group: raise HTTPException(404)
+        if group.status != "Активна":
+            raise HTTPException(400, "Карта расформирована")
+        res = db.query(Reservation).filter(Reservation.nesting_group_id == gid).first()
+        return {
+            "id": group.id, "name": group.name,
+            "operation_type": group.operation_type,
+            "resource_id": group.resource_id,
+            "material_id": group.material_id,
+            "material": group.material.name if group.material else "",
+            "sheets_planned": group.sheets_planned,
+            "reservation": ({
+                "id": res.id, "remaining_sheets": res.quantity_sheets or 0,
+                "remaining_kg": round(res.quantity_kg or 0, 2),
+                "is_active": bool(res.is_active),
+            } if res else None),
+            "items": [{
+                "id": it.id, "order_id": it.order_id, "order_item_id": it.order_item_id,
+                "order_display": it.order.display_name if it.order else "",
+                "part_template_id": it.part_template_id,
+                "component_template_id": it.component_template_id,
+                "part_name": pt_display(it.part_template) if it.part_template else "",
+                "qty_planned": it.qty_planned or 0,
+                "qty_completed": it.qty_completed or 0,
+                "qty_rejected": it.qty_rejected or 0,
+                "qty_remaining": max(0, (it.qty_planned or 0) - (it.qty_completed or 0) - (it.qty_rejected or 0)),
+            } for it in group.items],
+        }
+
 
     @app.get("/api/reservations/by-item/{item_id}")
     def api_res_by_item(item_id: int, part_template_id: int | None = None,
@@ -2430,7 +2887,9 @@ def create_app():
                 .joinedload(OrderItem.part_template)
                 .joinedload(PartTemplate.components)
                 .joinedload(AssemblyComponent.component),
-            joinedload(ProductionOp.component_template))
+            joinedload(ProductionOp.component_template),
+            joinedload(ProductionOp.nesting_group).joinedload(NestingGroup.items)
+                .joinedload(NestingGroupItem.part_template))
         if order_id: q = q.filter(ProductionOp.order_id == order_id)
         if active_only: q = q.join(Order).filter(Order.status == "В работе")
         if resource_id: q = q.filter(ProductionOp.resource_id == resource_id)
@@ -2468,9 +2927,54 @@ def create_app():
                 ck = avail // qty_per
                 if kits is None or ck < kits: kits = ck
             available_kits_map[o.id] = int(kits) if kits is not None else 0
+        # ── Синтетический "вход" для операций, у которых предыдущим этапом была карта раскроя ──
+        # Если у обычной op нет prev_op в её (item_id, comp_tid) группе, ищем сумму
+        # WriteOff.parts_good по нестинговым списаниям с тем же (item_id, comp_tid).
+        # Это позволяет корректно показывать "получено с лазера/пробивки: N шт.".
+        nesting_input_map = {}  # op.id -> (qty, src_op_type)
+        for o in ops_list:
+            if o.nesting_group_id is not None: continue   # сама карта — пропускаем
+            if prev_op_map.get(o.id) is not None: continue  # есть нормальный prev — не нужно
+            if not o.order_item_id: continue
+            row = db.query(
+                func.coalesce(func.sum(WriteOff.parts_good), 0),
+                func.max(WriteOff.operation_type),
+            ).filter(
+                WriteOff.order_item_id == o.order_item_id,
+                WriteOff.component_template_id == o.component_template_id,
+                WriteOff.nesting_group_id.isnot(None),
+                WriteOff.is_cancelled == False,
+                WriteOff.writeoff_type == "Детали",
+            ).one()
+            qty = int(row[0] or 0)
+            src_t = row[1] or ""
+            if qty > 0:
+                nesting_input_map[o.id] = (qty, src_t)
         result = []
         for o in ops_list:
             prev_op = prev_op_map.get(o.id)
+            ng = o.nesting_group
+            # Уникальный список заказов карты (для отображения в колонке "Заказ")
+            nesting_orders = []
+            if ng:
+                seen_oid = set()
+                for it in ng.items:
+                    if it.order_id and it.order_id not in seen_oid:
+                        seen_oid.add(it.order_id)
+                        nesting_orders.append({
+                            "order_id": it.order_id,
+                            "order_display": it.order.display_name if it.order else f"#{it.order_id}",
+                        })
+            # available_input/prev_op_type — берём сначала обычный prev, иначе синтетический из нестинга
+            if prev_op is not None:
+                avail_input = prev_op.completed_qty
+                prev_type = prev_op.operation_type
+                prev_id = prev_op.id
+            elif o.id in nesting_input_map:
+                avail_input, prev_type = nesting_input_map[o.id]
+                prev_id = None
+            else:
+                avail_input = None; prev_type = None; prev_id = None
             result.append({"id": o.id, "order_id": o.order_id,
                  "order_number": o.order.order_number if o.order else "",
                  "order_display": o.order.display_name if o.order else "",
@@ -2482,6 +2986,19 @@ def create_app():
                  "type": o.operation_type, "status": o.status,
                  "resource": o.resource.name if o.resource else "—",
                  "resource_id": o.resource_id,
+                 # ── Карта раскроя ──
+                 "nesting_group_id": o.nesting_group_id,
+                 "nesting_group_name": ng.name if ng else None,
+                 "nesting_orders": nesting_orders,
+                 "nesting_items": [{
+                     "id": it.id, "order_id": it.order_id, "order_item_id": it.order_item_id,
+                     "part_template_id": it.part_template_id,
+                     "component_template_id": it.component_template_id,
+                     "part_name": pt_display(it.part_template) if it.part_template else "",
+                     "qty_planned": it.qty_planned,
+                     "qty_completed": it.qty_completed,
+                     "qty_rejected": it.qty_rejected,
+                 } for it in (ng.items if ng else [])],
                  "operator": o.operator.full_name if o.operator else "",
                  "sequence": o.sequence, "sort_order": o.sort_order,
                  "planned_qty": o.planned_qty, "completed_qty": o.completed_qty,
@@ -2491,10 +3008,10 @@ def create_app():
                  "total_pause_min": o.total_pause_minutes or 0,
                  "completed_at": o.completed_at.isoformat() if o.completed_at else None,
                  "paused_at": o.paused_at.isoformat() if o.paused_at else None,
-                 # Передача деталей между операциями
-                 "available_input": prev_op.completed_qty if prev_op is not None else None,
-                 "prev_op_type": prev_op.operation_type if prev_op is not None else None,
-                 "prev_op_id": prev_op.id if prev_op is not None else None,
+                 # Передача деталей между операциями (с учётом нестинга, см. nesting_input_map выше)
+                 "available_input": avail_input,
+                 "prev_op_type": prev_type,
+                 "prev_op_id": prev_id,
                  # Готовые комплекты для первой сборочной операции
                  "available_kits": available_kits_map.get(o.id),
                  "sessions": [{"id": s.id, "user_id": s.user_id,
@@ -2699,6 +3216,35 @@ def create_app():
         op = db.query(ProductionOp).get(opid)
         if not op: raise HTTPException(404)
         warnings = []
+        # ── Карточная операция (нестинг): резерв и счётчики берём с группы ──
+        if op.nesting_group_id:
+            group = db.query(NestingGroup).options(
+                joinedload(NestingGroup.items).joinedload(NestingGroupItem.part_template),
+            ).get(op.nesting_group_id)
+            if group:
+                # Несписанный объединённый резерв
+                merged_res = db.query(Reservation).filter(
+                    Reservation.nesting_group_id == op.nesting_group_id,
+                    Reservation.is_active == True
+                ).first()
+                if merged_res and (merged_res.quantity_sheets or 0) > 0:
+                    mat = db.query(Material).get(merged_res.material_id)
+                    mat_name = mat.name if mat else f"Материал #{merged_res.material_id}"
+                    warnings.append(
+                        f"Несписан остаток карты: {mat_name} — {merged_res.quantity_sheets} л")
+                # Остаток деталей по каждому пункту карты
+                total_remaining = 0
+                detail_warns = []
+                for it in group.items:
+                    rem = max(0, (it.qty_planned or 0) - (it.qty_completed or 0) - (it.qty_rejected or 0))
+                    if rem > 0:
+                        total_remaining += rem
+                        nm = pt_display(it.part_template) if it.part_template else f"#{it.part_template_id}"
+                        detail_warns.append(f"{nm}: {rem} шт.")
+                if total_remaining > 0:
+                    warnings.append("Не закрыто деталей по карте: " + "; ".join(detail_warns))
+            return {"warnings": warnings}
+        # ── Обычная операция ──
         if op.order_item_id:
             item = db.query(OrderItem).get(op.order_item_id)
             # Определяем «свой» part_template_id для этой операции:
@@ -3283,9 +3829,12 @@ def create_app():
     async def api_create_wo(request: Request, db: Session = Depends(db_dep)):
         data = await request.json()
         uid = data.get("user_id", 1); wtype = data["writeoff_type"]
+        nest_gid = data.get("nesting_group_id") or None
+        nest_item_id = data.get("nesting_group_item_id") or None
         wo = WriteOff(writeoff_type=wtype, user_id=uid, resource_id=data.get("resource_id"),
                       order_id=data.get("order_id"), order_item_id=data.get("order_item_id"),
                       group_id=data.get("group_id", ""),
+                      nesting_group_id=nest_gid,
                       note=data.get("note", ""))
         if wtype == "Материал":
             res_id = data.get("reservation_id")
@@ -3355,9 +3904,14 @@ def create_app():
             wo.operation_type = op_type
             prod_op_id = data.get("production_op_id")
             wo.production_op_id = prod_op_id
-            is_anom, anom_note = check_sequence_anomaly(
-                db, data["order_item_id"], data.get("resource_id"), good,
-                comp_tid=comp_tid, prod_op_id=prod_op_id)
+            # Для карточных списаний (нестинг) проверка последовательности не нужна —
+            # карта обычно «первый» этап в маршруте детали.
+            if nest_gid:
+                is_anom, anom_note = False, ""
+            else:
+                is_anom, anom_note = check_sequence_anomaly(
+                    db, data["order_item_id"], data.get("resource_id"), good,
+                    comp_tid=comp_tid, prod_op_id=prod_op_id)
             wo.is_anomaly = is_anom; wo.anomaly_note = anom_note
             db.add(PartStationLog(order_item_id=data["order_item_id"], resource_id=data.get("resource_id"),
                                   operation_type=data.get("operation_type", ""),
@@ -3375,6 +3929,12 @@ def create_app():
                 if prod_op:
                     prod_op.completed_qty = (prod_op.completed_qty or 0) + good
                     prod_op.rejected_qty = (prod_op.rejected_qty or 0) + rej
+            # Обновляем счётчик конкретной детали внутри карты раскроя
+            if nest_item_id:
+                ng_item = db.query(NestingGroupItem).get(nest_item_id)
+                if ng_item:
+                    ng_item.qty_completed = (ng_item.qty_completed or 0) + good
+                    ng_item.qty_rejected = (ng_item.qty_rejected or 0) + rej
             audit(db, uid, "Списание деталей", "writeoff", 0,
                   f"+{good} годн +{rej} брак" + (f" ⚠ {anom_note}" if is_anom else ""))
         db.add(wo); db.flush(); db.commit()
@@ -3454,6 +4014,16 @@ def create_app():
                     PartStationLog.component_template_id == w.component_template_id
                 ).order_by(PartStationLog.created_at.desc()).first()
                 if logs: db.delete(logs)
+                # Откат счётчика конкретной детали внутри карты раскроя
+                if w.nesting_group_id:
+                    ng_item = db.query(NestingGroupItem).filter(
+                        NestingGroupItem.group_id == w.nesting_group_id,
+                        NestingGroupItem.order_item_id == w.order_item_id,
+                        NestingGroupItem.component_template_id == w.component_template_id,
+                    ).first()
+                    if ng_item:
+                        ng_item.qty_completed = max(0, (ng_item.qty_completed or 0) - (w.parts_good or 0))
+                        ng_item.qty_rejected = max(0, (ng_item.qty_rejected or 0) - (w.parts_rejected or 0))
 
         extra = f" + группа {wo.group_id} ({len(wos_to_cancel)} записи)" if len(wos_to_cancel) > 1 else ""
         audit(db, uid, "Отмена списания", "writeoff", wid, f"Тип={wo.writeoff_type}{extra}")
@@ -5441,15 +6011,23 @@ function pgOperations(c){
         }
         return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)"'+(o.status==='Завершена'?' style="opacity:.55"':'')+'>'+
           '<td style="cursor:grab">☰</td>'+
-          '<td style="font-size:.85em">'+(o.order_display||o.order_number)+'</td>'+
-          '<td>'+(o.component_name
+          '<td style="font-size:.85em">'+(o.nesting_group_id
+            ?'<div><span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 Карта</span>'+
+              '<div style="font-size:.78em;color:var(--text2);margin-top:3px;line-height:1.3">'+
+                ((o.nesting_orders||[]).map(function(no){return esc(no.order_display)}).join('<br>')||'—')+
+              '</div></div>'
+            :(o.order_display||o.order_number))+'</td>'+
+          '<td>'+(o.nesting_group_id
+            ?'<div><strong style="color:#7c3aed">🧩 '+esc(o.nesting_group_name||'Карта раскроя')+'</strong>'+
+                '<div style="font-size:.72em;color:var(--text3)">'+(o.nesting_items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(' · ')+'</div></div>'
+            :(o.component_name
             ?'<div>'+
                 '<strong style="font-size:.88em;cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.component_template_id+',\''+o.component_name.replace(/'/g,"\\'")+'\')" title="Просмотр файлов детали">🔩 '+o.component_name+'</strong>'+
                 '<div style="font-size:.73em;color:var(--text3)">сб: '+
                   (o.item_template_id?'<span style="cursor:pointer;color:var(--acc)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))+
                 '</div>'+
               '</div>'
-            :(o.item_template_id?'<span style="cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—')))+
+            :(o.item_template_id?'<span style="cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))))+
           '</td>'+
           '<td>'+resCell+'</td>'+
           '<td>'+o.planned_qty+'</td>'+
@@ -5506,7 +6084,7 @@ function pgOperations(c){
               } else if(o.status==='Завершена'&&hasPerm('op.reopen')){
                 btns='<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="sessionStart('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>';
               }
-              btns+=((o.status==='В работе'||o.status==='Пауза')&&o.item_id&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
+              btns+=((o.status==='В работе'||o.status==='Пауза')&&(o.item_id||o.nesting_group_id)&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
                 (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'');
               return operBadges+'<br style="line-height:.5em">'+btns;
             })()+
@@ -5606,6 +6184,8 @@ function onWoSheetsChange(){
 
 function modalOpWriteoff(opid){
   var op=window._opsData[opid];if(!op){toast('Операция не найдена','err');return}
+  // Карточная (нестинговая) операция — отдельная модалка
+  if(op.nesting_group_id){return modalNestingWriteoff(opid)}
   var otCfg=window._opTypesData[op.type]||{};
   var mode=otCfg.writeoff_mode||'Детали';
   if(mode==='Нет'){toast('Списание не настроено для «'+op.type+'»','err');return}
@@ -5734,6 +6314,166 @@ function modalOpWriteoff(opid){
     if(showMat&&matchedItems.length) setTimeout(onWoMatChange,10);
   }).catch(function(e){toast(e.message,'err')})}
 
+// ═══ СПИСАНИЕ ИЗ КАРТЫ РАСКРОЯ ═══
+function modalNestingWriteoff(opid){
+  var op=window._opsData[opid];if(!op||!op.nesting_group_id){toast('Не карта раскроя','err');return}
+  var showMat=U.writeoff_types.indexOf('Материал')>=0;
+  var showParts=U.writeoff_types.indexOf('Детали')>=0;
+  if(!showMat&&!showParts){toast('Нет прав на списание','err');return}
+
+  // Подгружаем данные карты + (если нужно) совместимые станки
+  var pData=api('/api/nesting-groups/'+op.nesting_group_id+'/writeoff-data');
+  var pRes=!op.resource_id?api('/api/resources/for-operation/'+encodeURIComponent(op.type)):Promise.resolve(null);
+  Promise.all([pData,pRes]).then(function(arr){
+    var d=arr[0], compatResources=arr[1];
+
+    // Блок выбора станка (как в обычной модалке)
+    var resBlockHtml='';
+    if(!op.resource_id){
+      var resList=compatResources&&compatResources.length?compatResources:(window._opsResources||[]);
+      var resOpts=resList.map(function(r){return'<option value="'+r.id+'">'+esc(r.name)+'</option>'}).join('');
+      resBlockHtml='<div class="form-row full" style="background:rgba(239,68,68,.07);border:1px solid var(--err);border-radius:var(--r);padding:8px 10px;margin-bottom:6px">'+
+        '<div><label style="color:var(--err);font-weight:700">🏭 Станок <span>*</span> — не задан в карте, выберите обязательно:</label>'+
+        '<select id="fnwo_res_sel" style="border-color:var(--err)"><option value="">— выберите станок —</option>'+resOpts+'</select></div></div>';
+    }
+
+    // Список заказов карты (для шапки)
+    var ordList=(d.items||[]).reduce(function(acc,it){if(it.order_display&&acc.indexOf(it.order_display)<0)acc.push(it.order_display);return acc},[]);
+
+    var h='<h2>📤 Списание с карты раскроя: '+esc(d.name||'')+'</h2>'+
+      '<div class="info-box" style="background:rgba(124,58,237,.08);border-color:#7c3aed;margin-bottom:6px">'+
+        '<strong>🧩 Карта:</strong> '+esc(d.name||'')+
+        ' · <strong>Участок:</strong> '+esc(d.operation_type||'')+
+        ' · <strong>Станок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+
+        '<div style="font-size:.82em;color:var(--text3);margin-top:4px">Заказы: '+ordList.map(esc).join(', ')+'</div>'+
+      '</div>'+
+      '<div class="info-box" style="background:rgba(245,158,11,.08);font-size:.82em;margin-bottom:6px">'+
+        '⚠ <strong>Это нестинг.</strong> Автоматический пересчёт количества деталей по листам отключён — <u>списывайте вручную</u> по каждой детали.'+
+      '</div>'+
+      resBlockHtml;
+
+    // Секция МАТЕРИАЛ
+    if(showMat){
+      var rsv=d.reservation;
+      var matLabel=esc(d.material||'')+' — ост. <strong>'+(rsv?rsv.remaining_sheets:0)+' л</strong> ('+(rsv?fmtN(rsv.remaining_kg||0):0)+' кг)';
+      h+='<div class="section-hdr">📦 Материал (общий резерв карты)</div>'+
+        '<div class="info-box" style="font-size:.85em;margin-bottom:4px">'+matLabel+'</div>'+
+        '<div class="form-row"><div><label>Листов</label>'+
+        '<input type="number" id="fnwo_sheets" min="0" value="0" data-max="'+(rsv?rsv.remaining_sheets:0)+'">'+
+        '</div><div></div></div>';
+    }
+
+    // Секция ДЕТАЛИ — по каждому пункту карты
+    if(showParts&&(d.items||[]).length){
+      h+='<div class="section-hdr">🔩 Детали карты</div>'+
+        '<div class="tbl-wrap" style="max-height:280px;overflow:auto"><table>'+
+          '<thead><tr><th>Заказ</th><th>Деталь</th><th>План</th><th>Готово</th><th>Брак</th><th>Ост.</th>'+
+            '<th>Годных <span style="color:var(--err)">*</span></th><th>Брак</th></tr></thead>'+
+          '<tbody>'+
+            d.items.map(function(it){
+              var rem=it.qty_remaining;
+              return '<tr data-itemid="'+it.id+'" data-oid="'+it.order_id+'" data-oitem="'+(it.order_item_id||'')+'" data-comp="'+(it.component_template_id||'')+'">'+
+                '<td style="font-size:.78em">'+esc(it.order_display||'')+'</td>'+
+                '<td><strong>'+esc(it.part_name||'')+'</strong></td>'+
+                '<td>'+it.qty_planned+'</td>'+
+                '<td>'+it.qty_completed+'</td>'+
+                '<td>'+it.qty_rejected+'</td>'+
+                '<td style="color:'+(rem>0?'var(--acc)':'var(--ok)')+';font-weight:600">'+rem+'</td>'+
+                '<td><input type="number" class="fnwo_good" min="0" value="0" style="width:70px"></td>'+
+                '<td><input type="number" class="fnwo_rej" min="0" value="0" style="width:70px"></td>'+
+              '</tr>';
+            }).join('')+
+          '</tbody></table></div>';
+    }
+    h+='<div class="form-row full"><div><label>Примечание</label><input id="fnwo_note"></div></div>'+
+      '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+      '<button class="btn primary" style="background:#7c3aed;border-color:#7c3aed" onclick="submitNestingWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
+    openModal(h);
+  }).catch(function(e){toast(e.message,'err')})
+}
+
+function submitNestingWriteoff(opid,showMat,showParts){
+  var op=window._opsData[opid];if(!op||!op.nesting_group_id)return;
+  var note=(document.getElementById('fnwo_note')||{}).value||'';
+  var gid=Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8)+'-u'+U.id;
+
+  // Эффективный станок
+  var effResId=op.resource_id||null;
+  if(!effResId){
+    var rs=document.getElementById('fnwo_res_sel');
+    if(rs&&rs.value){effResId=+rs.value}
+    else{toast('Выберите станок — он не задан в карте','err');return}
+  }
+
+  var promises=[];
+
+  // 1. Материал — один общий резерв
+  if(showMat){
+    var shInp=document.getElementById('fnwo_sheets');
+    var shVal=+(shInp&&shInp.value)||0;
+    if(shVal>0){
+      var maxSh=+(shInp&&shInp.dataset.max)||0;
+      if(shVal>maxSh){
+        var delta=shVal-maxSh;
+        if(!confirm('⚠ Перерасход +'+delta+' л сверх остатка карты ('+maxSh+' л).\n\nРезерв будет автоматически расширен на +'+delta+' л.\n\nПродолжить?'))return;
+      }
+      promises.push(_fnwoLoadReservation(op.nesting_group_id).then(function(rsv){
+        return api('/api/writeoffs/create','POST',{
+          writeoff_type:'Материал',user_id:U.id,
+          order_id:op.order_id, order_item_id:null,
+          resource_id:effResId, group_id:gid,
+          material_id:rsv.material_id, sheets:shVal,
+          reservation_id:rsv.reservation_id,
+          nesting_group_id:op.nesting_group_id,
+          note:'[🧩 '+(op.nesting_group_name||'Карта')+'] '+note,
+        });
+      }));
+    }
+  }
+
+  // 2. Детали — по каждой строке карты
+  if(showParts){
+    var rows=document.querySelectorAll('#modal tr[data-itemid]');
+    rows.forEach(function(tr){
+      var good=+(tr.querySelector('.fnwo_good')||{}).value||0;
+      var rej=+(tr.querySelector('.fnwo_rej')||{}).value||0;
+      if(good>0||rej>0){
+        promises.push(api('/api/writeoffs/create','POST',{
+          writeoff_type:'Детали',user_id:U.id,
+          order_id:+tr.dataset.oid, order_item_id:+tr.dataset.oitem||null,
+          resource_id:effResId, group_id:gid,
+          operation_type:op.type,
+          parts_good:good, parts_rejected:rej,
+          production_op_id:opid,
+          component_template_id:+tr.dataset.comp||null,
+          nesting_group_id:op.nesting_group_id,
+          nesting_group_item_id:+tr.dataset.itemid,
+          note:'[🧩 '+(op.nesting_group_name||'Карта')+'] '+note,
+        }));
+      }
+    });
+  }
+  if(!promises.length){toast('Укажите количество','err');return}
+  Promise.all(promises).then(function(results){
+    closeModal();
+    var anom=results.find(function(r){return r&&r.is_anomaly});
+    if(anom)toast('⚠ '+anom.anomaly_note,'err');
+    else toast('Списано с карты «'+(op.nesting_group_name||'')+'»','ok');
+    refreshPage();
+  }).catch(function(e){toast(e.message,'err')});
+}
+
+// Лёгкий хелпер: получить ID объединённого резерва и материал по карте
+var _fnwoCache={};
+function _fnwoLoadReservation(gid){
+  if(_fnwoCache[gid])return Promise.resolve(_fnwoCache[gid]);
+  return api('/api/nesting-groups/'+gid+'/writeoff-data').then(function(d){
+    var rsv={material_id:d.material_id, reservation_id:d.reservation?d.reservation.id:null};
+    _fnwoCache[gid]=rsv; return rsv;
+  });
+}
+
+
 function submitOpWriteoff(opid,showMat,showParts){
   var op=window._opsData[opid];if(!op)return;
   var note=(document.getElementById('fopwo_note')||{}).value||'';
@@ -5811,40 +6551,89 @@ window._resGetVal=function(r,col){
   return '';};
 window._resRender=function(){_resRenderTable();};
 
-function pgReservations(c){api('/api/reservations?active_only='+_resActiveOnly).then(function(rs){
-  _resItems=rs;window['_resItems']=rs;window['_resFilters']=_resFilters;
-  c.innerHTML='<div class="toolbar">'+
-    (hasPerm('reserve.create')?'<button class="btn primary" onclick="modalCreateRes()">+ Резерв</button>':'')+
-    '<label style="margin-left:8px;font-size:.85em">Резервы:</label>'+
-    '<select class="ctl" style="padding:3px;font-size:.85em" onchange="_resActiveOnly=+this.value;_resFilters={};pgReservations(document.getElementById(\'mainContent\'))">'+
-      '<option value="1" '+(_resActiveOnly?'selected':'')+'>Активные</option>'+
-      '<option value="0" '+(!_resActiveOnly?'selected':'')+'>Все (вкл. списанные)</option>'+
-    '</select>'+
-    '<span class="spacer"></span>'+
-    '<span id="res_count" style="font-size:.85em;color:var(--text2)"></span>'+
-    '<button class="btn sm" onclick="tblFpResetAll(\'res\')">✕ Сброс</button></div>'+
-  '<div class="tbl-wrap"><table><thead><tr>'+
-    tblFTh('Заказ','res','order')+
-    tblFTh('Ст.','res','status')+
-    tblFTh('Деталь','res','part')+
-    tblFTh('Материал','res','material')+
-    tblFTh('Тип','res','type')+
-    tblFTh('Статус','res','active')+
-    '<th>Зарез.(л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th>'+
-  '</tr></thead><tbody id="resTbody"></tbody></table></div>';
-  _resRenderTable();})}
+function pgReservations(c){
+  Promise.all([
+    api('/api/reservations?active_only='+_resActiveOnly),
+    api('/api/nesting-groups?active_only=1').catch(function(){return []}),
+  ]).then(function(arr){
+    var rs=arr[0], groups=arr[1]||[];
+    _resItems=rs;window['_resItems']=rs;window['_resFilters']=_resFilters;
+    window._nestingGroups=groups;
+    var groupsHtml=_renderNestingGroupsPanel(groups);
+    c.innerHTML=groupsHtml+
+      '<div class="toolbar">'+
+      (hasPerm('reserve.create')?'<button class="btn primary" onclick="modalCreateRes()">+ Резерв</button>':'')+
+      (hasPerm('nesting.create')?'<button class="btn" style="background:#7c3aed;border-color:#7c3aed;color:#fff" onclick="modalNestingMerge()">🧩 Объединить в карту</button>':'')+
+      '<label style="margin-left:8px;font-size:.85em">Резервы:</label>'+
+      '<select class="ctl" style="padding:3px;font-size:.85em" onchange="_resActiveOnly=+this.value;_resFilters={};pgReservations(document.getElementById(\'mainContent\'))">'+
+        '<option value="1" '+(_resActiveOnly?'selected':'')+'>Активные</option>'+
+        '<option value="0" '+(!_resActiveOnly?'selected':'')+'>Все (вкл. списанные)</option>'+
+      '</select>'+
+      '<span class="spacer"></span>'+
+      '<span id="res_count" style="font-size:.85em;color:var(--text2)"></span>'+
+      '<button class="btn sm" onclick="tblFpResetAll(\'res\')">✕ Сброс</button></div>'+
+    '<div class="tbl-wrap"><table><thead><tr>'+
+      (hasPerm('nesting.create')?'<th style="width:24px"><input type="checkbox" id="resSelAll" onchange="_resToggleAll(this.checked)"></th>':'')+
+      tblFTh('Заказ','res','order')+
+      tblFTh('Ст.','res','status')+
+      tblFTh('Деталь','res','part')+
+      tblFTh('Материал','res','material')+
+      tblFTh('Тип','res','type')+
+      tblFTh('Статус','res','active')+
+      '<th>Зарез.(л)</th><th>Списано</th><th>Остаток</th><th>Кем</th><th></th>'+
+    '</tr></thead><tbody id="resTbody"></tbody></table></div>';
+    _resRenderTable();
+  });}
+
+function _renderNestingGroupsPanel(groups){
+  if(!groups||!groups.length)return '';
+  var rows=groups.map(function(g){
+    var dets=(g.items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(', ');
+    var disband=hasPerm('nesting.disband')&&g.sheets_consumed===0
+      ?'<button class="btn sm" onclick="disbandNesting('+g.id+')" title="Расформировать">✖</button>':'';
+    return '<tr><td><span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 '+esc(g.name)+'</span></td>'+
+      '<td>'+esc(g.material||'—')+'</td>'+
+      '<td>'+esc(g.operation_type||'—')+(g.resource?' / '+esc(g.resource):'')+'</td>'+
+      '<td>'+(g.sheets_planned||0)+' л</td>'+
+      '<td>списано: '+(g.sheets_consumed||0)+' л · ост.: '+(g.sheets_remaining||0)+' л</td>'+
+      '<td style="font-size:.85em">'+dets+'</td>'+
+      '<td>'+disband+'</td></tr>';
+  }).join('');
+  return '<div class="info-box" style="background:rgba(124,58,237,.06);border-color:#7c3aed;margin-bottom:8px">'+
+    '<strong style="color:#7c3aed">🧩 Карты раскроя ('+groups.length+')</strong>'+
+    '<div class="tbl-wrap" style="margin-top:6px"><table><thead><tr>'+
+    '<th>Карта</th><th>Материал</th><th>Участок</th><th>Лист.</th><th>Прогресс</th><th>Детали</th><th></th>'+
+    '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
+}
+
+function _resToggleAll(checked){
+  var boxes=document.querySelectorAll('.res-merge-cb');
+  boxes.forEach(function(b){if(!b.disabled)b.checked=checked});
+}
 
 function _resRenderTable(){
   var rs=tblGetFiltered('res');
   var tbody=document.getElementById('resTbody');if(!tbody)return;
   var cnt=document.getElementById('res_count');if(cnt)cnt.innerHTML='Показано: <strong>'+rs.length+'</strong>';
+  var canMerge=hasPerm('nesting.create');
   tbody.innerHTML=rs.map(function(r){
     var consumed=!r.active;
     var rowStyle=consumed?'style="opacity:.6"':'';
     var statusCell=consumed
       ?'<span style="font-size:.75em;background:var(--text3);color:#fff;border-radius:3px;padding:1px 6px">✓ Списан</span>'
       :statusBadge(r.order_status);
-    return '<tr '+rowStyle+'><td>'+r.order_display+'</td><td>'+statusCell+'</td><td>'+(r.part_name||'—')+'</td>'+
+    var nestBadge='';
+    if(r.is_nesting_merged){
+      nestBadge=' <span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 5px;font-size:.7em">🧩 '+esc(r.nesting_group_name||'карта')+'</span>';
+    } else if(r.nesting_group_id){
+      nestBadge=' <span style="background:#a78bfa;color:#fff;border-radius:3px;padding:1px 5px;font-size:.7em">в карте «'+esc(r.nesting_group_name||'')+'»</span>';
+    }
+    var cb='';
+    if(canMerge){
+      var dis=r.can_merge?'':' disabled title="Нельзя объединить: уже в карте / списано / сборка / не активен"';
+      cb='<td><input type="checkbox" class="res-merge-cb" data-rid="'+r.id+'" data-mat="'+r.material_id+'"'+dis+'></td>';
+    }
+    return '<tr '+rowStyle+'>'+cb+'<td>'+(r.order_display||'—')+nestBadge+'</td><td>'+statusCell+'</td><td>'+(r.part_name||'—')+(r.is_assembly?' <span style="color:var(--acc);font-size:.7em">сборка</span>':'')+'</td>'+
       '<td>'+r.material+'</td><td>'+(r.material_type||'—')+'</td>'+
       '<td>'+(consumed?'<span class="badge b-gray">Списан</span>':'<span class="badge b-ok">Активный</span>')+'</td>'+
       '<td>'+(r.sheets||'—')+'</td><td>'+(r.consumed_sheets||0)+'</td>'+
@@ -5885,6 +6674,85 @@ function modalEditRes(rid,sheets,kg,note){openModal('<h2>✏ Резерв #'+rid
 function submitEditRes(rid){api('/api/reservations/'+rid+'/edit','POST',{user_id:U.id,sheets:+document.getElementById('fre_sh').value,note:document.getElementById('fre_note').value}).then(function(){
   closeModal();toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function cancelRes(rid){if(!confirm('Снять?'))return;api('/api/reservations/'+rid+'/cancel','POST',{user_id:U.id}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+
+// ═══ КАРТЫ РАСКРОЯ (NESTING) ═══
+function modalNestingMerge(){
+  var boxes=Array.prototype.slice.call(document.querySelectorAll('.res-merge-cb:checked'));
+  if(boxes.length<1){toast('Отметьте резервы галочками','err');return}
+  var rids=boxes.map(function(b){return +b.dataset.rid});
+  var mats=boxes.map(function(b){return +b.dataset.mat});
+  var firstMat=mats[0];
+  if(mats.some(function(m){return m!==firstMat})){
+    toast('Все выбранные резервы должны быть на ОДИН материал','err');return;
+  }
+  // Собираем сводку выбранных резервов
+  var picked=(window._resItems||[]).filter(function(r){return rids.indexOf(r.id)>=0});
+  var sumSh=picked.reduce(function(s,r){return s+(r.remaining_sheets||0)},0);
+  var matName=picked[0]?picked[0].material:'';
+  // Подгружаем типы операций и станки
+  Promise.all([api('/api/op-types').catch(function(){return[]}), api('/api/resources').catch(function(){return[]})]).then(function(arr){
+    var opTypes=arr[0]||[], resources=arr[1]||[];
+    // Оставляем только участки, на которых уже хотя бы 1 ProductionOp у выбранных деталей —
+    // фильтруем на сервере при создании; здесь — все настроенные типы.
+    var opOpts='<option value="">— выберите —</option>'+opTypes.map(function(o){return '<option value="'+esc(o.name)+'">'+esc(o.name)+'</option>'}).join('');
+    var summary=picked.map(function(r){
+      return '<tr><td>'+esc(r.order_display||'')+'</td><td>'+esc(r.part_name||'')+'</td><td>'+(r.remaining_sheets||0)+' л</td></tr>';
+    }).join('');
+    var h='<h2>🧩 Объединить резервы в карту раскроя</h2>'+
+      '<div class="info-box" style="background:rgba(124,58,237,.07);border-color:#7c3aed;margin-bottom:8px">'+
+        '<strong>Материал:</strong> '+esc(matName)+' · <strong>Резервов:</strong> '+picked.length+
+        ' · <strong>Сумма листов:</strong> '+sumSh+' л'+
+      '</div>'+
+      '<div class="tbl-wrap" style="max-height:180px;overflow:auto;margin-bottom:8px"><table>'+
+        '<thead><tr><th>Заказ</th><th>Деталь</th><th>Листов</th></tr></thead>'+
+        '<tbody>'+summary+'</tbody></table></div>'+
+      '<div class="form-row">'+
+        '<div><label>Название карты (не обяз.)</label><input id="fnst_name" placeholder="Карта №..."></div>'+
+        '<div><label>Тип операции (участок) <span style="color:var(--err)">*</span></label><select id="fnst_op">'+opOpts+'</select></div>'+
+      '</div>'+
+      '<div class="form-row">'+
+        '<div><label>Станок (не обяз.)</label><select id="fnst_res"><option value="">— выбирает оператор при списании —</option>'+
+          resources.map(function(r){return '<option value="'+r.id+'" data-ops=\''+JSON.stringify(r.allowed_ops||[]).replace(/\'/g,"&#39;")+'\'>'+esc(r.name)+'</option>'}).join('')+
+        '</select></div>'+
+        '<div><label>Листов на карту (после нестинга) <span style="color:var(--err)">*</span></label>'+
+          '<input type="number" id="fnst_sh" min="1" value="'+sumSh+'">'+
+          '<span style="font-size:.78em;color:var(--text3)">обычно меньше суммы</span></div>'+
+      '</div>'+
+      '<div class="form-row full"><div><label>Примечание</label><input id="fnst_note"></div></div>'+
+      '<div class="info-box" style="background:rgba(245,158,11,.08);font-size:.85em">'+
+        '⚠ Что произойдёт: исходные резервы будут закрыты, индивидуальные операции выбранного типа — удалены, '+
+        'вместо них появится <strong>один</strong> объединённый резерв и <strong>одна</strong> карточная операция. '+
+        'Возврат возможен через «Расформировать» (пока нет списаний).'+
+      '</div>'+
+      '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+      '<button class="btn primary" style="background:#7c3aed;border-color:#7c3aed" onclick="submitNestingMerge('+JSON.stringify(rids).replace(/"/g,'&quot;')+')">🧩 Объединить</button></div>';
+    openModal(h);
+  })}
+
+function submitNestingMerge(rids){
+  var op=(document.getElementById('fnst_op')||{}).value||'';
+  var sh=+(document.getElementById('fnst_sh')||{}).value||0;
+  if(!op){toast('Укажите тип операции','err');return}
+  if(sh<=0){toast('Укажите листов на карту','err');return}
+  api('/api/nesting-groups/create','POST',{
+    user_id:U.id,
+    reservation_ids:rids,
+    operation_type:op,
+    resource_id:+(document.getElementById('fnst_res')||{}).value||null,
+    sheets_planned:sh,
+    name:(document.getElementById('fnst_name')||{}).value||'',
+    note:(document.getElementById('fnst_note')||{}).value||'',
+  }).then(function(g){
+    closeModal();toast('Карта №'+g.id+' создана','ok');refreshPage();
+  }).catch(function(e){toast(e.message,'err')});
+}
+
+function disbandNesting(gid){
+  if(!confirm('Расформировать карту раскроя?\n\nИсходные резервы и индивидуальные операции будут восстановлены.\nДоступно только пока нет списаний.'))return;
+  api('/api/nesting-groups/'+gid+'/disband','POST',{user_id:U.id}).then(function(){
+    toast('Карта расформирована','ok');refreshPage();
+  }).catch(function(e){toast(e.message,'err')});
+}
 
 // ═══ УЧЁТ ДЕТАЛЕЙ ═══
 var _plItems=[],_plFilters={},_plAllOpTypes=[];
