@@ -1397,6 +1397,18 @@ def create_app():
                  "stations": [s.id for s in u.allowed_stations]}
                 for u in db.query(User).order_by(User.username).all()]
 
+    @app.get("/api/users/next-tab-number")
+    def api_next_tab_number(db: Session = Depends(db_dep)):
+        """Возвращает следующий свободный табельный номер (3 цифры с ведущими нулями)."""
+        tabs = [u.tab_number for u in db.query(User.tab_number).all()]
+        max_n = 0
+        for t in tabs:
+            t = (t or "").strip()
+            if t.isdigit():
+                max_n = max(max_n, int(t))
+        next_n = max_n + 1
+        return {"tab_number": str(next_n).zfill(3)}
+
     @app.post("/api/users/save")
     async def api_save_user(request: Request, db: Session = Depends(db_dep)):
         data = await request.json()
@@ -3774,6 +3786,50 @@ def create_app():
     @app.get("/api/logs/actions")
     def api_log_actions(db: Session = Depends(db_dep)):
         return [a[0] for a in db.query(AuditLog.action).distinct().order_by(AuditLog.action).all()]
+
+    @app.post("/api/admin/clear-test-data")
+    async def api_clear_test_data(request: Request, db: Session = Depends(db_dep)):
+        """Очистка тестовых данных: логи, списания, движения материала, сессии операторов, учёт деталей."""
+        from sqlalchemy import text
+        data = await request.json()
+        targets = data.get("targets", [])
+        counts = {}
+
+        if "audit_logs" in targets:
+            cnt = db.query(AuditLog).count()
+            db.query(AuditLog).delete(synchronize_session=False)
+            counts["audit_logs"] = cnt
+
+        if "writeoffs" in targets:
+            cnt = db.query(WriteOff).count()
+            db.query(WriteOff).delete(synchronize_session=False)
+            counts["writeoffs"] = cnt
+
+        if "material_movements" in targets:
+            cnt = db.query(MaterialMovement).count()
+            db.query(MaterialMovement).delete(synchronize_session=False)
+            counts["material_movements"] = cnt
+
+        if "op_sessions" in targets:
+            cnt = db.query(OpSession).count()
+            db.query(OpSession).delete(synchronize_session=False)
+            # Сбрасываем таймеры операций
+            db.query(ProductionOp).update({
+                "status": "Ожидает", "started_at": None, "paused_at": None,
+                "completed_at": None, "actual_minutes": None,
+                "total_pause_minutes": 0
+            }, synchronize_session=False)
+            counts["op_sessions"] = cnt
+
+        if "part_logs" in targets:
+            cnt = db.query(PartStationLog).count()
+            db.query(PartStationLog).delete(synchronize_session=False)
+            # Сбрасываем счётчики деталей на позициях заказов
+            db.query(OrderItem).update({"completed_qty": 0, "rejected_qty": 0}, synchronize_session=False)
+            counts["part_logs"] = cnt
+
+        db.commit()
+        return {"status": "ok", "cleared": counts}
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket):
@@ -6604,12 +6660,48 @@ function pgSettings(c){c.innerHTML='<div class="toolbar">'+
     '<button class="btn '+(setTab==='roles'?'primary':'')+'" onclick="setTab=\'roles\';pgSettings(document.getElementById(\'mainContent\'))">🛡 Роли</button>'+
     '<button class="btn '+(setTab==='grades'?'primary':'')+'" onclick="setTab=\'grades\';pgSettings(document.getElementById(\'mainContent\'))">🔬 Марки</button>'+
     '<button class="btn '+(setTab==='categories'?'primary':'')+'" onclick="setTab=\'categories\';pgSettings(document.getElementById(\'mainContent\'))">📂 Категории</button>'+
-    '<button class="btn '+(setTab==='op_types'?'primary':'')+'" onclick="setTab=\'op_types\';pgSettings(document.getElementById(\'mainContent\'))">🔧 Типы операций</button></div>'+
+    '<button class="btn '+(setTab==='op_types'?'primary':'')+'" onclick="setTab=\'op_types\';pgSettings(document.getElementById(\'mainContent\'))">🔧 Типы операций</button>'+
+    (U&&U.role==='admin'?'<button class="btn" style="margin-left:auto;background:var(--err);border-color:var(--err);color:#fff" onclick="modalClearTestData()">🗑 Очистить тестовые данные</button>':'')+
+  '</div>'+
   '<div id="setContent"></div>';var sc=document.getElementById('setContent');
   switch(setTab){case'users':setUsers(sc);break;case'roles':setRoles(sc);break;case'grades':setGrades(sc);break;
     case'categories':setCategories(sc);break;case'op_types':setOpTypes(sc);break}}
 
-var _TRANSLIT={'А':'A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'Yo','Ж':'Zh','З':'Z','И':'I','Й':'J','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya','а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'};
+function modalClearTestData(){
+  openModal('<h2>🗑 Очистить тестовые данные</h2>'+
+  '<div class="info-box" style="background:rgba(239,68,68,.1);border-color:var(--err);margin-bottom:12px">'+
+    '⚠ <strong>Внимание!</strong> Выбранные данные будут удалены безвозвратно. После очистки систему можно использовать в боевом режиме.'+
+  '</div>'+
+  '<div style="display:flex;flex-direction:column;gap:10px;margin-bottom:16px">'+
+    '<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer"><input type="checkbox" id="cl_audit" checked style="margin-top:3px"><div><strong>Логи (аудит)</strong><div style="font-size:.8em;color:var(--text3)">Все записи о действиях пользователей</div></div></label>'+
+    '<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer"><input type="checkbox" id="cl_wo" checked style="margin-top:3px"><div><strong>Списания</strong><div style="font-size:.8em;color:var(--text3)">Все записи о списании материалов и деталей</div></div></label>'+
+    '<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer"><input type="checkbox" id="cl_mov" checked style="margin-top:3px"><div><strong>Движения материала</strong><div style="font-size:.8em;color:var(--text3)">История поступлений, корректировок и возвратов</div></div></label>'+
+    '<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer"><input type="checkbox" id="cl_sess" checked style="margin-top:3px"><div><strong>Сессии операторов + сброс операций</strong><div style="font-size:.8em;color:var(--text3)">Все таймеры и статусы операций сбросятся в «Ожидает»</div></div></label>'+
+    '<label style="display:flex;align-items:flex-start;gap:10px;cursor:pointer"><input type="checkbox" id="cl_parts" checked style="margin-top:3px"><div><strong>Учёт деталей (PartLog)</strong><div style="font-size:.8em;color:var(--text3)">Записи об изготовленных деталях, счётчики «Готово» обнулятся</div></div></label>'+
+  '</div>'+
+  '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
+  '<button class="btn" style="background:var(--err);border-color:var(--err);color:#fff" onclick="execClearTestData()">🗑 Очистить выбранное</button></div>');}
+
+function execClearTestData(){
+  var targets=[];
+  if(document.getElementById('cl_audit').checked) targets.push('audit_logs');
+  if(document.getElementById('cl_wo').checked) targets.push('writeoffs');
+  if(document.getElementById('cl_mov').checked) targets.push('material_movements');
+  if(document.getElementById('cl_sess').checked) targets.push('op_sessions');
+  if(document.getElementById('cl_parts').checked) targets.push('part_logs');
+  if(!targets.length){toast('Ничего не выбрано','err');return;}
+  if(!confirm('ПОСЛЕДНЕЕ ПРЕДУПРЕЖДЕНИЕ!\n\nВыбранные данные будут удалены безвозвратно.\n\nПродолжить?'))return;
+  api('/api/admin/clear-test-data','POST',{targets:targets}).then(function(r){
+    closeModal();
+    var lines=Object.entries(r.cleared).map(function(e){
+      var names={'audit_logs':'Логи','writeoffs':'Списания','material_movements':'Движения мат.','op_sessions':'Сессии/Операции','part_logs':'Учёт деталей'};
+      return (names[e[0]]||e[0])+': '+e[1]+' записей';
+    });
+    toast('Очищено:\n'+lines.join('\n'),'ok');
+    setTimeout(function(){refreshPage()},1200);
+  }).catch(function(e){toast(e.message,'err')});}
+
+var _TRANSLIT='A','Б':'B','В':'V','Г':'G','Д':'D','Е':'E','Ё':'Yo','Ж':'Zh','З':'Z','И':'I','Й':'J','К':'K','Л':'L','М':'M','Н':'N','О':'O','П':'P','Р':'R','С':'S','Т':'T','У':'U','Ф':'F','Х':'H','Ц':'C','Ч':'Ch','Ш':'Sh','Щ':'Sch','Ъ':'','Ы':'Y','Ь':'','Э':'E','Ю':'Yu','Я':'Ya','а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'yo','ж':'zh','з':'z','и':'i','й':'j','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'c','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'};
 function _translit(s){return s.split('').map(function(c){return _TRANSLIT[c]!==undefined?_TRANSLIT[c]:c}).join('');}
 function genLoginPwd(){
   var fn=document.getElementById('fu_n').value.trim();
@@ -6650,8 +6742,8 @@ function impersonateUser(uid,name){
     else toast('Открыта новая вкладка под '+name,'ok');
   }).catch(function(e){toast(e.message,'err')})}
 
-function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles')]).then(function(arr){
-  var resources=arr[0],roles=arr[1];
+function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles'),uid?Promise.resolve(null):api('/api/users/next-tab-number')]).then(function(arr){
+  var resources=arr[0],roles=arr[1],nextTab=arr[2]?arr[2].tab_number:'';
   var isAdm=hasPerm('admin.users');
   var p1=uid?api('/api/users'):Promise.resolve(null);p1.then(function(us){var u=us?us.find(function(x){return x.id===uid}):null;
   var uSt=u?u.stations:[];var roleOpts=roles.map(function(r){return{v:r.role,t:r.display_name+' ('+r.role+')'}});
@@ -6667,7 +6759,7 @@ function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles')]).t
       '<button type="button" class="btn sm" onclick="genLoginPwd()" title="Авто-генерация по ФИО">⚡</button>'+
     '</div>'+pwHint+'</div></div>'+
   '<div class="form-row"><div><label>ФИО</label><input id="fu_n" value="'+(u?esc(u.full_name):'')+'" placeholder="Кузнецов Илья"></div>'+
-    '<div><label>Таб.№</label><input id="fu_t" value="'+(u?esc(u.tab_number||''):'')+'"></div></div>'+
+    '<div><label>Таб.№</label><input id="fu_t" value="'+(u?esc(u.tab_number||''):nextTab)+'" placeholder="'+nextTab+'"></div></div>'+
   (!u?'<div style="margin:-4px 0 10px"><span style="font-size:.78em;color:var(--text3)">⚡ — авто-генерация логина и пароля по ФИО (введите ФИО ниже)</span></div>':'')+
   '<div class="form-row"><div><label>Роль</label>'+SS('fu_r',roleOpts,u?u.role:'operator','Роль')+'</div>'+
     '<div><label>Активен</label><select id="fu_a"><option value="true" '+(!u||u.is_active?'selected':'')+'>Да</option><option value="false" '+(u&&!u.is_active?'selected':'')+'>Нет</option></select></div></div>'+
