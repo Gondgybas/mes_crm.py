@@ -1393,6 +1393,7 @@ def create_app():
         return [{"id": u.id, "username": u.username, "full_name": u.full_name,
                  "role": u.role, "role_label": ROLE_LABELS.get(u.role, u.role),
                  "is_active": u.is_active, "tab_number": u.tab_number,
+                 "password_plain": u.password_plain or "",
                  "stations": [s.id for s in u.allowed_stations]}
                 for u in db.query(User).order_by(User.username).all()]
 
@@ -3337,17 +3338,23 @@ def create_app():
     def api_dashboard_detail(widget: str, db: Session = Depends(db_dep)):
         n = now_msk(); today = n.replace(hour=0, minute=0, second=0)
         if widget == "orders_active":
-            return [{"number": o.order_number, "customer": o.customer.name if o.customer else "—",
-                     "status": o.status, "deadline": o.deadline.isoformat() if o.deadline else None, "overdue": o.is_overdue}
+            return [{"номер": o.order_number,
+                     "описание": o.description or "",
+                     "заказчик": o.customer.name if o.customer else "—",
+                     "статус": o.status, "дедлайн": o.deadline.isoformat() if o.deadline else None, "просрочен": o.is_overdue}
                     for o in db.query(Order).options(joinedload(Order.customer)).filter(Order.status.in_(["Новый", "Ожидает", "В работе"])).all()]
         elif widget == "orders_overdue":
-            return [{"number": o.order_number, "customer": o.customer.name if o.customer else "—",
-                     "status": o.status, "deadline": o.deadline.isoformat() if o.deadline else None}
+            return [{"номер": o.order_number,
+                     "описание": o.description or "",
+                     "заказчик": o.customer.name if o.customer else "—",
+                     "статус": o.status, "дедлайн": o.deadline.isoformat() if o.deadline else None}
                     for o in db.query(Order).options(joinedload(Order.customer)).filter(Order.deadline < n, Order.status.notin_(["Завершён", "Отменён", "Отгружен"])).all()]
         elif widget == "ops_in_progress":
-            return [{"order": o.order.order_number if o.order else "", "type": o.operation_type,
-                     "resource": o.resource.name if o.resource else "—"}
-                    for o in db.query(ProductionOp).options(joinedload(ProductionOp.order), joinedload(ProductionOp.resource)).filter(ProductionOp.status == "В работе").all()]
+            return [{"заказ": (o.order.order_number + (" / " + o.order.description[:40] if o.order.description else "")) if o.order else "",
+                     "заказчик": o.order.customer.name if o.order and o.order.customer else "—",
+                     "тип": o.operation_type,
+                     "станок": o.resource.name if o.resource else "—"}
+                    for o in db.query(ProductionOp).options(joinedload(ProductionOp.order).joinedload(Order.customer), joinedload(ProductionOp.resource)).filter(ProductionOp.status == "В работе").all()]
         elif widget == "low_stock":
             return [{"name": m.name, "available": m.available_sheets, "min": m.min_stock_sheets}
                     for m in db.query(Material).filter(Material.material_type == "Лист",
@@ -3452,44 +3459,42 @@ def create_app():
         order = db.query(Order).get(oid)
         if not order: raise HTTPException(404)
         ops = db.query(ProductionOp).options(joinedload(ProductionOp.resource)).filter(ProductionOp.order_id == oid).order_by(ProductionOp.sequence).all()
-        n = now_msk(); by_resource = {}; first_start = None; last_complete = None
+        n = now_msk(); by_op_type = {}; first_start = None; last_complete = None
         for op in ops:
-            rn = op.resource.name if op.resource else "Не назначен"
-            shift_h = op.resource.shift_hours if op.resource else 8
-            if rn not in by_resource:
-                by_resource[rn] = {"work_min": 0, "pause_min": 0, "estimated_min": 0, "completed": 0, "total": 0, "shift_hours": shift_h}
-            by_resource[rn]["total"] += 1; by_resource[rn]["estimated_min"] += op.estimated_minutes
+            otn = op.operation_type or "Без типа"
+            if otn not in by_op_type:
+                by_op_type[otn] = {"work_min": 0, "estimated_min": 0, "completed": 0, "total": 0}
+            by_op_type[otn]["total"] += 1
+            by_op_type[otn]["estimated_min"] += op.estimated_minutes or 0
             if op.status == "Пауза":
                 if op.started_at and op.paused_at:
                     elapsed = int((op.paused_at - op.started_at).total_seconds() / 60)
-                    by_resource[rn]["work_min"] += elapsed - (op.total_pause_minutes or 0)
+                    by_op_type[otn]["work_min"] += elapsed - (op.total_pause_minutes or 0)
             elif op.status == "Завершена" and op.actual_minutes is not None:
-                by_resource[rn]["work_min"] += op.actual_minutes; by_resource[rn]["completed"] += 1
+                by_op_type[otn]["work_min"] += op.actual_minutes; by_op_type[otn]["completed"] += 1
             elif op.status == "В работе" and op.started_at:
                 elapsed = int((n - op.started_at).total_seconds() / 60)
-                by_resource[rn]["work_min"] += elapsed - (op.total_pause_minutes or 0)
+                by_op_type[otn]["work_min"] += elapsed - (op.total_pause_minutes or 0)
             if op.started_at:
                 if first_start is None or op.started_at < first_start: first_start = op.started_at
             if op.completed_at:
                 if last_complete is None or op.completed_at > last_complete: last_complete = op.completed_at
         end_time = order.completed_at or n
         total_elapsed_min = int((end_time - first_start).total_seconds() / 60) if first_start else 0
-        resources_stats = []
-        for rn, data in by_resource.items():
-            shift_min = data["shift_hours"] * 60
-            shifts = round(data["work_min"] / shift_min, 2) if shift_min > 0 else 0
-            resources_stats.append({"resource": rn, "work_hours": round(data["work_min"] / 60, 2),
-                                    "work_shifts": shifts, "estimated_hours": round(data["estimated_min"] / 60, 2),
-                                    "completed_ops": data["completed"], "total_ops": data["total"],
-                                    "shift_hours": data["shift_hours"]})
-        return {"order_number": order.order_number, "customer": order.customer.name if order.customer else "—",
+        op_types_stats = [{"op_type": otn, "work_hours": round(data["work_min"] / 60, 2),
+                           "estimated_hours": round(data["estimated_min"] / 60, 2),
+                           "completed_ops": data["completed"], "total_ops": data["total"]}
+                          for otn, data in by_op_type.items()]
+        return {"order_number": order.order_number,
+                "description": order.description or "",
+                "customer": order.customer.name if order.customer else "—",
                 "status": order.status,
                 "first_start": first_start.isoformat() if first_start else None,
                 "last_complete": last_complete.isoformat() if last_complete else None,
                 "order_completed": order.completed_at.isoformat() if order.completed_at else None,
                 "total_elapsed_hours": round(total_elapsed_min / 60, 2),
                 "total_elapsed_shifts": round(total_elapsed_min / 480, 2),
-                "resources": resources_stats}
+                "resources": op_types_stats}
 
     @app.get("/api/reports/customers")
     def api_report_customers(date_from: str = "", date_to: str = "", customer_id: int = 0, db: Session = Depends(db_dep)):
@@ -4311,15 +4316,16 @@ function saveOrder(oid){var dl=document.getElementById('f_dl').value;
 
 function modalOrderStats(oid){
   api('/api/orders/'+oid+'/stats').then(function(st){
-  var h='<h2>📈 Статистика: '+st.order_number+'</h2>'+
-  '<div class="info-box"><strong>'+st.customer+'</strong> | '+statusBadge(st.status)+
+  var orderTitle=st.customer+' — '+st.order_number+(st.description?' / '+esc(st.description):'');
+  var h='<h2>📈 Статистика: '+orderTitle+'</h2>'+
+  '<div class="info-box">'+statusBadge(st.status)+
     (st.first_start?' | Начало: '+fmtDT(st.first_start):'')+
     (st.order_completed?' | Завершён: '+fmtDT(st.order_completed):'')+'</div>'+
   '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin-bottom:16px">'+
     '<div class="stat-card"><div class="stat-label">Общее время</div><div class="stat-val">'+st.total_elapsed_hours+' ч</div><div style="font-size:.8em;color:var(--text3)">'+st.total_elapsed_shifts+' смен</div></div></div>'+
-  '<div class="section-hdr">По участкам</div>'+
-  '<div class="tbl-wrap"><table><thead><tr><th>Участок</th><th>Работа (ч)</th><th>Смен</th><th>План (ч)</th><th>Смена</th><th>Операций</th></tr></thead>'+
-  '<tbody>'+st.resources.map(function(r){return '<tr><td><strong>'+r.resource+'</strong></td><td>'+r.work_hours+'</td><td>'+r.work_shifts+'</td><td>'+r.estimated_hours+'</td><td>'+r.shift_hours+'ч</td><td>'+r.completed_ops+'/'+r.total_ops+'</td></tr>'}).join('')+'</tbody></table></div>'+
+  '<div class="section-hdr">По типам операций</div>'+
+  '<div class="tbl-wrap"><table><thead><tr><th>Тип операции</th><th>Факт (ч)</th><th>План (ч)</th><th>Операций</th></tr></thead>'+
+  '<tbody>'+st.resources.map(function(r){return '<tr><td><strong>'+esc(r.op_type)+'</strong></td><td>'+r.work_hours+'</td><td>'+r.estimated_hours+'</td><td>'+r.completed_ops+'/'+r.total_ops+'</td></tr>'}).join('')+'</tbody></table></div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Закрыть</button></div>';
   openModal(h)}).catch(function(e){toast(e.message,'err')})}
 
@@ -4334,7 +4340,7 @@ function modalOrderDetail(oid){
       var ao=r.allowed_ops||[];return ao.length===0||ao.indexOf(opType)>=0});
     return [{v:'',t:'— не назначен —'}].concat(filtered.map(function(r){return{v:String(r.id),t:r.name}}));
   }
-  openModal('<h2>📋 '+o.number+' — '+o.customer+'</h2>'+
+  openModal('<h2>📋 '+o.customer+' — '+o.number+(o.description?' / '+esc(o.description.substring(0,50)):'')+' </h2>'+
   '<div class="info-box">'+statusBadge(o.priority)+' '+statusBadge(o.status)+shipBadge(o.ship_status)+(o.overdue?' <span class="low">⚠ ПРОСРОЧЕН</span>':'')+' | Дедлайн: '+fmtD(o.deadline)+' | Сумма: '+fmtMoney(o.total_amount)+
     (o.completed_at?' | <strong>Завершён:</strong> '+fmtDT(o.completed_at):'')+
     '<br>'+(o.description||'')+'</div>'+
