@@ -2907,6 +2907,14 @@ def create_app():
                 prev_op_map[o.id] = group_sorted[i - 1] if i > 0 else None
         # Вычисляем available_kits для первой сборочной операции (component_template_id IS NULL, нет prev_op)
         # available_kits = min(floor(last_comp_op.completed_qty / ac.quantity)) по всем компонентам
+        # Если у компонента все индивидуальные op'ы поглощены картой раскроя —
+        # берём fallback из NestingGroupItem.qty_completed.
+        def _ng_done_for_component(order_item_id, component_id):
+            row = db.query(func.coalesce(func.sum(NestingGroupItem.qty_completed), 0)).filter(
+                NestingGroupItem.order_item_id == order_item_id,
+                NestingGroupItem.component_template_id == component_id,
+            ).scalar()
+            return int(row or 0)
         available_kits_map = {}  # op.id -> int
         for o in ops_list:
             if o.component_template_id is not None: continue       # только сборочный уровень
@@ -2919,10 +2927,17 @@ def create_app():
             kits = None
             for ac in components:
                 comp_grp = op_groups.get((o.order_item_id, ac.component_id), [])
-                if not comp_grp:
-                    kits = 0; break
-                last_comp = sorted(comp_grp, key=lambda x: (x.sequence or 0, x.sort_order or 0))[-1]
-                avail = last_comp.completed_qty or 0
+                if comp_grp:
+                    last_comp = sorted(comp_grp, key=lambda x: (x.sequence or 0, x.sort_order or 0))[-1]
+                    avail = last_comp.completed_qty or 0
+                else:
+                    # Все op'ы компонента поглощены картой раскроя — берём из NGI
+                    avail = _ng_done_for_component(o.order_item_id, ac.component_id)
+                # Если в обычной цепочке всё на нуле, но карта уже что-то выдала — учтём
+                if comp_grp and avail == 0:
+                    ng_avail = _ng_done_for_component(o.order_item_id, ac.component_id)
+                    if ng_avail > 0:
+                        avail = ng_avail
                 qty_per = ac.quantity or 1
                 ck = avail // qty_per
                 if kits is None or ck < kits: kits = ck
@@ -3492,7 +3507,19 @@ def create_app():
                 if op.component_template_id is None:
                     last_asm_op_type = op.operation_type or ""
                     break
-            # Факт = только логи последней сборочной операции
+            is_asm = it.part_template.is_assembly if it.part_template else False
+            # Для не-сборок: если есть нестинговые списания (в act_dict), их тоже учитываем.
+            # Берём ключ (None, op_type) с наибольшим суммарным good из act_dict —
+            # это и будет «последний» этап для простой детали.
+            if not is_asm and last_asm_op_type is None:
+                # Нет ProductionOp вообще — ищем в act_dict
+                best_key = None; best_good = 0
+                for (cid, op_t), v in act_dict.items():
+                    if cid is None and v["good"] > best_good:
+                        best_good = v["good"]; best_key = op_t
+                last_asm_op_type = best_key
+
+            # Факт = только логи последней операции (работает и для сборок, и для деталей)
             if last_asm_op_type is not None:
                 last_key = (None, last_asm_op_type)
                 last_actual = act_dict.get(last_key, {"good": 0, "rejected": 0})
@@ -3504,11 +3531,16 @@ def create_app():
                 final_rej  = asm_rej
 
             # Пересорт: для сборок — с последней операции; для деталей — с первого участка
-            is_asm = it.part_template.is_assembly if it.part_template else False
             if is_asm:
                 surplus = max(0, final_good - it.quantity)
             else:
-                surplus = max(0, first_res_good - it.quantity) if first_res_id else max(0, it.completed_qty - it.quantity)
+                # Если нет first_res_id (чисто нестинговые детали) — берём суммарный факт из логов
+                if first_res_id:
+                    surplus = max(0, first_res_good - it.quantity)
+                elif final_good > 0:
+                    surplus = max(0, final_good - it.quantity)
+                else:
+                    surplus = max(0, it.completed_qty - it.quantity)
 
             planned_ops = []
             for idx, op in enumerate(ops_q):
@@ -3524,10 +3556,22 @@ def create_app():
                         kits2 = None
                         for ac2 in components_list:
                             comp_grp2 = comp_op_groups.get(ac2.component_id, [])
-                            if not comp_grp2:
-                                kits2 = 0; break
-                            last_c = comp_grp2[-1]  # ops_q уже отсортирован, группы в порядке
-                            av2 = last_c.completed_qty or 0
+                            if comp_grp2:
+                                last_c = comp_grp2[-1]
+                                av2 = last_c.completed_qty or 0
+                                # fallback на NestingGroupItem если op даёт 0
+                                if av2 == 0:
+                                    ng_av2 = db.query(func.coalesce(func.sum(NestingGroupItem.qty_completed), 0)).filter(
+                                        NestingGroupItem.order_item_id == it.id,
+                                        NestingGroupItem.component_template_id == ac2.component_id,
+                                    ).scalar() or 0
+                                    if ng_av2 > 0: av2 = ng_av2
+                            else:
+                                # Все op компонента поглощены картой — берём из NGI
+                                av2 = db.query(func.coalesce(func.sum(NestingGroupItem.qty_completed), 0)).filter(
+                                    NestingGroupItem.order_item_id == it.id,
+                                    NestingGroupItem.component_template_id == ac2.component_id,
+                                ).scalar() or 0
                             qpk2 = ac2.quantity or 1
                             ck2 = av2 // qpk2
                             if kits2 is None or ck2 < kits2: kits2 = ck2
@@ -3548,7 +3592,79 @@ def create_app():
                     "available_input": prev_op2.completed_qty if prev_op2 is not None else None,
                     "prev_op_type": prev_op2.operation_type if prev_op2 is not None else None,
                     # Готовые комплекты (для первой сборочной операции)
-                    "available_kits": available_kits_val
+                    "available_kits": available_kits_val,
+                    "is_nesting": False,
+                })
+            # ── Синтетические строки для нестинговых операций ──
+            # Индивидуальные ProductionOp удалены при создании карты, но списания
+            # отражаются в PartStationLog. Добавляем строки на основании NestingGroupItem
+            # (или act_dict для исторических нестинговых списаний без живой карты).
+            matched_keys = {(p["component_id"], p["op_type"]) for p in planned_ops}
+            ng_items_for_it = db.query(NestingGroupItem).options(
+                joinedload(NestingGroupItem.group).joinedload(NestingGroup.resource),
+                joinedload(NestingGroupItem.part_template),
+            ).filter(NestingGroupItem.order_item_id == it.id).all()
+            for ngi in ng_items_for_it:
+                grp = ngi.group
+                if not grp: continue
+                op_t = grp.operation_type or ""
+                key = (ngi.component_template_id, op_t)
+                if key in matched_keys: continue
+                matched_keys.add(key)
+                actual = act_dict.get(key, {"good": ngi.qty_completed or 0,
+                                            "rejected": ngi.qty_rejected or 0})
+                comp_name = pt_display(ngi.component_template) if ngi.component_template else None
+                if not comp_name and ngi.part_template_id:
+                    # Для не-сборочных позиций component_id=NULL, имя — из part_template
+                    pass
+                rn = grp.resource.name if grp.resource else "—"
+                planned_ops.append({
+                    "seq": 0,
+                    "op_type": op_t,
+                    "resource": rn,
+                    "resource_id": grp.resource_id,
+                    "planned_qty": ngi.qty_planned or 0,
+                    "completed_qty": actual["good"],
+                    "rejected_qty": actual["rejected"],
+                    "status": "Активна" if grp.status == "Активна" else grp.status,
+                    "component_name": comp_name,
+                    "component_id": ngi.component_template_id,
+                    "actual_resources": act_res_dict.get(key, []),
+                    "available_input": None,
+                    "prev_op_type": None,
+                    "available_kits": None,
+                    "is_nesting": True,
+                    "nesting_group_id": grp.id,
+                    "nesting_group_name": grp.name,
+                })
+            # Также подбираем «осиротевшие» ключи act_dict (списано на тип, для которого
+            # уже нет ни ProductionOp, ни NestingGroupItem — например, карта расформирована).
+            for (comp_id, op_type), counts in act_dict.items():
+                if not op_type: continue
+                if (comp_id, op_type) in matched_keys: continue
+                if (counts["good"] or 0) == 0 and (counts["rejected"] or 0) == 0: continue
+                matched_keys.add((comp_id, op_type))
+                comp_name = None
+                if comp_id and is_asm and it.part_template:
+                    for ac in (it.part_template.components or []):
+                        if ac.component_id == comp_id and ac.component:
+                            comp_name = pt_display(ac.component); break
+                planned_ops.append({
+                    "seq": 0,
+                    "op_type": op_type,
+                    "resource": "—",
+                    "resource_id": None,
+                    "planned_qty": (counts["good"] or 0) + (counts["rejected"] or 0),
+                    "completed_qty": counts["good"] or 0,
+                    "rejected_qty": counts["rejected"] or 0,
+                    "status": "Архив",
+                    "component_name": comp_name,
+                    "component_id": comp_id,
+                    "actual_resources": act_res_dict.get((comp_id, op_type), []),
+                    "available_input": None,
+                    "prev_op_type": None,
+                    "available_kits": None,
+                    "is_nesting": True,
                 })
             result.append({
                 "item_id": it.id, "order_id": it.order_id,
@@ -3564,8 +3680,9 @@ def create_app():
                                for ac in sorted(it.part_template.components or [], key=lambda x: x.sort_order)] if is_asm else [],
                 "quantity": it.quantity,
                 # completed/rejected для строки: «Факт» = выход с последней операции
-                "completed": final_good if is_asm else it.completed_qty,
-                "rejected": final_rej if is_asm else it.rejected_qty,
+                # (работает и для обычных деталей, и для сборок, и для нестинга)
+                "completed": final_good if (is_asm or final_good > 0) else it.completed_qty,
+                "rejected": final_rej if (is_asm or final_good > 0) else it.rejected_qty,
                 "surplus": surplus,
                 "by_resource": by_res,
                 "planned_ops": planned_ops})
@@ -4719,6 +4836,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .op-cell-active{background:rgba(251,191,36,.15)!important;color:var(--warn)}
 .op-cell-partial{background:rgba(59,130,246,.13)!important;color:var(--info)}
 .op-cell-wait{background:var(--bg);color:var(--text3)}
+.op-cell-nesting{background:rgba(124,58,237,.09)!important;color:#7c3aed}
 /* Пустая строка-разделитель между заказами: без фона и без рамок */
 .parts-matrix tr.pm-gap td{background:var(--bg)!important;border:0!important;padding:0!important;height:14px;line-height:0;font-size:0}
 
@@ -6942,6 +7060,7 @@ function renderPartsMatrix(data,allOpTypes){
 }
 
 function plOpClass(op){
+  if(op.is_nesting)return 'op-cell-nesting';
   if(op.status==='Завершена')return 'op-cell-done';
   if(op.status==='В работе')return 'op-cell-active';
   if(op.status==='Частично')return 'op-cell-partial';
@@ -6950,6 +7069,10 @@ function plOpClass(op){
 
 function plOpCell(op){
   var h='';
+  // Нестинговая операция — показываем бейдж карты
+  if(op.is_nesting){
+    h+='<div style="font-size:.7em;background:#7c3aed;color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-bottom:2px">🧩 '+(op.nesting_group_name||'Карта')+'</div>';
+  }
   var isOver=op.planned_qty>0&&op.completed_qty>op.planned_qty;
   // Строка с источником: комплекты (сборочная) или детали с предыдущего участка
   if(op.available_kits!=null){
