@@ -5808,27 +5808,31 @@ function _plRenderMatrix(){
   tblUpdateBtns('pl');
 }
 
-function pgPartsLog(c){api('/api/part-station-logs?active_only=0').then(function(data){
+function pgPartsLog(c){Promise.all([api('/api/part-station-logs?active_only=0'),api('/api/op-types')]).then(function(arr){
+  var data=arr[0],opTypes=arr[1]||[];
   _plItems=data;window._plItems=_plItems;window._plFilters=_plFilters;
 
   var surplusItems=data.filter(function(d){return d.surplus>0});
   var totalSurplus=surplusItems.reduce(function(s,d){return s+d.surplus},0);
 
-  // Типы операций: компонентные — слева, сборочные/одиночные — справа
-  var compOpSeq={},asmOpSeq={};
+  // Глобальный порядок участков из OperationTypeCfg.sort_order
+  var globalOrder={};
+  opTypes.forEach(function(o,i){globalOrder[o.name]=(o.sort_order!=null?o.sort_order:i);});
+
+  // Собираем все типы операций, встречающиеся в данных
+  var seenTypes={};
   data.forEach(function(d){
-    (d.planned_ops||[]).forEach(function(op){
-      if(!op.op_type) return;
-      if(op.component_id!=null){
-        if(!(op.op_type in compOpSeq)||op.seq<compOpSeq[op.op_type]) compOpSeq[op.op_type]=op.seq;
-      } else {
-        if(!(op.op_type in asmOpSeq)||op.seq<asmOpSeq[op.op_type]) asmOpSeq[op.op_type]=op.seq;
-      }
-    });
+    (d.planned_ops||[]).forEach(function(op){if(op.op_type) seenTypes[op.op_type]=true;});
   });
-  var compTypes=Object.keys(compOpSeq).sort(function(a,b){return compOpSeq[a]-compOpSeq[b]});
-  var asmOnlyTypes=Object.keys(asmOpSeq).filter(function(t){return !(t in compOpSeq)}).sort(function(a,b){return asmOpSeq[a]-asmOpSeq[b]});
-  _plAllOpTypes=compTypes.concat(asmOnlyTypes);
+  var allTypes=Object.keys(seenTypes);
+  // Сортируем по глобальному sort_order, неизвестные — в конец, по алфавиту
+  allTypes.sort(function(a,b){
+    var sa=(a in globalOrder)?globalOrder[a]:1e9;
+    var sb=(b in globalOrder)?globalOrder[b]:1e9;
+    if(sa!==sb)return sa-sb;
+    return a.localeCompare(b);
+  });
+  _plAllOpTypes=allTypes;
 
   var bannerHtml='';
   if(totalSurplus>0){
