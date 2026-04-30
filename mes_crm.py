@@ -6566,13 +6566,14 @@ function modalRes(rid){api('/api/op-types').then(function(opTypes){
   var curOps=r?r.allowed_ops:[];
   // Показываем все активные типы операций; is_active может быть 1/true/null
   var activeOps=opTypes.filter(function(o){return o.is_active!==false&&o.is_active!==0});
-  var RES_TYPES=['Лазерный станок','Плазменный станок','Координатно-пробивной','Листогиб','Сверлильный','Фрезерный','Токарный','Сварочный пост','Сборочный пост','Покрасочная камера','Финишный участок','ОТК'];
-  // Добавляем тип станка из БД если не входит в список (пользовательские)
+  // Тип станка — берём только из настроек (Типы операций), никакого жёсткого списка
+  var RES_TYPES=opTypes.map(function(ot){return ot.name;});
+  // Если у редактируемого станка тип не входит в список — добавляем (для совместимости)
   if(r&&r.type&&RES_TYPES.indexOf(r.type)<0)RES_TYPES.push(r.type);
   var typeOpts=RES_TYPES.map(function(t){return{v:t,t:t}});
   openModal('<h2>'+(r?'✏':'+')+' Станок</h2>'+
   '<div class="form-row"><div><label>Название</label><input id="frs_name" value="'+(r?r.name:'')+'"></div><div><label>Код</label><input id="frs_code" value="'+(r?r.code:'')+'"></div></div>'+
-  '<div class="form-row"><div><label>Тип</label>'+SS('frs_type',typeOpts,r?r.type:RES_TYPES[0],'Тип')+'</div>'+
+  '<div class="form-row"><div><label>Тип</label>'+SS('frs_type',typeOpts,r?r.type:(RES_TYPES[0]||''),'Тип')+'</div>'+
     '<div><label>Доступен</label><select id="frs_av"><option value="true" '+(!r||r.available?'selected':'')+'>Да</option><option value="false" '+(r&&!r.available?'selected':'')+'>Нет</option></select></div></div>'+
   '<div class="form-row"><div><label>Смена (ч)</label><input type="number" id="frs_sh" step="0.5" value="'+(r?r.shift_hours:8)+'"></div>'+
     '<div><label>Смен/сутки</label><input type="number" id="frs_shd" min="1" value="'+(r?r.shifts_per_day:1)+'"></div></div>'+
