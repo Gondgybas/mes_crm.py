@@ -4840,7 +4840,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75em;font-weight:600}
 .badge.b-ok{background:#10b98120;color:#10b981}.badge.b-warn{background:#f59e0b20;color:#f59e0b}
 .badge.b-err{background:#ef444420;color:#ef4444}.badge.b-info{background:#3b82f620;color:#3b82f6}
-.badge.b-gray{background:#6b728020;color:#6b7280}.badge.b-purple{background:#8b5cf620;color:#8b5cf6}
+.badge.b-gray{background:#6b728020;color:#6b7280}.badge.b-purple{background:#64748b20;color:#64748b}
 .toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap;align-items:center}
 .toolbar .spacer{flex:1}
 .modal-bg{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.6);display:none;z-index:200;justify-content:center;align-items:flex-start;padding-top:4vh;overflow-y:auto}
@@ -4953,7 +4953,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .op-cell-active{color:var(--warn)}
 .op-cell-partial{color:var(--info)}
 .op-cell-wait{color:var(--text3)}
-.op-cell-nesting{color:#7c3aed}
+.op-cell-nesting{color:#64748b}
 /* Пустая строка-разделитель между заказами: без фона и без рамок */
 .parts-matrix tr.pm-gap td{background:var(--bg)!important;border:0!important;padding:0!important;height:14px;line-height:0;font-size:0}
 
@@ -6258,13 +6258,13 @@ function pgOperations(c){
         return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)"'+(o.status==='Завершена'?' style="opacity:.55"':'')+'>'+
           '<td style="cursor:grab">☰</td>'+
           '<td style="font-size:.85em">'+(o.nesting_group_id
-            ?'<div><span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 Карта</span>'+
+            ?'<div><span style="background:#64748b;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 Карта</span>'+
               '<div style="font-size:.78em;color:var(--text2);margin-top:3px;line-height:1.3">'+
                 ((o.nesting_orders||[]).map(function(no){return esc(no.order_display)}).join('<br>')||'—')+
               '</div></div>'
             :(o.order_display||o.order_number))+'</td>'+
           '<td>'+(o.nesting_group_id
-            ?'<div><strong style="color:#7c3aed">🧩 '+esc(o.nesting_group_name||'Карта раскроя')+'</strong>'+
+            ?'<div><strong style="color:#64748b">🧩 '+esc(o.nesting_group_name||'Карта раскроя')+'</strong>'+
                 '<div style="font-size:.72em;color:var(--text3)">'+(o.nesting_items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(' · ')+'</div></div>'
             :(o.component_name
             ?'<div>'+
@@ -6617,7 +6617,7 @@ function modalNestingWriteoff(opid){
     var ordList=(d.items||[]).reduce(function(acc,it){if(it.order_display&&acc.indexOf(it.order_display)<0)acc.push(it.order_display);return acc},[]);
 
     var h='<h2>📤 Списание с карты раскроя: '+esc(d.name||'')+'</h2>'+
-      '<div class="info-box" style="background:rgba(124,58,237,.08);border-color:#7c3aed;margin-bottom:6px">'+
+      '<div class="info-box" style="background:rgba(100,116,139,.08);border-color:#64748b;margin-bottom:6px">'+
         '<strong>🧩 Карта:</strong> '+esc(d.name||'')+
         ' · <strong>Участок:</strong> '+esc(d.operation_type||'')+
         ' · <strong>Станок:</strong> '+(op.resource||'<span style="color:var(--err)">не задан</span>')+
@@ -6663,7 +6663,7 @@ function modalNestingWriteoff(opid){
     }
     h+='<div class="form-row full"><div><label>Примечание</label><input id="fnwo_note"></div></div>'+
       '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
-      '<button class="btn primary" style="background:#7c3aed;border-color:#7c3aed" onclick="submitNestingWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
+      '<button class="btn primary" style="background:#64748b;border-color:#64748b" onclick="submitNestingWriteoff('+opid+','+showMat+','+showParts+')">Списать</button></div>';
     openModal(h);
   }).catch(function(e){toast(e.message,'err')})
 }
@@ -6839,7 +6839,7 @@ function pgReservations(c){
     c.innerHTML=groupsHtml+
       '<div class="toolbar">'+
       (hasPerm('reserve.create')?'<button class="btn primary" onclick="modalCreateRes()">+ Резерв</button>':'')+
-      (hasPerm('nesting.create')?'<button class="btn" style="background:#7c3aed;border-color:#7c3aed;color:#fff" onclick="modalNestingMerge()">🧩 Объединить в карту</button>':'')+
+      (hasPerm('nesting.create')?'<button class="btn" style="background:#64748b;border-color:#64748b;color:#fff" onclick="modalNestingMerge()">🧩 Объединить в карту</button>':'')+
       '<label style="margin-left:8px;font-size:.85em">Резервы:</label>'+
       '<select class="ctl" style="padding:3px;font-size:.85em" onchange="_resActiveOnly=+this.value;_resFilters={};pgReservations(document.getElementById(\'mainContent\'))">'+
         '<option value="1" '+(_resActiveOnly?'selected':'')+'>Активные</option>'+
@@ -6867,7 +6867,7 @@ function _renderNestingGroupsPanel(groups){
     var dets=(g.items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(', ');
     var disband=hasPerm('nesting.disband')&&g.sheets_consumed===0
       ?'<button class="btn sm" onclick="disbandNesting('+g.id+')" title="Расформировать">✖</button>':'';
-    return '<tr><td><span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 '+esc(g.name)+'</span></td>'+
+    return '<tr><td><span style="background:#64748b;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 '+esc(g.name)+'</span></td>'+
       '<td>'+esc(g.material||'—')+'</td>'+
       '<td>'+esc(g.operation_type||'—')+(g.resource?' / '+esc(g.resource):'')+'</td>'+
       '<td>'+(g.sheets_planned||0)+' л</td>'+
@@ -6875,8 +6875,8 @@ function _renderNestingGroupsPanel(groups){
       '<td style="font-size:.85em">'+dets+'</td>'+
       '<td>'+disband+'</td></tr>';
   }).join('');
-  return '<div class="info-box" style="background:rgba(124,58,237,.06);border-color:#7c3aed;margin-bottom:8px">'+
-    '<strong style="color:#7c3aed">🧩 Карты раскроя ('+groups.length+')</strong>'+
+  return '<div class="info-box" style="background:rgba(100,116,139,.06);border-color:#64748b;margin-bottom:8px">'+
+    '<strong style="color:#64748b">🧩 Карты раскроя ('+groups.length+')</strong>'+
     '<div class="tbl-wrap" style="margin-top:6px"><table><thead><tr>'+
     '<th>Карта</th><th>Материал</th><th>Участок</th><th>Лист.</th><th>Прогресс</th><th>Детали</th><th></th>'+
     '</tr></thead><tbody>'+rows+'</tbody></table></div></div>';
@@ -6900,7 +6900,7 @@ function _resRenderTable(){
       :statusBadge(r.order_status);
     var nestBadge='';
     if(r.is_nesting_merged){
-      nestBadge=' <span style="background:#7c3aed;color:#fff;border-radius:3px;padding:1px 5px;font-size:.7em">🧩 '+esc(r.nesting_group_name||'карта')+'</span>';
+      nestBadge=' <span style="background:#64748b;color:#fff;border-radius:3px;padding:1px 5px;font-size:.7em">🧩 '+esc(r.nesting_group_name||'карта')+'</span>';
     } else if(r.nesting_group_id){
       nestBadge=' <span style="background:#a78bfa;color:#fff;border-radius:3px;padding:1px 5px;font-size:.7em">в карте «'+esc(r.nesting_group_name||'')+'»</span>';
     }
@@ -6975,7 +6975,7 @@ function modalNestingMerge(){
       return '<tr><td>'+esc(r.order_display||'')+'</td><td>'+esc(r.part_name||'')+'</td><td>'+(r.remaining_sheets||0)+' л</td></tr>';
     }).join('');
     var h='<h2>🧩 Объединить резервы в карту раскроя</h2>'+
-      '<div class="info-box" style="background:rgba(124,58,237,.07);border-color:#7c3aed;margin-bottom:8px">'+
+      '<div class="info-box" style="background:rgba(100,116,139,.07);border-color:#64748b;margin-bottom:8px">'+
         '<strong>Материал:</strong> '+esc(matName)+' · <strong>Резервов:</strong> '+picked.length+
         ' · <strong>Сумма листов:</strong> '+sumSh+' л'+
       '</div>'+
@@ -7001,7 +7001,7 @@ function modalNestingMerge(){
         'Возврат возможен через «Расформировать» (пока нет списаний).'+
       '</div>'+
       '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button>'+
-      '<button class="btn primary" style="background:#7c3aed;border-color:#7c3aed" onclick="submitNestingMerge('+JSON.stringify(rids).replace(/"/g,'&quot;')+')">🧩 Объединить</button></div>';
+      '<button class="btn primary" style="background:#64748b;border-color:#64748b" onclick="submitNestingMerge('+JSON.stringify(rids).replace(/"/g,'&quot;')+')">🧩 Объединить</button></div>';
     openModal(h);
   })}
 
@@ -7229,7 +7229,7 @@ function plOpCell(op){
   var h='';
   // Нестинговая операция — показываем бейдж карты
   if(op.is_nesting){
-    h+='<div style="font-size:.7em;background:#7c3aed;color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-bottom:2px">🧩 '+(op.nesting_group_name||'Карта')+'</div>';
+    h+='<div style="font-size:.7em;background:#64748b;color:#fff;border-radius:3px;padding:1px 5px;display:inline-block;margin-bottom:2px">🧩 '+(op.nesting_group_name||'Карта')+'</div>';
   }
   var isOver=op.planned_qty>0&&op.completed_qty>op.planned_qty;
   // Строка с источником: комплекты (сборочная) или детали с предыдущего участка
@@ -7606,7 +7606,7 @@ function woFillTable(el){
     var typeBadge=isBoth
       ?(row.mat&&row.mat.type==='Отход'
         ?'<span class="badge b-warn" style="font-size:.72em">♻🔩 Отход+Дет</span>'
-        :'<span class="badge" style="font-size:.72em;background:rgba(139,92,246,.14);color:#7c3aed;border:1px solid rgba(139,92,246,.3)">📦🔩 Мат+Дет</span>')
+        :'<span class="badge" style="font-size:.72em;background:rgba(100,116,139,.14);color:#64748b;border:1px solid rgba(100,116,139,.3)">📦🔩 Мат+Дет</span>')
       :isMat?'<span class="badge b-info" style="font-size:.73em">📦 Матер.</span>'
       :isScrap?'<span class="badge b-warn" style="font-size:.73em">♻ Отход</span>'
       :'<span class="badge b-ok" style="font-size:.73em">🔩 Детали</span>';
