@@ -4941,23 +4941,19 @@ tr:hover td{background:rgba(239,68,68,.04)}
 .pm-cust-col .pm-onum{display:block;font-size:.75em;color:var(--text3);font-weight:500;margin-top:2px}
 .pm-plan-col,.pm-done-col{min-width:48px;text-align:center;white-space:nowrap}
 .pm-op-col{min-width:95px;text-align:center;white-space:nowrap;font-size:.78em}
-.pm-asm-row td{background:rgba(59,130,246,.07)!important;font-weight:600}
-.pm-comp-row td{background:var(--s1)}
-.pm-comp-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
+.pm-asm-row td{font-weight:600}
 .pm-comp-name{padding-left:34px!important;color:var(--text2);font-size:.85em;position:relative}
 /* Дерево: вертикальная линия от сборки к компонентам + горизонтальный отросток */
 .pm-comp-row .pm-comp-name::before{content:'';position:absolute;left:14px;top:0;bottom:0;border-left:2px solid var(--info);opacity:.55}
 .pm-comp-row.pm-comp-last .pm-comp-name::before{bottom:auto;height:50%}
 .pm-comp-row .pm-comp-name::after{content:'';position:absolute;left:14px;top:50%;width:12px;border-top:2px solid var(--info);opacity:.55}
-.pm-part-row td{background:var(--s1)}
-.pm-part-row.has-surplus-row td{background:rgba(239,68,68,.05)!important}
 .pm-op-cell{text-align:center;padding:4px 6px!important}
 .pm-no-op{color:var(--text3);text-align:center;font-size:.8em}
-.op-cell-done{background:rgba(34,197,94,.15)!important;color:var(--ok)}
-.op-cell-active{background:rgba(251,191,36,.15)!important;color:var(--warn)}
-.op-cell-partial{background:rgba(59,130,246,.13)!important;color:var(--info)}
-.op-cell-wait{background:var(--bg);color:var(--text3)}
-.op-cell-nesting{background:rgba(124,58,237,.09)!important;color:#7c3aed}
+.op-cell-done{color:var(--ok)}
+.op-cell-active{color:var(--warn)}
+.op-cell-partial{color:var(--info)}
+.op-cell-wait{color:var(--text3)}
+.op-cell-nesting{color:#7c3aed}
 /* Пустая строка-разделитель между заказами: без фона и без рамок */
 .parts-matrix tr.pm-gap td{background:var(--bg)!important;border:0!important;padding:0!important;height:14px;line-height:0;font-size:0}
 
