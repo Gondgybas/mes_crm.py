@@ -5334,7 +5334,7 @@ function _ordRenderTable(){
     '<td title="'+esc(o.description)+'">'+(o.description||'').substring(0,35)+'</td>'+
     '<td>'+fmtMoney(o.total_amount)+'</td><td>'+(o.items||[]).length+'</td>'+
     '<td>'+statusBadge(o.priority)+'</td>'+
-    '<td>'+statusBadge(o.status)+shipBadge(o.ship_status)+'</td>'+
+    '<td>'+statusBadge(o.status)+'</td>'+
     '<td>'+shipBadge(o.ship_status)+'</td>'+
     '<td '+(o.overdue?'class="low"':'')+'>'+fmtD(o.deadline)+(o.overdue?' ⚠':'')+'</td>'+
     '<td>'+fmtD(o.completed_at)+'</td>'+
