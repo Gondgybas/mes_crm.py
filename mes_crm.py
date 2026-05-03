@@ -5135,7 +5135,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
 <div id="appShell" style="display:none">
 <div class="header"><h1>⚙ <span>MetalWorks</span> <span class="hdr-title">MES</span></h1>
 <div class="hdr-r"><span class="ws-dot" id="wsDot"></span><span id="userInfo"></span>
-<select class="ctl" id="themeCtl" onchange="toggleTheme()"><option value="dark">🌙</option><option value="light">☀</option></select>
+<select class="ctl" id="themeCtl" onchange="toggleTheme()"><option value="light">☀</option><option value="dark">🌙</option></select>
 <button class="btn" onclick="refreshPage()">↻</button><button class="btn" id="logoutBtn" onclick="doLogout()"><span class="btn-label">Выход</span></button></div></div>
 <div class="nav" id="mainNav"></div>
 <main id="mainContent"></main></div>
