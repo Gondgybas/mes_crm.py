@@ -5135,7 +5135,7 @@ tr:hover td{background:rgba(239,68,68,.04)}
 <div id="appShell" style="display:none">
 <div class="header"><h1>⚙ <span>MetalWorks</span> <span class="hdr-title">MES</span></h1>
 <div class="hdr-r"><span class="ws-dot" id="wsDot"></span><span id="userInfo"></span>
-<select class="ctl" id="themeCtl" onchange="toggleTheme()"><option value="light">☀</option><option value="dark">🌙</option></select>
+<select class="ctl" id="themeCtl" onchange="toggleTheme()"><option value="dark">🌙</option><option value="light">☀</option></select>
 <button class="btn" onclick="refreshPage()">↻</button><button class="btn" id="logoutBtn" onclick="doLogout()"><span class="btn-label">Выход</span></button></div></div>
 <div class="nav" id="mainNav"></div>
 <main id="mainContent"></main></div>
@@ -5203,7 +5203,8 @@ function fmtDT(iso){if(!iso)return'—';var d=new Date(iso);return d.toLocaleStr
 function fmtN(n){return n==null?'—':Number(n).toLocaleString('ru-RU')}
 function fmtMoney(n){return n?Number(n).toLocaleString('ru-RU',{minimumFractionDigits:2})+'₽':'—'}
 function fmtMinToH(m){if(!m&&m!==0)return'—';var h=Math.floor(m/60);var mn=m%60;return h+'ч '+mn+'м'}
-function toggleTheme(){document.body.classList.toggle('light',document.getElementById('themeCtl').value==='light')}
+function toggleTheme(){var v=document.getElementById('themeCtl').value;document.body.classList.toggle('light',v==='light');try{localStorage.setItem('theme',v)}catch(e){}}
+(function(){var t='dark';try{t=localStorage.getItem('theme')||'dark'}catch(e){}document.getElementById('themeCtl').value=t;document.body.classList.toggle('light',t==='light')})()
 function refreshPage(){loadPage(curPage)}
 function statusBadge(s){var m={'Черновик':'b-gray','Новый':'b-info','Ожидает':'b-purple','В работе':'b-warn','Завершён':'b-ok','Отгружен':'b-ok','Частично отгружен':'b-warn','Отменён':'b-err','Приостановлен':'b-gray','Запланирована':'b-purple','Завершена':'b-ok','Частично':'b-warn','Пауза':'b-gray','Низкий':'b-gray','Обычный':'b-info','Высокий':'b-warn','Срочный':'b-err','Критический':'b-err'};return '<span class="badge '+(m[s]||'b-gray')+'">'+s+'</span>'}
 function shipBadge(s){if(!s)return '';var cls=s==='Отгружен'?'b-ok':'b-warn';return '<span class="badge '+cls+'" title="Статус отгрузки" style="margin-left:3px">🚚 '+s+'</span>';}
