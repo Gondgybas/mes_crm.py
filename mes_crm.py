@@ -2901,7 +2901,7 @@ def create_app():
                 .joinedload(OrderItem.part_template)
                 .joinedload(PartTemplate.components)
                 .joinedload(AssemblyComponent.component),
-            joinedload(ProductionOp.component_template),
+            joinedload(ProductionOp.component_template).joinedload(PartTemplate.materials),
             joinedload(ProductionOp.nesting_group).joinedload(NestingGroup.items)
                 .joinedload(NestingGroupItem.part_template))
         if order_id: q = q.filter(ProductionOp.order_id == order_id)
@@ -2985,6 +2985,57 @@ def create_app():
             src_t = row[1] or ""
             if qty > 0:
                 nesting_input_map[o.id] = (qty, src_t)
+        # ── Преднагрузка материалов для строк операций ──────────────────────────
+        order_ids_set = list({o.order_id for o in ops_list if o.order_id})
+        ng_ids_set    = list({o.nesting_group_id for o in ops_list if o.nesting_group_id})
+
+        # Резервы обычных операций: (order_id, part_template_id, material_id) -> Reservation
+        res_map: dict = {}
+        if order_ids_set:
+            for r in db.query(Reservation).filter(
+                    Reservation.order_id.in_(order_ids_set),
+                    Reservation.is_active == True,
+                    Reservation.nesting_group_id.is_(None)).all():
+                res_map[(r.order_id, r.part_template_id, r.material_id)] = r
+
+        # Резервы нестинговых карт: nesting_group_id -> Reservation
+        ng_res_map: dict = {}
+        if ng_ids_set:
+            for r in db.query(Reservation).filter(
+                    Reservation.nesting_group_id.in_(ng_ids_set),
+                    Reservation.is_active == True).all():
+                ng_res_map[r.nesting_group_id] = r
+
+        # Потреблено материала (списания типа «Материал»): (order_id, material_id) -> {kg, sheets}
+        consumed_map: dict = {}
+        if order_ids_set:
+            for row in db.query(
+                    WriteOff.order_id, WriteOff.material_id,
+                    func.sum(WriteOff.quantity_kg), func.sum(WriteOff.quantity_sheets)
+                ).filter(
+                    WriteOff.order_id.in_(order_ids_set),
+                    WriteOff.writeoff_type == "Материал",
+                    WriteOff.is_cancelled == False,
+                    WriteOff.material_id.isnot(None),
+                    WriteOff.nesting_group_id.is_(None)
+                ).group_by(WriteOff.order_id, WriteOff.material_id).all():
+                consumed_map[(row[0], row[1])] = {'kg': float(row[2] or 0), 'sheets': int(row[3] or 0)}
+
+        # Потреблено по нестинговым картам: (ng_id, material_id) -> {kg, sheets}
+        ng_consumed_map: dict = {}
+        if ng_ids_set:
+            for row in db.query(
+                    WriteOff.nesting_group_id, WriteOff.material_id,
+                    func.sum(WriteOff.quantity_kg), func.sum(WriteOff.quantity_sheets)
+                ).filter(
+                    WriteOff.nesting_group_id.in_(ng_ids_set),
+                    WriteOff.writeoff_type == "Материал",
+                    WriteOff.is_cancelled == False,
+                    WriteOff.material_id.isnot(None)
+                ).group_by(WriteOff.nesting_group_id, WriteOff.material_id).all():
+                ng_consumed_map[(row[0], row[1])] = {'kg': float(row[2] or 0), 'sheets': int(row[3] or 0)}
+        # ─────────────────────────────────────────────────────────────────────
+
         result = []
         for o in ops_list:
             prev_op = prev_op_map.get(o.id)
@@ -3010,6 +3061,54 @@ def create_app():
                 prev_id = None
             else:
                 avail_input = None; prev_type = None; prev_id = None
+            # ── Материалы для строки операции ──
+            mat_info = []
+            if o.nesting_group_id and o.nesting_group and o.nesting_group.material_id:
+                mat = o.nesting_group.material
+                if mat:
+                    ng_r = ng_res_map.get(o.nesting_group_id)
+                    ng_c = ng_consumed_map.get((o.nesting_group_id, mat.id), {})
+                    res_kg = ng_r.quantity_kg if ng_r else 0.0
+                    res_sh = ng_r.quantity_sheets if ng_r else 0
+                    mat_info.append({
+                        "material_id": mat.id, "name": mat.name,
+                        "material_type": mat.material_type, "primary_unit": mat.primary_unit,
+                        "qty_kg": round(float(mat.quantity_kg or 0), 2), "qty_sheets": int(mat.quantity_sheets or 0),
+                        "reserved_kg": round(float(res_kg), 2), "reserved_sheets": int(res_sh),
+                        "consumed_kg": round(float(ng_c.get('kg', 0.0)), 2),
+                        "consumed_sheets": int(ng_c.get('sheets', 0)),
+                        "remainder_kg": round(max(0.0, float(res_kg) - float(ng_c.get('kg', 0.0))), 2),
+                        "remainder_sheets": max(0, int(res_sh) - int(ng_c.get('sheets', 0))),
+                    })
+            elif o.order_item_id and o.order_item:
+                # Для компонентов сборки берём материалы из component_template,
+                # для прямых деталей — из part_template самой позиции заказа
+                if o.component_template_id and o.component_template:
+                    pt_mats = o.component_template.materials or []
+                    pt_id_for_res = o.component_template_id
+                elif o.order_item.part_template:
+                    pt_mats = o.order_item.part_template.materials or []
+                    pt_id_for_res = o.order_item.part_template_id
+                else:
+                    pt_mats = []
+                    pt_id_for_res = None
+                for ptm in pt_mats:
+                    mat = ptm.material
+                    if not mat or not pt_id_for_res: continue
+                    r = res_map.get((o.order_id, pt_id_for_res, ptm.material_id))
+                    c = consumed_map.get((o.order_id, ptm.material_id), {})
+                    res_kg = r.quantity_kg if r else 0.0
+                    res_sh = r.quantity_sheets if r else 0
+                    mat_info.append({
+                        "material_id": mat.id, "name": mat.name,
+                        "material_type": mat.material_type, "primary_unit": mat.primary_unit,
+                        "qty_kg": round(float(mat.quantity_kg or 0), 2), "qty_sheets": int(mat.quantity_sheets or 0),
+                        "reserved_kg": round(float(res_kg), 2), "reserved_sheets": int(res_sh),
+                        "consumed_kg": round(float(c.get('kg', 0.0)), 2),
+                        "consumed_sheets": int(c.get('sheets', 0)),
+                        "remainder_kg": round(max(0.0, float(res_kg) - float(c.get('kg', 0.0))), 2),
+                        "remainder_sheets": max(0, int(res_sh) - int(c.get('sheets', 0))),
+                    })
             result.append({"id": o.id, "order_id": o.order_id,
                  "order_number": o.order.order_number if o.order else "",
                  "order_display": o.order.display_name if o.order else "",
@@ -3049,6 +3148,8 @@ def create_app():
                  "prev_op_id": prev_id,
                  # Готовые комплекты для первой сборочной операции
                  "available_kits": available_kits_map.get(o.id),
+                 # Материалы: наименование, склад, резерв, остаток резерва
+                 "materials": mat_info,
                  "sessions": [{"id": s.id, "user_id": s.user_id,
                      "user_name": s.user.full_name if s.user else "",
                      "status": s.status,
@@ -6237,7 +6338,30 @@ function pgOperations(c){
                 (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'');
               return operBadges+'<br style="line-height:.5em">'+btns;
             })()+
-          '</td></tr>';
+          '</td></tr>'+(function(){
+            // Строка материала — только для участков со списанием «Материал» или «Материал+Детали»
+            var opCfg=window._opTypesData[o.type]||{};
+            var wm=opCfg.writeoff_mode||'Детали';
+            if((wm==='Материал'||wm==='Материал+Детали')&&o.materials&&o.materials.length>0){
+              var pills=o.materials.map(function(m){
+                var isSheet=m.material_type==='Лист';
+                var qtyVal=isSheet?m.qty_sheets:m.qty_kg;
+                var resVal=isSheet?m.reserved_sheets:m.reserved_kg;
+                var remVal=isSheet?m.remainder_sheets:m.remainder_kg;
+                var unit=isSheet?'л':m.primary_unit;
+                var remColor=remVal<=0?'var(--err)':(isSheet&&remVal<=2?'var(--warn)':'var(--ok)');
+                return '<span style="display:inline-flex;align-items:center;gap:6px;font-size:.75em;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:4px;padding:2px 8px;margin-right:4px">'+
+                  '📦 <strong>'+esc(m.name)+'</strong>'+
+                  '<span style="color:var(--text3)">|</span>Склад: <b style="color:var(--text2)">'+qtyVal+' '+unit+'</b>'+
+                  '<span style="color:var(--text3)">|</span>Резерв: <b style="color:var(--info)">'+resVal+' '+unit+'</b>'+
+                  '<span style="color:var(--text3)">|</span>Остаток: <b style="color:'+remColor+'">'+remVal+' '+unit+'</b>'+
+                '</span>';
+              }).join('');
+              return '<tr style="background:rgba(59,130,246,.04)"><td></td>'+
+                '<td colspan="11" style="padding:1px 8px 5px 20px">'+pills+'</td></tr>';
+            }
+            return '';
+          })();
       }).join('')+'</tbody></table></div>';
   });
 
