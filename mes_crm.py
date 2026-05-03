@@ -2698,12 +2698,13 @@ def create_app():
         if group.status != "Активна":
             raise HTTPException(400, "Карта уже расформирована")
 
-        # Любые WriteOff на эту карту блокируют расформирование
+        # Только НЕ отменённые WriteOff блокируют расформирование
         wo_count = db.query(func.count(WriteOff.id)).filter(
-            WriteOff.nesting_group_id == gid).scalar() or 0
+            WriteOff.nesting_group_id == gid,
+            WriteOff.is_cancelled == False).scalar() or 0
         if wo_count > 0:
             raise HTTPException(400,
-                "По карте уже есть списания — расформирование невозможно")
+                "По карте есть активные (не отменённые) списания — расформирование невозможно")
 
         mat = group.material
         # Удаляем объединённый резерв и снимаем mat.reserved_*
@@ -2720,8 +2721,11 @@ def create_app():
 
         # Восстанавливаем исходные резервы и операции
         for it in group.items:
-            # Восстанавливаем исходный резерв
-            if it.src_reservation_id:
+            # Проверяем существование заказа (мог быть удалён)
+            order_exists = it.order_id and db.query(
+                func.count(Order.id)).filter(Order.id == it.order_id).scalar() > 0
+            # Восстанавливаем исходный резерв (только если заказ жив)
+            if it.src_reservation_id and order_exists:
                 src_r = db.query(Reservation).get(it.src_reservation_id)
                 if src_r:
                     src_r.is_active = True
@@ -2729,8 +2733,8 @@ def create_app():
                     src_r.quantity_kg = it.src_reservation_kg or 0.0
                     mat.reserved_sheets = (mat.reserved_sheets or 0) + (src_r.quantity_sheets or 0)
                     mat.reserved_kg = (mat.reserved_kg or 0) + (src_r.quantity_kg or 0)
-            # Восстанавливаем индивидуальную ProductionOp (если был снимок)
-            if it.src_op_planned_qty or it.src_op_estimated_minutes or it.src_op_id:
+            # Восстанавливаем индивидуальную ProductionOp (только если заказ жив)
+            if order_exists and (it.src_op_planned_qty or it.src_op_estimated_minutes or it.src_op_id):
                 db.add(ProductionOp(
                     order_id=it.order_id, order_item_id=it.order_item_id,
                     operation_type=group.operation_type, status="Ожидает",
@@ -2895,9 +2899,15 @@ def create_app():
         if resource_id: q = q.filter(ProductionOp.resource_id == resource_id)
         ops_list = q.order_by(ProductionOp.resource_id, ProductionOp.sort_order, ProductionOp.sequence).all()
         # Группируем по (order_item_id, component_template_id), сортируем по (sequence, sort_order)
+        # Нестинговые операции (карты раскроя) — всегда независимы, каждая в своей группе.
+        # Без этого все карты с (item_id=None, comp_id=None) оказывались в одной группе,
+        # вторая получала prev_op = первая → available_input=0 → кнопка «Начать» блокировалась.
         op_groups = {}
         for o in ops_list:
-            gk = (o.order_item_id, o.component_template_id)
+            if o.nesting_group_id is not None:
+                gk = ("_ng_", o.nesting_group_id)   # каждая карта раскроя — отдельная цепочка
+            else:
+                gk = (o.order_item_id, o.component_template_id)
             if gk not in op_groups: op_groups[gk] = []
             op_groups[gk].append(o)
         prev_op_map = {}  # op.id -> prev_op or None
@@ -6099,7 +6109,8 @@ function pgOperations(c){
 
   typeOrder.forEach(function(tname){
     var data=byType[tname];
-    data.ops.sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;return aD-bD;});
+    // Завершённые — в конец; остальные — по sort_order (явно, чтобы не зависеть от стабильности браузерного sort)
+    data.ops.sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;if(aD!==bD)return aD-bD;return (a.sort_order||0)-(b.sort_order||0);});
     var totalMin=data.ops.reduce(function(s,o){return s+o.estimated_min},0);
     var noRes=data.ops.filter(function(o){return !o.resource_id}).length;
     html+='<div class="section-hdr">'+
@@ -6110,7 +6121,7 @@ function pgOperations(c){
       '<div class="tbl-wrap"><table><thead><tr>'+
         '<th>↕</th><th>Заказ</th><th>Деталь / Компонент</th><th>Станок / Участок</th>'+
         '<th>План</th><th title="Поступило с предыдущего участка">📥 Вход</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th><th>Ст.</th><th></th>'+
-      '</tr></thead><tbody>'+
+      '</tr></thead><tbody ondragover="event.preventDefault()" ondrop="dropOpEnd(event)">'+
       data.ops.map(function(o){
         var resCell=o.resource&&o.resource!=='—'
           ?'<span style="font-size:.82em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.12);border-radius:3px;padding:1px 6px">📍'+o.resource+'</span>'
@@ -6215,13 +6226,20 @@ function pgOperations(c){
   })})}
 
 var draggedOpId=null;function dragOp(e){draggedOpId=e.target.closest('tr').dataset.opid;e.dataTransfer.effectAllowed='move'}
-function dropOp(e){e.preventDefault();var tr=e.target.closest('tr');if(!tr||!draggedOpId)return;
+function dropOp(e){e.preventDefault();e.stopPropagation();var tr=e.target.closest('tr');if(!tr||!draggedOpId)return;
   var tbody=tr.closest('tbody'),rows=Array.from(tbody.querySelectorAll('tr'));
   var order=rows.map(function(r,i){return{id:+r.dataset.opid,sort_order:i}});
   var di=order.findIndex(function(o){return o.id===+draggedOpId}),ti=order.findIndex(function(o){return o.id===+tr.dataset.opid});
   if(di<0||ti<0)return;var mv=order.splice(di,1)[0];order.splice(ti,0,mv);order.forEach(function(o,i){o.sort_order=i});draggedOpId=null;
   api('/api/operations/reorder','POST',{order:order}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e2){toast(e2.message,'err')})}
-function startOp(id){api('/api/operations/'+id+'/start','POST',{user_id:U.id}).then(function(){toast('Запущена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
+// Drop в пустую область tbody (ниже последней строки) — перемещает перетаскиваемый элемент в конец группы
+function dropOpEnd(e){e.preventDefault();if(!draggedOpId)return;var tbody=e.currentTarget;
+  if(e.target.closest('tr'))return; // обработано строковым handler'ом
+  var rows=Array.from(tbody.querySelectorAll('tr'));
+  var order=rows.map(function(r,i){return{id:+r.dataset.opid,sort_order:i}});
+  var di=order.findIndex(function(o){return o.id===+draggedOpId});
+  if(di<0)return;var mv=order.splice(di,1)[0];order.push(mv);order.forEach(function(o,i){o.sort_order=i});draggedOpId=null;
+  api('/api/operations/reorder','POST',{order:order}).then(function(){toast('OK','ok');refreshPage()}).catch(function(e2){toast(e2.message,'err')})}function startOp(id){api('/api/operations/'+id+'/start','POST',{user_id:U.id}).then(function(){toast('Запущена','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function pauseOp(id){api('/api/operations/'+id+'/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function sessionStart(id){api('/api/operations/'+id+'/session/start','POST',{user_id:U.id}).then(function(){toast('Запущено','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
 function sessionPause(id){api('/api/operations/'+id+'/session/pause','POST',{user_id:U.id}).then(function(){toast('Пауза','ok');refreshPage()}).catch(function(e){toast(e.message,'err')})}
