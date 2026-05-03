@@ -96,6 +96,10 @@ user_stations = Table("user_stations", Base.metadata,
     Column("user_id", Integer, ForeignKey("users.id"), primary_key=True),
     Column("resource_id", Integer, ForeignKey("resources.id"), primary_key=True))
 
+user_op_types = Table("user_op_types", Base.metadata,
+    Column("user_id", Integer, ForeignKey("users.id"), primary_key=True),
+    Column("op_type_id", Integer, ForeignKey("operation_type_cfgs.id"), primary_key=True))
+
 
 class OperationTypeCfg(Base):
     __tablename__ = "operation_type_cfgs"
@@ -144,6 +148,7 @@ class User(Base):
     tab_number = Column(String(50), default="")
     created_at = Column(DateTime, default=now_msk)
     allowed_stations = relationship("Resource", secondary=user_stations, lazy="joined")
+    allowed_op_types = relationship("OperationTypeCfg", secondary=user_op_types, lazy="joined")
 
     @staticmethod
     def hash_pw(pw):
@@ -1475,12 +1480,13 @@ def create_app():
         perms = [p.code for p in rc.permissions] if rc else []
         wo_types = rc.get_wo_types() if rc else []
         stations = [{"id": s.id, "name": s.name} for s in user.allowed_stations]
+        op_types = [{"id": t.id, "name": t.name} for t in user.allowed_op_types]
         audit(db, user.id, "Вход", "user", user.id, user.username)
         db.commit()
         return {"id": user.id, "username": user.username, "role": user.role,
                 "role_label": rc.display_name if rc else user.role,
                 "full_name": user.full_name, "permissions": perms,
-                "stations": stations, "writeoff_types": wo_types}
+                "stations": stations, "op_types": op_types, "writeoff_types": wo_types}
 
     # ─── Op Types ───────────────────────────────────
     @app.get("/api/op-types")
@@ -1515,7 +1521,8 @@ def create_app():
                  "role": u.role, "role_label": ROLE_LABELS.get(u.role, u.role),
                  "is_active": u.is_active, "tab_number": u.tab_number,
                  "password_plain": u.password_plain or "",
-                 "stations": [s.id for s in u.allowed_stations]}
+                 "stations": [s.id for s in u.allowed_stations],
+                 "op_types": [t.id for t in u.allowed_op_types]}
                 for u in db.query(User).order_by(User.username).all()]
 
     @app.get("/api/users/next-tab-number")
@@ -1554,6 +1561,8 @@ def create_app():
             db.add(u)
         sids = data.get("stations", [])
         u.allowed_stations = db.query(Resource).filter(Resource.id.in_(sids)).all() if sids else []
+        otids = data.get("op_types", [])
+        u.allowed_op_types = db.query(OperationTypeCfg).filter(OperationTypeCfg.id.in_(otids)).all() if otids else []
         db.flush(); db.commit()
         return {"id": u.id}
 
@@ -1601,10 +1610,11 @@ def create_app():
         perms = [p.code for p in rc.permissions] if rc else []
         wo_types = rc.get_wo_types() if rc else []
         stations = [{"id": s.id, "name": s.name} for s in user.allowed_stations]
+        op_types = [{"id": t.id, "name": t.name} for t in user.allowed_op_types]
         return {"id": user.id, "username": user.username, "role": user.role,
                 "role_label": rc.display_name if rc else user.role,
                 "full_name": user.full_name, "permissions": perms,
-                "stations": stations, "writeoff_types": wo_types}
+                "stations": stations, "op_types": op_types, "writeoff_types": wo_types}
 
     # ─── Roles ──────────────────────────────────────
     @app.get("/api/roles")
@@ -6078,9 +6088,13 @@ function pgOperations(c){
   var resources=arr2[0],opTypes=arr2[1];
   window._opsResources=resources;
   window._opTypesData={};opTypes.forEach(function(ot){window._opTypesData[ot.name]=ot});
+  // Типы операций текущего пользователя (если назначены — показываем только их)
+  var myOpTypeNames=(U&&U.op_types&&U.op_types.length>0)?U.op_types.map(function(t){return t.name}):null;
   var url='/api/operations?active_only=1';if(opsResFilter)url+='&resource_id='+opsResFilter;
   api(url).then(function(ops){
   window._opsData={};ops.forEach(function(o){window._opsData[o.id]=o});
+  // Фильтр по привязанным типам операций пользователя
+  if(myOpTypeNames)ops=ops.filter(function(o){return myOpTypeNames.indexOf(o.type)>=0});
   if(opsTypeFilter)ops=ops.filter(function(o){return o.type===opsTypeFilter});
 
   // ─ Группируем по ТИПУ операции ─
@@ -6099,9 +6113,15 @@ function pgOperations(c){
     return a.localeCompare(b);
   });
 
+  // Участки в фильтре — все (фильтр по типу операции — отдельный)
   var resOpts=[{v:'0',t:'Все участки'}].concat(resources.map(function(r){return{v:String(r.id),t:r.name}}));
-  var typeOpts=[{v:'',t:'Все типы'}].concat(opTypes.filter(function(o){return o.is_active}).map(function(o){return{v:o.name,t:o.name}}));
-  var html='<div class="toolbar"><div class="info-box" style="margin:0;padding:6px 12px">Операции «В работе»</div><span class="spacer"></span></div>'+
+  var typeOptsAll=opTypes.filter(function(o){return o.is_active});
+  var typeOptsFiltered=myOpTypeNames?typeOptsAll.filter(function(o){return myOpTypeNames.indexOf(o.name)>=0}):typeOptsAll;
+  var typeOpts=[{v:'',t:myOpTypeNames?'Все мои типы':'Все типы'}].concat(typeOptsFiltered.map(function(o){return{v:o.name,t:o.name}}));
+  var stationBadge=myOpTypeNames
+    ?'<span style="background:rgba(99,102,241,.15);border:1px solid var(--acc);border-radius:4px;padding:3px 10px;font-size:.82em;color:var(--acc)">⚙ Мои типы: '+U.op_types.map(function(t){return t.name}).join(', ')+'</span>'
+    :'';
+  var html='<div class="toolbar"><div class="info-box" style="margin:0;padding:6px 12px">Операции «В работе»</div><span class="spacer"></span>'+stationBadge+'</div>'+
     '<div class="filter-bar">'+
       '<label>Участок:</label><div style="min-width:200px">'+SS('ops_res',resOpts,String(opsResFilter),'Все',function(v){opsResFilter=+v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
       '<label>Тип:</label><div style="min-width:200px">'+SS('ops_type',typeOpts,opsTypeFilter,'Все типы',function(v){opsTypeFilter=v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
@@ -8119,11 +8139,11 @@ function impersonateUser(uid,name){
     else toast('Открыта новая вкладка под '+name,'ok');
   }).catch(function(e){toast(e.message,'err')})}
 
-function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles'),uid?Promise.resolve(null):api('/api/users/next-tab-number')]).then(function(arr){
-  var resources=arr[0],roles=arr[1],nextTab=arr[2]?arr[2].tab_number:'';
+function modalUser(uid){Promise.all([api('/api/op-types'),api('/api/roles'),uid?Promise.resolve(null):api('/api/users/next-tab-number')]).then(function(arr){
+  var opTypes=arr[0],roles=arr[1],nextTab=arr[2]?arr[2].tab_number:'';
   var isAdm=hasPerm('admin.users');
   var p1=uid?api('/api/users'):Promise.resolve(null);p1.then(function(us){var u=us?us.find(function(x){return x.id===uid}):null;
-  var uSt=u?u.stations:[];var roleOpts=roles.map(function(r){return{v:r.role,t:r.display_name+' ('+r.role+')'}});
+  var uOt=u?u.op_types:[];var roleOpts=roles.map(function(r){return{v:r.role,t:r.display_name+' ('+r.role+')'}});
   var pwHint=(u&&isAdm&&!(u.password_plain||'').trim())?'<div style="font-size:.78em;color:var(--warn);margin-top:4px">⚠ Старый пароль скрыт (создан до сохранения plain). Введите новый или попросите пользователя войти — после входа пароль появится.</div>':'';
   openModal('<h2>'+(u?'✏':'+')+' Пользователь</h2>'+
   '<div class="form-row"><div><label>Логин</label>'+
@@ -8140,12 +8160,12 @@ function modalUser(uid){Promise.all([api('/api/resources'),api('/api/roles'),uid
   (!u?'<div style="margin:-4px 0 10px"><span style="font-size:.78em;color:var(--text3)">⚡ — авто-генерация логина и пароля по ФИО (введите ФИО ниже)</span></div>':'')+
   '<div class="form-row"><div><label>Роль</label>'+SS('fu_r',roleOpts,u?u.role:'operator','Роль')+'</div>'+
     '<div><label>Активен</label><select id="fu_a"><option value="true" '+(!u||u.is_active?'selected':'')+'>Да</option><option value="false" '+(u&&!u.is_active?'selected':'')+'>Нет</option></select></div></div>'+
-  '<div class="section-hdr">Участки</div>'+
-  '<div class="check-grid">'+resources.map(function(r){return '<label><input type="checkbox" class="fus_st" value="'+r.id+'" '+(uSt.indexOf(r.id)>=0?'checked':'')+'> '+r.name+'</label>'}).join('')+'</div>'+
+  '<div class="section-hdr">Типы операций</div>'+
+  '<div class="check-grid">'+opTypes.filter(function(o){return o.is_active}).map(function(o){return '<label><input type="checkbox" class="fus_ot" value="'+o.id+'" '+(uOt.indexOf(o.id)>=0?'checked':'')+'> '+o.name+'</label>'}).join('')+'</div>'+
   '<div class="actions"><button class="btn" onclick="closeModal()">Отмена</button><button class="btn primary" onclick="saveUser('+(uid||0)+')">Сохранить</button></div>')})})}
 function saveUser(uid){var b={full_name:document.getElementById('fu_n').value,tab_number:document.getElementById('fu_t').value,
   role:ssVal('fu_r'),is_active:document.getElementById('fu_a').value==='true',
-  stations:Array.from(document.querySelectorAll('.fus_st:checked')).map(function(cb){return+cb.value})};
+  op_types:Array.from(document.querySelectorAll('.fus_ot:checked')).map(function(cb){return+cb.value})};
   if(uid)b.id=uid;else{b.username=document.getElementById('fu_l').value;b.password=document.getElementById('fu_p').value}
   var pw=document.getElementById('fu_p').value;if(pw&&uid)b.password=pw;
   api('/api/users/save','POST',b).then(function(){closeModal();toast('OK','ok');pgSettings(document.getElementById('mainContent'))}).catch(function(e){toast(e.message,'err')})}
