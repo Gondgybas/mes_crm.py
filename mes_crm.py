@@ -6299,146 +6299,168 @@ function pgOperations(c){
       '<label>Тип:</label><div style="min-width:200px">'+SS('ops_type',typeOpts,opsTypeFilter,'Все типы',function(v){opsTypeFilter=v;pgOperations(document.getElementById('mainContent'))})+'</div>'+
     '</div>';
 
+  // Регистрируем данные и рендерим контейнеры для каждой секции
   typeOrder.forEach(function(tname){
-    var data=byType[tname];
-    // Завершённые — в конец; остальные — по sort_order (явно, чтобы не зависеть от стабильности браузерного sort)
-    data.ops.sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;if(aD!==bD)return aD-bD;return (a.sort_order||0)-(b.sort_order||0);});
-    var totalMin=data.ops.reduce(function(s,o){return s+o.estimated_min},0);
-    var noRes=data.ops.filter(function(o){return !o.resource_id}).length;
-    html+='<div class="section-hdr">'+
-        '<span style="font-size:1.05em">⚙ '+tname+'</span>'+
-        '<span style="font-weight:400;font-size:.82em;color:var(--text3);margin-left:12px">'+data.ops.length+' оп. | '+fmtMinToH(totalMin)+'</span>'+
-        (noRes>0?'<span style="font-size:.78em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 7px;margin-left:8px">'+noRes+' без участка</span>':'')+
-      '</div>'+
-      '<div class="tbl-wrap"><table><thead><tr>'+
-        '<th>↕</th><th>Заказ</th><th>Деталь / Компонент</th><th>Станок / Участок</th>'+
-        '<th>План</th><th title="Поступило с предыдущего участка">📥 Вход</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th><th>Ст.</th><th></th>'+
-      '</tr></thead><tbody ondragover="event.preventDefault()" ondrop="dropOpEnd(event)">'+
-      data.ops.map(function(o){
-        var resCell=o.resource&&o.resource!=='—'
-          ?'<span style="font-size:.82em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.12);border-radius:3px;padding:1px 6px">📍'+o.resource+'</span>'
-          :'<span style="color:var(--err);font-size:.8em;background:rgba(239,68,68,.1);border-radius:3px;padding:1px 6px">⚠ не назначен</span>';
-        // Фактическое время: завершена — берём actual_min; в работе — считаем на лету из started_at
-        var actualCell='<span style="color:var(--text3);font-size:.8em">—</span>';
-        if(o.status==='Завершена'&&o.actual_min!=null){
-          var over=o.estimated_min&&o.actual_min>o.estimated_min;
-          actualCell='<span style="font-size:.82em;font-weight:600;color:'+(over?'var(--err)':'var(--ok)')+'">'+fmtMinToH(o.actual_min)+(over?' ⚠':'')+'</span>';
-        } else if((o.status==='В работе'||o.status==='Пауза')&&o.started_at){
-          var elapsedMs=Date.now()-new Date(o.started_at).getTime();
-          var elapsedMin=Math.floor(elapsedMs/60000)-(o.total_pause_min||0);
-          if(elapsedMin<0)elapsedMin=0;
-          var over2=o.estimated_min&&elapsedMin>o.estimated_min;
-          actualCell='<span style="font-size:.82em;color:'+(over2?'var(--err)':'var(--info)')+'">'+fmtMinToH(elapsedMin)+(o.status==='В работе'?' 🔄':'')+(over2?' ⚠':'')+'</span>';
-        }
-        return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)"'+(o.status==='Завершена'?' style="opacity:.55"':'')+'>'+
-          '<td style="cursor:grab">☰</td>'+
-          '<td style="font-size:.85em">'+(o.nesting_group_id
-            ?'<div><span style="background:#64748b;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 Карта</span>'+
-              '<div style="font-size:.78em;color:var(--text2);margin-top:3px;line-height:1.3">'+
-                ((o.nesting_orders||[]).map(function(no){return esc(no.order_display)}).join('<br>')||'—')+
-              '</div></div>'
-            :(o.order_display||o.order_number))+'</td>'+
-          '<td>'+(o.nesting_group_id
-            ?'<div><strong style="color:#64748b">🧩 '+esc(o.nesting_group_name||'Карта раскроя')+'</strong>'+
-                '<div style="font-size:.72em;color:var(--text3)">'+(o.nesting_items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(' · ')+'</div></div>'
-            :(o.component_name
-            ?'<div>'+
-                '<strong style="font-size:.88em;cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.component_template_id+',\''+o.component_name.replace(/'/g,"\\'")+'\')" title="Просмотр файлов детали">🔩 '+o.component_name+'</strong>'+
-                '<div style="font-size:.73em;color:var(--text3)">сб: '+
-                  (o.item_template_id?'<span style="cursor:pointer;color:var(--acc)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))+
-                '</div>'+
-              '</div>'
-            :(o.item_template_id?'<span style="cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))))+
-          '</td>'+
-          '<td>'+resCell+'</td>'+
-          '<td>'+o.planned_qty+'</td>'+
-          (function(){
-            // Колонка "Вход": сборочная единица → показываем комплекты; обычная деталь → детали с предыдущего участка
-            if(o.available_kits!=null){
-              // Первая сборочная операция: показываем число готовых комплектов
-              var kColor=o.available_kits===0?'var(--err)':o.available_kits>0?'var(--ok)':'var(--text3)';
-              return '<td style="font-size:.82em;text-align:center" title="Готово комплектов для сборки">'+
-                '<span style="font-weight:700;color:'+kColor+'">'+o.available_kits+'</span>'+
-                '<div style="font-size:.75em;color:var(--text3)">компл.</div>'+
-              '</td>';
-            }
-            if(o.available_input==null) return '<td style="color:var(--text3);font-size:.8em;text-align:center" title="Первый участок — источник">—</td>';
-            var inp=o.available_input;
-            var remaining=Math.max(0,inp-(o.completed_qty||0)-(o.rejected_qty||0));
-            var color=inp===0?'var(--err)':remaining>0?'var(--acc)':'var(--ok)';
-            return '<td style="font-size:.82em" title="Поступило с «'+esc(o.prev_op_type||'')+'»">'+
-              '<span style="color:'+color+';font-weight:600">'+inp+'</span>'+
-              (remaining>0?'<div style="font-size:.78em;color:var(--text3)">→'+remaining+'</div>':'')+
-            '</td>';
-          })()+
-          '<td>'+o.completed_qty+'</td>'+
-          '<td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td>'+
-          '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(o.estimated_min)+'</td>'+
-          '<td>'+actualCell+'</td>'+
-          '<td>'+statusBadge(o.status)+'</td>'+
-          '<td style="white-space:nowrap">'+
-            (function(){
-              var mySess=(o.sessions||[]).find(function(s){return s.user_id===U.id});
-              var activeSessions=(o.sessions||[]).filter(function(s){return s.status!=='Завершена'});
-              // Плашки активных операторов
-              var operBadges=activeSessions.map(function(s){
-                return '<span style="font-size:.72em;background:rgba(99,102,241,.15);border-radius:3px;padding:1px 5px;margin:1px;display:inline-block">'+
-                  esc(s.user_name)+(s.status==='Пауза'?' ⏸':' ▶')+'</span>';}).join('');
-              var btns='';
-              if(o.status==='Ожидает'||o.status==='Запланирована'){
-                // Проверка блокировок
-                if(o.available_kits!=null&&o.available_kits===0)
-                  btns='<button class="btn sm" disabled title="Нельзя начать сборку — неполный комплект деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
-                else if(o.available_kits==null&&o.available_input!=null&&o.available_input===0)
-                  btns='<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
-                else
-                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Начать операцию">▶ Начать</button>';
-              } else if(o.status==='В работе'||o.status==='Пауза'){
-                if(!mySess||mySess.status==='Завершена'){
-                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Присоединиться к операции">▶ Начать</button>';
-                } else if(mySess.status==='В работе'){
-                  btns='<button class="btn sm" onclick="sessionPause('+o.id+')" title="Поставить свою работу на паузу">⏸ Пауза</button>';
-                } else if(mySess.status==='Пауза'){
-                  btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Возобновить свою работу">▶ Продолжить</button>';
-                }
-                btns+='<button class="btn sm ok" onclick="completeOp('+o.id+')">✓ Готово</button>';
-              } else if(o.status==='Завершена'&&hasPerm('op.reopen')){
-                btns='<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="sessionStart('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>';
-              }
-              btns+=((o.status==='В работе'||o.status==='Пауза')&&(o.item_id||o.nesting_group_id)&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
-                (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'');
-              return operBadges+'<br style="line-height:.5em">'+btns;
-            })()+
-          '</td></tr>'+(function(){
-            // Строка материала — только для участков со списанием «Материал» или «Материал+Детали»
-            var opCfg=window._opTypesData[o.type]||{};
-            var wm=opCfg.writeoff_mode||'Детали';
-            if((wm==='Материал'||wm==='Материал+Детали')&&o.materials&&o.materials.length>0){
-              var pills=o.materials.map(function(m){
-                var isSheet=m.material_type==='Лист';
-                var qtyVal=isSheet?m.qty_sheets:m.qty_kg;
-                var resVal=isSheet?m.reserved_sheets:m.reserved_kg;
-                var remVal=isSheet?m.remainder_sheets:m.remainder_kg;
-                var unit=isSheet?'л':m.primary_unit;
-                var remColor=remVal<=0?'var(--err)':(isSheet&&remVal<=2?'var(--warn)':'var(--ok)');
-                return '<span style="display:inline-flex;align-items:center;gap:6px;font-size:.75em;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:4px;padding:2px 8px;margin-right:4px">'+
-                  '📦 <strong>'+esc(m.name)+'</strong>'+
-                  '<span style="color:var(--text3)">|</span>Склад: <b style="color:var(--text2)">'+qtyVal+' '+unit+'</b>'+
-                  '<span style="color:var(--text3)">|</span>Резерв: <b style="color:var(--info)">'+resVal+' '+unit+'</b>'+
-                  '<span style="color:var(--text3)">|</span>Остаток: <b style="color:'+remColor+'">'+remVal+' '+unit+'</b>'+
-                '</span>';
-              }).join('');
-              return '<tr style="background:rgba(59,130,246,.04)"><td></td>'+
-                '<td colspan="11" style="padding:1px 8px 5px 20px">'+pills+'</td></tr>';
-            }
-            return '';
-          })();
-      }).join('')+'</tbody></table></div>';
+    var ns='ops_'+tname.replace(/[^a-zA-Z0-9]/g,'_');
+    var secOps=byType[tname].ops;
+    secOps.sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;if(aD!==bD)return aD-bD;return (a.sort_order||0)-(b.sort_order||0);});
+    window['_'+ns+'Items']=secOps;
+    if(!window['_'+ns+'Filters'])window['_'+ns+'Filters']={};
+    window['_'+ns+'GetVal']=function(o,col){
+      if(col==='order')return o.nesting_group_id?(o.nesting_orders||[]).map(function(no){return no.order_display}).join(', '):(o.order_display||o.order_number||'');
+      if(col==='part')return o.nesting_group_id?(o.nesting_group_name||'Карта раскроя'):(o.component_name||o.item||'');
+      if(col==='resource')return o.resource||'—';
+      if(col==='status')return o.status||'';
+      return '';};
+    window['_'+ns+'Render']=function(){_opsRenderSec(ns,tname);};
+    html+='<div id="opsSec_'+ns+'"></div>';
   });
 
   if(!typeOrder.length)html+='<div class="info-box">Нет операций</div>';
   c.innerHTML=html;
+  typeOrder.forEach(function(tname){_opsRenderSec('ops_'+tname.replace(/[^a-zA-Z0-9]/g,'_'),tname);});
   })})}
+
+function _opsRenderSec(ns,tname){
+  var domEl=document.getElementById('opsSec_'+ns);if(!domEl)return;
+  var allOps=window['_'+ns+'Items']||[];
+  var ops=tblGetFiltered(ns).slice().sort(function(a,b){var aD=a.status==='Завершена'?1:0,bD=b.status==='Завершена'?1:0;if(aD!==bD)return aD-bD;return (a.sort_order||0)-(b.sort_order||0);});
+  var totalMin=allOps.reduce(function(s,o){return s+(o.estimated_min||0)},0);
+  var noRes=allOps.filter(function(o){return !o.resource_id}).length;
+  var hasF=Object.keys(window['_'+ns+'Filters']||{}).some(function(k){var s=window['_'+ns+'Filters'][k];return s&&s.size>0;});
+  var cntLabel=ops.length+(ops.length!==allOps.length?'/'+allOps.length:'')+' оп. | '+fmtMinToH(totalMin);
+  var resetBtn=hasF?'<button class="btn sm" style="font-size:.75em;padding:2px 8px;margin-left:8px;background:rgba(245,158,11,.15);border-color:var(--warn);color:var(--warn)" onclick="tblFpResetAll(\''+ns+'\')">✕ Сброс фильтра</button>':'';
+  var html='<div class="section-hdr">'+
+    '<span style="font-size:1.05em">⚙ '+esc(tname)+'</span>'+
+    '<span style="font-weight:400;font-size:.82em;color:var(--text3);margin-left:12px">'+cntLabel+'</span>'+
+    (noRes>0?'<span style="font-size:.78em;background:rgba(239,68,68,.15);color:var(--err);border-radius:3px;padding:1px 7px;margin-left:8px">'+noRes+' без участка</span>':'')+
+    resetBtn+
+    '</div>'+
+    '<div class="tbl-wrap"><table><thead><tr>'+
+      '<th>↕</th>'+
+      tblFTh('Заказ',ns,'order')+
+      tblFTh('Деталь / Компонент',ns,'part')+
+      tblFTh('Станок / Участок',ns,'resource')+
+      '<th>План</th><th title="Поступило с предыдущего участка">📥 Вход</th><th>Гот</th><th>Брак</th><th title="Плановое время">⏱ План</th><th title="Фактическое время (после завершения)">⏱ Факт</th>'+
+      tblFTh('Ст.',ns,'status')+
+      '<th></th>'+
+    '</tr></thead><tbody ondragover="event.preventDefault()" ondrop="dropOpEnd(event)">'+
+    ops.map(function(o){
+      var resCell=o.resource&&o.resource!=='—'
+        ?'<span style="font-size:.82em;font-weight:600;color:var(--acc);background:rgba(99,102,241,.12);border-radius:3px;padding:1px 6px">📍'+o.resource+'</span>'
+        :'<span style="color:var(--err);font-size:.8em;background:rgba(239,68,68,.1);border-radius:3px;padding:1px 6px">⚠ не назначен</span>';
+      var actualCell='<span style="color:var(--text3);font-size:.8em">—</span>';
+      if(o.status==='Завершена'&&o.actual_min!=null){
+        var over=o.estimated_min&&o.actual_min>o.estimated_min;
+        actualCell='<span style="font-size:.82em;font-weight:600;color:'+(over?'var(--err)':'var(--ok)')+'">'+fmtMinToH(o.actual_min)+(over?' ⚠':'')+'</span>';
+      } else if((o.status==='В работе'||o.status==='Пауза')&&o.started_at){
+        var elapsedMs=Date.now()-new Date(o.started_at).getTime();
+        var elapsedMin=Math.floor(elapsedMs/60000)-(o.total_pause_min||0);
+        if(elapsedMin<0)elapsedMin=0;
+        var over2=o.estimated_min&&elapsedMin>o.estimated_min;
+        actualCell='<span style="font-size:.82em;color:'+(over2?'var(--err)':'var(--info)')+'">'+fmtMinToH(elapsedMin)+(o.status==='В работе'?' 🔄':'')+(over2?' ⚠':'')+'</span>';
+      }
+      return '<tr draggable="true" data-opid="'+o.id+'" ondragstart="dragOp(event)" ondragover="event.preventDefault()" ondrop="dropOp(event)"'+(o.status==='Завершена'?' style="opacity:.55"':'')+'>'+
+        '<td style="cursor:grab">☰</td>'+
+        '<td style="font-size:.85em">'+(o.nesting_group_id
+          ?'<div><span style="background:#64748b;color:#fff;border-radius:3px;padding:1px 6px;font-size:.78em">🧩 Карта</span>'+
+            '<div style="font-size:.78em;color:var(--text2);margin-top:3px;line-height:1.3">'+
+              ((o.nesting_orders||[]).map(function(no){return esc(no.order_display)}).join('<br>')||'—')+
+            '</div></div>'
+          :(o.order_display||o.order_number))+'</td>'+
+        '<td>'+(o.nesting_group_id
+          ?'<div><strong style="color:#64748b">🧩 '+esc(o.nesting_group_name||'Карта раскроя')+'</strong>'+
+              '<div style="font-size:.72em;color:var(--text3)">'+(o.nesting_items||[]).map(function(it){return esc(it.part_name)+' (x'+it.qty_planned+')'}).join(' · ')+'</div></div>'
+          :(o.component_name
+          ?'<div>'+
+              '<strong style="font-size:.88em;cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.component_template_id+',\''+o.component_name.replace(/'/g,"\\'")+'\')" title="Просмотр файлов детали">🔩 '+o.component_name+'</strong>'+
+              '<div style="font-size:.73em;color:var(--text3)">сб: '+
+                (o.item_template_id?'<span style="cursor:pointer;color:var(--acc)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))+
+              '</div>'+
+            '</div>'
+          :(o.item_template_id?'<span style="cursor:pointer;color:var(--info)" onclick="modalPTFiles('+o.item_template_id+',\''+o.item.replace(/'/g,"\\'")+'\')">'+o.item+'</span>':(o.item||'—'))))+
+        '</td>'+
+        '<td>'+resCell+'</td>'+
+        '<td>'+o.planned_qty+'</td>'+
+        (function(){
+          if(o.available_kits!=null){
+            var kColor=o.available_kits===0?'var(--err)':o.available_kits>0?'var(--ok)':'var(--text3)';
+            return '<td style="font-size:.82em;text-align:center" title="Готово комплектов для сборки">'+
+              '<span style="font-weight:700;color:'+kColor+'">'+o.available_kits+'</span>'+
+              '<div style="font-size:.75em;color:var(--text3)">компл.</div>'+
+            '</td>';
+          }
+          if(o.available_input==null) return '<td style="color:var(--text3);font-size:.8em;text-align:center" title="Первый участок — источник">—</td>';
+          var inp=o.available_input;
+          var remaining=Math.max(0,inp-(o.completed_qty||0)-(o.rejected_qty||0));
+          var color=inp===0?'var(--err)':remaining>0?'var(--acc)':'var(--ok)';
+          return '<td style="font-size:.82em" title="Поступило с «'+esc(o.prev_op_type||'')+'»">'+
+            '<span style="color:'+color+';font-weight:600">'+inp+'</span>'+
+            (remaining>0?'<div style="font-size:.78em;color:var(--text3)">→'+remaining+'</div>':'')+
+          '</td>';
+        })()+
+        '<td>'+o.completed_qty+'</td>'+
+        '<td class="'+(o.rejected_qty?'low':'')+'">'+o.rejected_qty+'</td>'+
+        '<td style="font-size:.82em;color:var(--text3)">'+fmtMinToH(o.estimated_min)+'</td>'+
+        '<td>'+actualCell+'</td>'+
+        '<td>'+statusBadge(o.status)+'</td>'+
+        '<td style="white-space:nowrap">'+
+          (function(){
+            var mySess=(o.sessions||[]).find(function(s){return s.user_id===U.id});
+            var activeSessions=(o.sessions||[]).filter(function(s){return s.status!=='Завершена'});
+            var operBadges=activeSessions.map(function(s){
+              return '<span style="font-size:.72em;background:rgba(99,102,241,.15);border-radius:3px;padding:1px 5px;margin:1px;display:inline-block">'+
+                esc(s.user_name)+(s.status==='Пауза'?' ⏸':' ▶')+'</span>';}).join('');
+            var btns='';
+            if(o.status==='Ожидает'||o.status==='Запланирована'){
+              if(o.available_kits!=null&&o.available_kits===0)
+                btns='<button class="btn sm" disabled title="Нельзя начать сборку — неполный комплект деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+              else if(o.available_kits==null&&o.available_input!=null&&o.available_input===0)
+                btns='<button class="btn sm" disabled title="Нельзя начать: с участка «'+esc(o.prev_op_type||'')+'» ещё не передано деталей" style="opacity:.45;cursor:not-allowed">▶</button>';
+              else
+                btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Начать операцию">▶ Начать</button>';
+            } else if(o.status==='В работе'||o.status==='Пауза'){
+              if(!mySess||mySess.status==='Завершена'){
+                btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Присоединиться к операции">▶ Начать</button>';
+              } else if(mySess.status==='В работе'){
+                btns='<button class="btn sm" onclick="sessionPause('+o.id+')" title="Поставить свою работу на паузу">⏸ Пауза</button>';
+              } else if(mySess.status==='Пауза'){
+                btns='<button class="btn sm warn" onclick="sessionStart('+o.id+')" title="Возобновить свою работу">▶ Продолжить</button>';
+              }
+              btns+='<button class="btn sm ok" onclick="completeOp('+o.id+')">✓ Готово</button>';
+            } else if(o.status==='Завершена'&&hasPerm('op.reopen')){
+              btns='<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="sessionStart('+o.id+')" title="Дополнить: возобновить операцию с продолжением таймера">➕ Дополнить</button>';
+            }
+            btns+=((o.status==='В работе'||o.status==='Пауза')&&(o.item_id||o.nesting_group_id)&&U.writeoff_types.length>0&&(window._opTypesData[o.type]||{}).writeoff_mode&&(window._opTypesData[o.type]||{}).writeoff_mode!=='Нет'?'<button class="btn sm" style="background:var(--info);border-color:var(--info);color:#fff" onclick="modalOpWriteoff('+o.id+')" title="Списание">📤</button>':'')+
+              (['Завершена','В работе','Пауза'].indexOf(o.status)>=0&&hasPerm('op.rollback')?'<button class="btn sm" onclick="rollbackOp('+o.id+')" style="color:var(--err)" title="Откатить">↩</button>':'');
+            return operBadges+'<br style="line-height:.5em">'+btns;
+          })()+
+        '</td></tr>'+(function(){
+          var opCfg=window._opTypesData[o.type]||{};
+          var wm=opCfg.writeoff_mode||'Детали';
+          if((wm==='Материал'||wm==='Материал+Детали')&&o.materials&&o.materials.length>0){
+            var pills=o.materials.map(function(m){
+              var isSheet=m.material_type==='Лист';
+              var qtyVal=isSheet?m.qty_sheets:m.qty_kg;
+              var resVal=isSheet?m.reserved_sheets:m.reserved_kg;
+              var remVal=isSheet?m.remainder_sheets:m.remainder_kg;
+              var unit=isSheet?'л':m.primary_unit;
+              var remColor=remVal<=0?'var(--err)':(isSheet&&remVal<=2?'var(--warn)':'var(--ok)');
+              return '<span style="display:inline-flex;align-items:center;gap:6px;font-size:.75em;background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.25);border-radius:4px;padding:2px 8px;margin-right:4px">'+
+                '📦 <strong>'+esc(m.name)+'</strong>'+
+                '<span style="color:var(--text3)">|</span>Склад: <b style="color:var(--text2)">'+qtyVal+' '+unit+'</b>'+
+                '<span style="color:var(--text3)">|</span>Резерв: <b style="color:var(--info)">'+resVal+' '+unit+'</b>'+
+                '<span style="color:var(--text3)">|</span>Остаток: <b style="color:'+remColor+'">'+remVal+' '+unit+'</b>'+
+              '</span>';
+            }).join('');
+            return '<tr style="background:rgba(59,130,246,.04)"><td></td>'+
+              '<td colspan="11" style="padding:1px 8px 5px 20px">'+pills+'</td></tr>';
+          }
+          return '';
+        })();
+    }).join('')+'</tbody></table></div>';
+  domEl.innerHTML=html;
+  tblUpdateBtns(ns);}
 
 var draggedOpId=null;function dragOp(e){draggedOpId=e.target.closest('tr').dataset.opid;e.dataTransfer.effectAllowed='move'}
 function dropOp(e){e.preventDefault();e.stopPropagation();var tr=e.target.closest('tr');if(!tr||!draggedOpId)return;
