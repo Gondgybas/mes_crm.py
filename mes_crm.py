@@ -7633,6 +7633,8 @@ window._woGetVal=function(w,col){
   if(col==='op_type')return w.op_type||'';
   if(col==='resource')return w.resource||'';
   if(col==='user')return w.user||'';
+  if(col==='part')return w.component_name?w.component_name:(w.part_name||'');
+  if(col==='material')return w.material||'';
   return '';};
 window._woRender=function(){woFillTable(null);};
 
@@ -7647,10 +7649,10 @@ function pgWriteoffs(c){
       '<th>Дата</th><th>Тип</th>'+
       tblFTh('Заказчик','wo','customer')+
       tblFTh('Заказ','wo','order')+
-      '<th>Деталь</th>'+
+      tblFTh('Деталь','wo','part')+
       '<th title="Годных">Годн.</th><th title="Брак">Брак</th>'+
       tblFTh('Тип операции','wo','op_type')+
-      '<th>Материал</th><th>Л</th><th>Кг</th>'+
+      tblFTh('Материал','wo','material')+'<th>Л</th><th>Кг</th>'+
       tblFTh('Станок','wo','resource')+
       tblFTh('Оператор','wo','user')+
       '<th>Прим.</th><th></th>'+
