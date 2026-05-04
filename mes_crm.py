@@ -1212,6 +1212,38 @@ def create_app():
         all_res = db.query(Resource).filter(Resource.is_available == True).all()
         return [r for r in all_res if op_name in r.get_allowed_ops()]
 
+    def get_active_nesting_pt_ids(db, order_item_id):
+        """Возвращает set part_template_id деталей, которые уже покрыты активной картой раскроя
+        для данной позиции заказа. Используется для защиты от дублирования резервов."""
+        rows = db.query(NestingGroupItem.part_template_id).join(
+            NestingGroup, NestingGroupItem.group_id == NestingGroup.id
+        ).filter(
+            NestingGroupItem.order_item_id == order_item_id,
+            NestingGroup.status == "Активна"
+        ).all()
+        return {r[0] for r in rows}
+
+    def get_active_nesting_op_keys(db, order_item_id):
+        """Возвращает set (operation_type, component_template_id) для операций,
+        уже покрытых активными картами раскроя этой позиции заказа.
+        Используется для защиты от дублирования ProductionOp."""
+        rows = db.query(NestingGroupItem.component_template_id, NestingGroup.operation_type).join(
+            NestingGroup, NestingGroupItem.group_id == NestingGroup.id
+        ).filter(
+            NestingGroupItem.order_item_id == order_item_id,
+            NestingGroup.status == "Активна"
+        ).all()
+        return {(op_type, comp_id) for comp_id, op_type in rows}
+
+    def has_active_nesting(db, order_item_id):
+        """True, если для позиции заказа есть хотя бы одна активная карта раскроя."""
+        return db.query(NestingGroupItem.id).join(
+            NestingGroup, NestingGroupItem.group_id == NestingGroup.id
+        ).filter(
+            NestingGroupItem.order_item_id == order_item_id,
+            NestingGroup.status == "Активна"
+        ).first() is not None
+
     def auto_create_reservations(db, order_item, user_id=None):
         # Резервы создаются только для заказов в статусе «В работе»
         order = db.query(Order).get(order_item.order_id) if order_item.order_id else None
@@ -1219,7 +1251,13 @@ def create_app():
         pt = order_item.part_template
         if not pt: return
 
+        # Части, уже покрытые активной картой раскроя — резерв для них не создаём
+        nesting_pt_ids = get_active_nesting_pt_ids(db, order_item.id)
+
         def _reserve_materials(template, qty_multiplier, label_pt_id):
+            # Если эта деталь/компонент уже в активной карте раскроя — пропускаем
+            if label_pt_id in nesting_pt_ids:
+                return
             for ptm in (template.materials or []):
                 sheets = ptm.calc_sheets_for_qty(order_item.quantity * qty_multiplier)
                 mat = db.query(Material).get(ptm.material_id)
@@ -1252,11 +1290,17 @@ def create_app():
         pt = order_item.part_template
         if not pt: return
 
+        # Типы операций, уже покрытые активной картой раскроя — не создаём дубли
+        nesting_op_keys = get_active_nesting_op_keys(db, order_item.id)
+
         def _create_ops(template, qty_multiplier, comp_template_id=None, comp_label=""):
             op_times = template.get_op_times()
             seq = 0
             for op_name, entry in op_times.items():
                 if not op_name: continue
+                # Если эта (тип операции, компонент) уже в активной карте — пропускаем
+                if (op_name, comp_template_id) in nesting_op_keys:
+                    continue
                 if isinstance(entry, dict):
                     per_one = float(entry.get("per_one", 0) or 0)
                     saved_total = float(entry.get("total_min", 0) or 0)
@@ -1327,8 +1371,12 @@ def create_app():
                 remove_item_reservations(db, it.id)
                 auto_create_reservations(db, it, user_id)
                 ops = db.query(ProductionOp).filter(ProductionOp.order_item_id == it.id).all()
-                all_pending = all(o.status == "Ожидает" for o in ops)
-                if all_pending:
+                # all([]) == True, но если по позиции есть активный нестинг — не пересоздаём операции:
+                # нестинг сам управляет своими ProductionOp (order_item_id=None).
+                # Пересоздаём только если нет нестинга вообще или все индивидуальные ops ещё в ожидании.
+                item_has_nesting = has_active_nesting(db, it.id)
+                all_pending = bool(ops) and all(o.status == "Ожидает" for o in ops)
+                if all_pending or (not ops and not item_has_nesting):
                     # Сохраняем назначения станков перед пересозданием операций
                     saved_resources = {}
                     for o in ops:
@@ -1343,6 +1391,11 @@ def create_app():
                         key = (o.operation_type, o.component_template_id)
                         if key in saved_resources:
                             o.resource_id = saved_resources[key]
+                elif item_has_nesting and not ops:
+                    # Позиция полностью в нестинге — операции пересоздавать не нужно,
+                    # но при наличии частично нестингованных операций auto_create_operations
+                    # выше всё равно пропустит те, что уже в карте.
+                    auto_create_operations(db, it)
                 recalced_items += 1
         db.flush()
         return recalced_items
@@ -2244,10 +2297,12 @@ def create_app():
             for it in items:
                 existing_res = db.query(Reservation).filter(
                     Reservation.order_item_id == it.id, Reservation.is_active == True).count()
+                # auto_create_reservations сама пропустит детали, покрытые нестинговой картой.
                 if existing_res == 0:
                     auto_create_reservations(db, it, data.get("user_id", 1))
                 existing_ops = db.query(ProductionOp).filter(
                     ProductionOp.order_item_id == it.id).count()
+                # auto_create_operations сама пропустит типы, покрытые нестинговой картой.
                 if existing_ops == 0:
                     auto_create_operations(db, it)
             db.flush()
@@ -2298,6 +2353,13 @@ def create_app():
             it = db.query(OrderItem).get(iid)
             old_qty = it.quantity; it.quantity = int(data.get("quantity", it.quantity))
             if it.quantity != old_qty:
+                # Если есть активный нестинг — его ProductionOp (order_item_id=None) не трогаем.
+                # remove_item_operations удалит только индивидуальные ops (order_item_id=it.id).
+                # auto_create_* пропустят типы/детали, уже покрытые нестингом.
+                if has_active_nesting(db, it.id):
+                    raise HTTPException(400,
+                        "Нельзя изменить количество: позиция входит в активную карту раскроя. "
+                        "Сначала расформируйте карту раскроя.")
                 remove_item_reservations(db, it.id); remove_item_operations(db, it.id)
                 auto_create_reservations(db, it, uid); auto_create_operations(db, it)
         else:
@@ -3068,17 +3130,23 @@ def create_app():
                 if mat:
                     ng_r = ng_res_map.get(o.nesting_group_id)
                     ng_c = ng_consumed_map.get((o.nesting_group_id, mat.id), {})
-                    res_kg = ng_r.quantity_kg if ng_r else 0.0
-                    res_sh = ng_r.quantity_sheets if ng_r else 0
+                    # res_sh/res_kg — текущий остаток резерва (уменьшается при списании)
+                    rem_kg = float(ng_r.quantity_kg if ng_r else 0.0)
+                    rem_sh = int(ng_r.quantity_sheets if ng_r else 0)
+                    cons_kg = float(ng_c.get('kg', 0.0))
+                    cons_sh = int(ng_c.get('sheets', 0))
+                    # Весь (исходный) резерв = остаток + уже списано
+                    total_kg = round(rem_kg + cons_kg, 2)
+                    total_sh = rem_sh + cons_sh
                     mat_info.append({
                         "material_id": mat.id, "name": mat.name,
                         "material_type": mat.material_type, "primary_unit": mat.primary_unit,
                         "qty_kg": round(float(mat.quantity_kg or 0), 2), "qty_sheets": int(mat.quantity_sheets or 0),
-                        "reserved_kg": round(float(res_kg), 2), "reserved_sheets": int(res_sh),
-                        "consumed_kg": round(float(ng_c.get('kg', 0.0)), 2),
-                        "consumed_sheets": int(ng_c.get('sheets', 0)),
-                        "remainder_kg": round(max(0.0, float(res_kg) - float(ng_c.get('kg', 0.0))), 2),
-                        "remainder_sheets": max(0, int(res_sh) - int(ng_c.get('sheets', 0))),
+                        "reserved_kg": total_kg, "reserved_sheets": total_sh,
+                        "consumed_kg": round(cons_kg, 2),
+                        "consumed_sheets": cons_sh,
+                        "remainder_kg": round(rem_kg, 2),
+                        "remainder_sheets": rem_sh,
                     })
             elif o.order_item_id and o.order_item:
                 # Для компонентов сборки берём материалы из component_template,
@@ -3097,17 +3165,23 @@ def create_app():
                     if not mat or not pt_id_for_res: continue
                     r = res_map.get((o.order_id, pt_id_for_res, ptm.material_id))
                     c = consumed_map.get((o.order_id, ptm.material_id), {})
-                    res_kg = r.quantity_kg if r else 0.0
-                    res_sh = r.quantity_sheets if r else 0
+                    # rem_sh/rem_kg — текущий остаток резерва (уменьшается при списании)
+                    rem_kg = float(r.quantity_kg if r else 0.0)
+                    rem_sh = int(r.quantity_sheets if r else 0)
+                    cons_kg = float(c.get('kg', 0.0))
+                    cons_sh = int(c.get('sheets', 0))
+                    # Весь (исходный) резерв = остаток + уже списано
+                    total_kg = round(rem_kg + cons_kg, 2)
+                    total_sh = rem_sh + cons_sh
                     mat_info.append({
                         "material_id": mat.id, "name": mat.name,
                         "material_type": mat.material_type, "primary_unit": mat.primary_unit,
                         "qty_kg": round(float(mat.quantity_kg or 0), 2), "qty_sheets": int(mat.quantity_sheets or 0),
-                        "reserved_kg": round(float(res_kg), 2), "reserved_sheets": int(res_sh),
-                        "consumed_kg": round(float(c.get('kg', 0.0)), 2),
-                        "consumed_sheets": int(c.get('sheets', 0)),
-                        "remainder_kg": round(max(0.0, float(res_kg) - float(c.get('kg', 0.0))), 2),
-                        "remainder_sheets": max(0, int(res_sh) - int(c.get('sheets', 0))),
+                        "reserved_kg": total_kg, "reserved_sheets": total_sh,
+                        "consumed_kg": round(cons_kg, 2),
+                        "consumed_sheets": cons_sh,
+                        "remainder_kg": round(rem_kg, 2),
+                        "remainder_sheets": rem_sh,
                     })
             result.append({"id": o.id, "order_id": o.order_id,
                  "order_number": o.order.order_number if o.order else "",
